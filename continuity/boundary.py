@@ -255,11 +255,119 @@ def stage_manual_successor(store: Store, ident, *, host: str, predecessor_sessio
     return {"ok": True, "manual_start": True, "command": command}
 
 
+def _spawn_codex_exec(argv: list[str], cwd: Path, log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stream = log_path.open("ab")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=stream,
+            start_new_session=True,
+        )
+    finally:
+        stream.close()
+    return proc
+
+
+def _thread_id_from_log(log_path: Path) -> str | None:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("type") == "thread.started":
+            tid = value.get("thread_id")
+            if isinstance(tid, str) and tid:
+                return tid
+    return None
+
+
+def launch_codex_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
+    exe = shutil.which("codex")
+    if not exe:
+        staged = stage_manual_successor(
+            store, ident, host="codex", predecessor_session=predecessor_session,
+            arm=arm, handoff_id=handoff_id, handoff_path=handoff_path,
+            command=f'cd "{ident.root}" && codex',
+        )
+        staged.update({"automatic": False, "reason": "codex executable not found"})
+        return staged
+
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    log_path = ident.root / ".continuity" / "successors" / f"codex-{stamp}.jsonl"
+    pending = {
+        "schema": 1,
+        "status": "pending",
+        "host": "codex",
+        "predecessor_session": predecessor_session,
+        "handoff_id": handoff_id,
+        "handoff_path": str(handoff_path),
+        "goal": arm.get("goal", ""),
+        "instructions": arm.get("instructions", ""),
+        "auto_successor": bool(arm.get("auto_successor", True)),
+        "created_at": int(time.time()),
+        "log_path": str(log_path),
+    }
+    store.set_state(ident.key, "successor_pending", pending)
+    store.release_lease(ident.key, predecessor_session)
+
+    prompt = (
+        "You are the fresh Continuity successor bootstrap. Do not edit project files. "
+        "Read .continuity/LATEST.md, run continuity resume, continuity orient, and continuity status. "
+        "Verify project root, branch, HEAD, working tree, and relevant source against the handoff. "
+        "Report readiness and the first unresolved next step only."
+    )
+    try:
+        proc = _spawn_codex_exec([exe, "exec", "--json", prompt], ident.root, log_path)
+    except OSError as exc:
+        store.acquire_lease(ident.key, predecessor_session, "codex")
+        pending.update({"status": "failed", "reason": str(exc)})
+        store.set_state(ident.key, "successor_pending", pending)
+        set_arm_status(store, ident.key, predecessor_session, "armed", launch_error=str(exc))
+        return {"ok": False, "reason": str(exc)}
+
+    thread_id = None
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        thread_id = _thread_id_from_log(log_path)
+        if thread_id:
+            break
+        time.sleep(0.1)
+
+    current = store.get_state(ident.key, "successor_pending")
+    if not isinstance(current, dict):
+        current = pending
+    if current.get("status") not in {"consumed", "ready"}:
+        current["status"] = "launched"
+    current.update({"pid": proc.pid, "log_path": str(log_path)})
+    if thread_id:
+        current["thread_id"] = thread_id
+    store.set_state(ident.key, "successor_pending", current)
+    set_arm_status(store, ident.key, predecessor_session, "transferred", successor_thread_id=thread_id)
+
+    return {
+        "ok": True,
+        "automatic": True,
+        "pid": proc.pid,
+        "thread_id": thread_id,
+        "log_path": str(log_path),
+        "resume_command": f"codex resume {thread_id}" if thread_id else "codex resume",
+    }
+
+
 def stage_codex_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
-    return stage_manual_successor(
-        store, ident, host="codex", predecessor_session=predecessor_session,
-        arm=arm, handoff_id=handoff_id, handoff_path=handoff_path,
-        command=f'cd "{ident.root}" && codex',
+    # Backward-compatible alias. v0.3 automatically creates a read-only Codex exec
+    # bootstrap thread when the CLI is available; otherwise it stages manual launch.
+    return launch_codex_successor(
+        store, ident, predecessor_session=predecessor_session, arm=arm,
+        handoff_id=handoff_id, handoff_path=handoff_path,
     )
 
 
