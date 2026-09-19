@@ -137,7 +137,7 @@ class HookTests(unittest.TestCase):
                 )
                 self.arm(root, home)
                 with patch("continuity.boundary.shutil.which", return_value="/usr/bin/claude"), patch(
-                    "continuity.boundary.subprocess.Popen",
+                    "continuity.boundary._spawn_background",
                     return_value=SimpleNamespace(pid=4242),
                 ) as popen:
                     _, out, _ = self.run_event(
@@ -177,7 +177,7 @@ class HookTests(unittest.TestCase):
                 )
                 self.arm(root, home)
                 with patch("continuity.boundary.shutil.which", return_value="/usr/bin/claude"), patch(
-                    "continuity.boundary.subprocess.Popen",
+                    "continuity.boundary._spawn_background",
                     side_effect=OSError("spawn failed"),
                 ):
                     _, out, _ = self.run_event(
