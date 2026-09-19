@@ -1,0 +1,12 @@
+{
+  "goal": "Ship the sample project",
+  "summary": "The storage adapter is implemented; its migration still needs validation.",
+  "constraints": ["Keep the first release local-only"],
+  "decisions": ["Use SQLite for the initial release"],
+  "accomplished": ["Implemented the storage adapter"],
+  "pending": ["Validate migration on the synthetic fixture"],
+  "blockers": [],
+  "next_actions": ["Run the migration test and inspect the resulting schema version"],
+  "relevant_files": ["src/storage.py", "tests/test_migration.py"],
+  "record_ids": []
+}

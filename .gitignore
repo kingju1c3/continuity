@@ -1,0 +1,13 @@
+# Continuity's private/runtime outputs; vendored tracked snapshots are exceptions.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+.continuity/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+continuity-snapshot-*.json
+.env
+.env.*

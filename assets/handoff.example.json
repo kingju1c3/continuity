@@ -1,0 +1,21 @@
+{
+  "checkpoint": {
+    "goal": "Finish the user's original task",
+    "summary": "Replace this example with verified current progress.",
+    "constraints": ["Preserve the existing scope and permissions"],
+    "decisions": ["Record each material decision and its reason"],
+    "accomplished": [],
+    "pending": ["Complete the next concrete action"],
+    "blockers": [],
+    "next_actions": ["Inspect the current implementation and run its focused test"],
+    "relevant_files": [],
+    "record_ids": []
+  },
+  "permissions": ["Only actions already authorized by the current user"],
+  "failed_approaches": [],
+  "open_questions": [],
+  "omissions": [],
+  "required_artifacts": [],
+  "writers_quiesced": true,
+  "mission_complete": false
+}

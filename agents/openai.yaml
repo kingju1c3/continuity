@@ -1,0 +1,14 @@
+interface:
+  display_name: Continuity
+  short_description: Automatic handoffs, sourced memory, and fresh sessions
+  default_prompt: Use $continuity to resume this project from verified records and
+    take the next useful action.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
