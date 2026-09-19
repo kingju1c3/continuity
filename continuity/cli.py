@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import uuid
 
 from .adapters import detect, structural_query
@@ -160,7 +161,7 @@ def cmd_arm(a) -> int:
             {
                 "status": "consumed",
                 "successor_session": sid,
-                "consumed_at": int(__import__("time").time()),
+                "consumed_at": int(time.time()),
             }
         )
         st.set_state(ident.key, "successor_pending", pending)
