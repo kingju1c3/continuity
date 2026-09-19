@@ -86,8 +86,12 @@ def build_context_pack(
                     f"Event: {freeze.get('_event')}",
                     f"Created: {freeze.get('_created_at')}",
                     f"Git: {json.dumps(freeze.get('git') or {}, sort_keys=True)}",
-                    "A semantic checkpoint may be missing after this freeze; verify current source before continuing.",
                 ]
+            )
+            if freeze.get("compact_summary"):
+                lines.append("Host compact summary:\n" + str(freeze["compact_summary"]).strip())
+            lines.append(
+                "A semantic checkpoint may be missing after this freeze; verify current source before continuing."
             )
 
     q = fts_query(prompt)
