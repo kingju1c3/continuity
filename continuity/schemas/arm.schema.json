@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Continuity Armed Session",
+  "type": "object",
+  "required": ["schema", "status", "session_id", "host", "auto_successor", "armed_at"],
+  "properties": {
+    "schema": {"const": 1},
+    "status": {
+      "enum": ["armed", "handoff_pending", "transferred", "disarmed"]
+    },
+    "session_id": {"type": "string", "minLength": 1},
+    "host": {"type": "string", "minLength": 1},
+    "goal": {"type": "string"},
+    "instructions": {"type": "string"},
+    "auto_successor": {"type": "boolean"},
+    "armed_at": {"type": "integer"},
+    "inherited_from": {"type": ["string", "null"]},
+    "handoff_id": {"type": "integer"},
+    "handoff_path": {"type": "string"}
+  },
+  "additionalProperties": true
+}
