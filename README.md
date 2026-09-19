@@ -97,42 +97,107 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
-## Premium continuity runtime — v0.2
+## Premium continuity runtime — v0.3
 
-Continuity v0.2 moves beyond command-only handoffs into an active lifecycle protocol.
+Continuity v0.3 changes the operating model from **active per-turn assistance** to **arm once, stay passive, transfer at the compaction boundary**.
 
-It now adds:
+Invoke `/continuity` once in the session. The skill arms the exact current host session, then gets out of the way.
 
-- **exact host-session ownership** with one active lease per project;
-- **lease-conflict detection** instead of silent concurrent takeover;
-- **explicit abandoned-session recovery** with an expected-owner check;
-- **real SessionStart hydration** — the previous handoff, newer lifecycle freeze, durable memory, Git identity, and index freshness are injected into agent context;
-- **prompt-scoped retrieval** on UserPromptSubmit;
-- **mechanical PreCompact / PostCompact / SessionEnd freezes**;
-- **host compact-summary preservation** when the host exposes one;
-- **one-shot Stop feedback** when code changed after the latest semantic checkpoint;
-- **manual-compaction protection** on Claude Code when changes are still uncheckpointed;
-- **automatic structural freshness tracking** after edits/shell activity;
-- **automatic index refresh** before built-in structural queries and semantic checkpoints;
-- **memory revision history** for evolving topic keys;
-- **handoff drift detection** against current project root, branch, HEAD, working tree, and relevant files;
-- **fail-closed host configuration edits** with backups;
-- **project opt-in gating** for globally configured Codex hooks;
-- **dry-run, repair, and uninstall** operations that preserve unrelated host configuration;
-- a **complete installed protocol bundle** with lifecycle references and JSON schemas.
-
-Useful maintenance commands:
-
-```bash
-continuity status
-continuity memory-history architecture/auth-model
-continuity recover --host codex --expected-owner <old-session-id>
-continuity install --agents claude,codex --dry-run
-continuity repair --agents claude,codex
-continuity uninstall --agents claude,codex
+```text
+/continuity
+    │
+    ▼
+arm exact session
+    │
+    ├──────── normal prompts/tools ────────┐
+    │             silent                  │
+    │                                     │
+    └───────────────┬─────────────────────┘
+                    ▼
+              host PreCompact
+                    │
+          alert user BEFORE loss
+                    │
+          durable boundary handoff
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+ Claude local             Codex local
+ background named         background persisted
+ successor session        codex exec thread
+        │                       │
+        └───────────┬───────────┘
+                    ▼
+           successor verifies
+          source/Git + resumes
 ```
 
-The portable core still does not claim that every host can programmatically spawn a brand-new chat. What it now does is preserve, validate, and rehydrate the strongest available durable state across the lifecycle surfaces the host actually exposes.
+### What “passive” means
+
+After arming:
+
+- no memory dump on every prompt;
+- no checkpoint nag after every turn;
+- no visible PostToolUse chatter;
+- edits silently mark structural state stale;
+- durable memory remains available on demand;
+- the runtime waits for the host's documented **PreCompact** event.
+
+The host APIs do not expose one portable, stable live “N% until compaction” field on every turn, so Continuity does **not** fabricate one. PreCompact is the reliable lifecycle boundary immediately before compaction.
+
+### Boundary alert and handoff
+
+At an armed PreCompact event, Continuity:
+
+1. alerts the user that compaction is about to occur;
+2. emits a terminal notification/bell where supported;
+3. writes a mechanical freeze;
+4. rebuilds structural state;
+5. writes an `automatic-boundary` handoff;
+6. records branch, HEAD, worktree, diffstat, changed files, arm goal/instructions, bounded durable memory, and a bounded best-effort transcript tail;
+7. redacts common secret patterns from transcript evidence;
+8. persists `.continuity/LATEST.md` and `.continuity/LATEST.json`;
+9. transfers ownership only after the handoff is durable;
+10. blocks that compaction attempt so the predecessor context is not destroyed first.
+
+### Automatic successor creation
+
+**Claude Code:** when the local Claude CLI is available, Continuity starts a fresh named background session and tells you exactly how to attach:
+
+```bash
+claude --resume <continuity-successor-name>
+```
+
+**Codex:** when the local Codex CLI is available, Continuity starts a fresh persisted **read-only background bootstrap thread** with `codex exec --json`, captures its `thread.started` ID when available, and tells you how to attach interactively:
+
+```bash
+codex resume <successor-thread-id>
+```
+
+The Codex bootstrap only verifies the handoff/source; it is not launched with workspace-write permissions.
+
+If either executable is unavailable, Continuity preserves the handoff and falls back safely rather than claiming a successor was created.
+
+### Arm/disarm controls
+
+```bash
+continuity arm \
+  --host auto \
+  --goal "Finish retry-safe upload handling" \
+  --instructions "Preserve the public API"
+
+continuity status
+continuity disarm
+```
+
+Use `--no-auto-successor` to keep the boundary alert/handoff while requiring a manual fresh-session launch.
+
+### Ownership safety
+
+Continuity keeps one active project lease. A successful transfer marks the predecessor `transferred`; later prompts in that predecessor can be blocked so two sessions do not unknowingly continue the same chain.
+
+Arm state survives an ordinary session exit/resume. The lease is released on exit, while the saved session remains armed when resumed.
+
 
 ---
 
@@ -291,7 +356,7 @@ The successor should verify the handoff against current source and Git state bef
 
 ### 5. Claude Code and Codex lifecycle integration
 
-Continuity can wire itself into supported host lifecycle surfaces.
+Install host integration:
 
 ```bash
 continuity install --agents claude,codex
@@ -299,51 +364,37 @@ continuity install --agents claude,codex
 
 #### Claude Code
 
-The installer writes:
+Claude receives only minimal project-global bookkeeping hooks:
 
-```text
-.claude/
-├── settings.json
-└── skills/
-    └── continuity/
-        └── SKILL.md
-```
+- `SessionStart` — exact session identity + lease bookkeeping;
+- `SessionEnd` — objective freeze + lease release.
 
-It adds Continuity lifecycle command hooks for:
+The expensive/session-specific hooks live in the installed `/continuity` skill itself. After the skill is invoked, its hook set remains active for that session:
 
-- `SessionStart`;
-- `PreCompact`;
-- `Stop`.
+- `UserPromptSubmit` — normally silent; blocks a transferred predecessor;
+- `PostToolUse` — silently marks structure stale;
+- `PreCompact` — alert, capture handoff, launch/transfer successor;
+- `PostCompact` — recovery evidence if compaction still occurs.
+
+The installer rewrites the skill hook command to the exact Python interpreter that installed Continuity, avoiding PATH-dependent hook failures.
 
 #### Codex
 
-The installer writes:
+Codex lifecycle dispatch hooks are installed in `~/.codex/hooks.json` when available, but expensive behavior is **arm-gated**. Unarmed project sessions are effectively no-op beyond session bookkeeping.
 
-```text
-.agents/
-└── skills/
-    └── continuity/
-        └── SKILL.md
-
-AGENTS.md
-```
-
-The `AGENTS.md` integration is marker-fenced so Continuity owns only its own section.
-
-If `~/.codex` exists, the installer also attempts to preserve foreign entries while adding Continuity hooks to:
-
-```text
-~/.codex/hooks.json
-```
-
-for:
+Installed dispatchers include:
 
 - `SessionStart`;
 - `UserPromptSubmit`;
+- `PostToolUse`;
 - `PreCompact`;
-- `Stop`.
+- `PostCompact`;
+- `SessionEnd`.
 
-> Hooks can register/restorе continuity state and inject checkpoint instructions. They do **not** fabricate a semantic checkpoint and they do **not** guarantee that a host can spawn a brand-new chat/session automatically. Session creation is host-controlled.
+There is intentionally no per-turn Stop nag.
+
+At the boundary, Continuity can automatically create a persisted non-interactive Codex successor thread without pretending that a hook can open an interactive terminal window.
+
 
 ---
 
@@ -398,14 +449,21 @@ or:
 continuity install --agents codex
 ```
 
-### First session
+### First armed session
 
-```bash
-continuity start --host codex --emit-context
-continuity orient
+In Claude Code or Codex, invoke:
+
+```text
+/continuity
 ```
 
-If there is no previous state yet, that is expected. Work normally, save durable decisions as they emerge, then checkpoint before the session ends.
+The skill's first action arms the exact host session. For manual use:
+
+```bash
+continuity arm --host auto --goal "Current objective" --instructions "Critical constraints"
+```
+
+Then work normally. Continuity stays passive until PreCompact. Use `continuity status` at any time to inspect arm/lease/successor state.
 
 ### End of session
 
@@ -1081,6 +1139,7 @@ Security guidelines:
 
 - **Do not store secrets** in `continuity remember`.
 - Do not persist API keys, credentials, auth cookies, private keys, or tokens.
+- Automatic transcript-tail evidence applies common-pattern redaction, but redaction is best-effort; avoid putting secrets in prompts.
 - Treat handoffs as project metadata that may contain sensitive implementation context.
 - The user-level SQLite database inherits the security of the local user account and filesystem.
 - Review host configuration changes when installing into shared machines or shared repositories.
@@ -1097,9 +1156,9 @@ It does **not** claim:
 - perfect memory;
 - model consciousness or identity persistence;
 - lossless replay of every prior token;
-- automatic creation of a new chat/session on every host;
+- the ability to force every host UI to open a new interactive window;
 - that historical memory is more authoritative than current code;
-- that a hook can infer semantic task state without the agent writing a checkpoint;
+- that a machine-captured boundary handoff is equivalent to a human/agent-authored semantic checkpoint;
 - that the built-in index is a full semantic code intelligence engine.
 
 It provides a practical, inspectable approximation of continuity from durable state.
