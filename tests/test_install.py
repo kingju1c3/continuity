@@ -53,6 +53,8 @@ class InstallTests(unittest.TestCase):
                 10,
             )
             self.assertTrue((root / ".continuity" / "enabled.json").exists())
+            self.assertTrue((root / ".claude" / "skills" / "continuity" / "protocol" / "session-open.md").exists())
+            self.assertTrue((root / ".agents" / "skills" / "continuity" / "schemas" / "checkpoint.schema.json").exists())
 
     def test_uninstall_removes_only_continuity_owned_entries(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
