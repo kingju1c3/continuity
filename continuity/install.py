@@ -91,7 +91,16 @@ def _skill_text() -> str:
 def _install_skill_bundle(target: Path) -> None:
     package_root = Path(__file__).resolve().parent
     target.mkdir(parents=True, exist_ok=True)
-    (target / "SKILL.md").write_text(_skill_text(), encoding="utf-8")
+    skill = _skill_text()
+    # Skill-scoped Claude hooks must use the same Python that owns this Continuity
+    # installation; relying on a console-script PATH would make activation brittle.
+    hook_command = f'\"{sys.executable}\" -m continuity hook --host claude'
+    yaml_hook_command = hook_command.replace("'", "''")
+    skill = skill.replace(
+        'command: "continuity hook --host claude"',
+        f"command: '{yaml_hook_command}'",
+    )
+    (target / "SKILL.md").write_text(skill, encoding="utf-8")
     for name in ("protocol", "schemas"):
         src = package_root / name
         if src.is_dir():
