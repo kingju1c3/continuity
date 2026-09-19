@@ -96,13 +96,13 @@ def _extract_strings(value, out: list[str], depth: int = 0) -> None:
 
 
 _SECRET_PATTERNS = [
-    (re.compile(r"\\bsk-[A-Za-z0-9_-]{16,}\\b"), "[REDACTED_API_KEY]"),
-    (re.compile(r"\\b(?:ghp|github_pat)_[A-Za-z0-9_]{12,}\\b"), "[REDACTED_GITHUB_TOKEN]"),
-    (re.compile(r"\\bAKIA[0-9A-Z]{16}\\b"), "[REDACTED_AWS_KEY]"),
-    (re.compile(r"(?i)\\bBearer\\s+[A-Za-z0-9._~+/-]{16,}=*"), "Bearer [REDACTED_TOKEN]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{12,}\b"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_AWS_KEY]"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*"), "Bearer [REDACTED_TOKEN]"),
     (
-        re.compile(r"(?i)(password|passwd|api[_-]?key|secret|token)(\\s*[:=]\\s*)[^\\s,;]{6,}"),
-        r"\\1\\2[REDACTED]",
+        re.compile(r"(?i)(password|passwd|api[_-]?key|secret|token)(\s*[:=]\s*)[^\s,;]{6,}"),
+        r"\1\2[REDACTED]",
     ),
 ]
 
