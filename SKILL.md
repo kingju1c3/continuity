@@ -1,75 +1,343 @@
 ---
 name: continuity
-description: "Use for persistent project continuity across sessions and compactions. Restores prior handoffs, searches curated memory, orients in the codebase before broad reads, records durable decisions, and creates successor-ready checkpoints. Invoke with /continuity."
+description: "Premium project continuity for coding agents. Restores verified handoffs, injects relevant durable memory, tracks exact session ownership, preserves compaction freezes, keeps structural context fresh, records durable decisions, and hands work to successor sessions. Invoke with /continuity."
 ---
 
 # /continuity
 
-Continuity is the project's continuity layer. It creates an evidence-backed approximation of continuity from durable state: curated memory, source structure, Git state, and explicit handoffs.
+Continuity is the project's persistent coordination layer. Use it whenever work may span turns, compactions, sessions, agents, or hosts.
 
-## Session opening
+Continuity does **not** treat model prose as authority. Reconstruct continuity from separate durable layers, in this authority order:
 
-At the beginning of project work:
+1. current source + Git state;
+2. fresh structural evidence;
+3. current durable memory;
+4. semantic handoff;
+5. mechanical lifecycle freezes / host summaries.
 
-1. Run continuity start --host <claude|codex|other> --emit-context.
-2. Read the recovered handoff completely before modifying files.
-3. Run continuity orient.
-4. If the task refers to past decisions, bugs, conventions, or prior work, use continuity recall "keywords" before rediscovering them.
-5. For architecture/code questions, prefer continuity query, continuity find, or continuity graph before broad raw-file traversal.
-6. If the index is absent or stale, run continuity index.
+Current source and Git state always win when layers disagree.
 
-Never claim recovery of facts that are not present in durable state or current source.
+## Mandatory operating loop
 
-## Durable memory protocol
+For meaningful project work:
 
-Save significant reusable knowledge, not every turn and not raw tool output. Good candidates: architecture decisions, confirmed conventions, non-obvious bug root causes, configuration decisions, user constraints, and discoveries that prevent future rework.
+`OPEN → VERIFY → RETRIEVE → WORK → REMEMBER → CHECKPOINT → RESTORE`
 
-Use stable --topic keys for knowledge that evolves. That topic is updated rather than duplicated.
+### OPEN
 
-## Structural orientation protocol
+Prefer host-injected SessionStart context. If absent or insufficient:
 
-Use the cheapest reliable source in this order:
+```bash
+continuity start --host <claude|codex|manual> --emit-context
+continuity orient
+```
 
-1. Exact current source when the location is already known.
-2. Continuity local symbol/edge index.
-3. Graft adapter for code orientation when installed.
-4. Graphify adapter for graph/path/concept questions when installed and indexed.
-5. Raw repository-wide search/read as fallback.
+Read `continuity/protocol/session-open.md` when opening or recovering a session.
 
-After meaningful code changes, refresh with continuity index before producing an architecture handoff.
+Never silently ignore a `LEASE CONFLICT`.
 
-## Checkpoint and handoff
+### VERIFY
 
-Before ending a session, before compaction, or when ownership will move to another agent/session, create a semantic checkpoint. It must state:
+Before editing after a handoff:
 
+- verify project root;
+- verify branch;
+- verify HEAD;
+- inspect current working-tree changes;
+- confirm relevant files still exist;
+- surface drift before continuing.
+
+Use:
+
+```bash
+continuity resume
+```
+
+### RETRIEVE
+
+Before re-solving known work:
+
+```bash
+continuity recall "relevant topic"
+```
+
+Before broad codebase traversal:
+
+```bash
+continuity query "where is X implemented?"
+continuity find SomeSymbol
+continuity graph some/module
+```
+
+Read `continuity/protocol/retrieval.md`.
+
+### WORK
+
+Use current source as canonical truth.
+
+PostToolUse hooks mark structural state stale after edit-capable or shell operations. Commands that rely on the built-in structural index refresh it before use.
+
+### REMEMBER
+
+Persist only durable knowledge whose loss would create meaningful rework:
+
+```bash
+continuity remember \
+  "Decision title" \
+  "**What**: ...
+**Why**: ...
+**Where**: ...
+**Learned**: ..." \
+  --kind decision \
+  --topic architecture/example
+```
+
+Use stable topic keys for evolving knowledge. Previous topic values remain in revision history:
+
+```bash
+continuity memory-history architecture/example
+```
+
+Read `continuity/protocol/memory-write.md`.
+
+### CHECKPOINT
+
+Before explicit handoff, session end, risky context loss, or manual compaction after changes:
+
+```bash
+continuity checkpoint \
+  --goal "..." \
+  --instructions "..." \
+  --discoveries "..." \
+  --accomplished "..." \
+  --next-steps "..." \
+  --relevant-files "..." \
+  --verification "..."
+```
+
+A checkpoint must distinguish completed work, proposed work, verified facts, assumptions, and unverified items. The command refreshes structural state first and binds the handoff to the active session lease when available.
+
+Read `continuity/protocol/checkpoint-handoff.md`.
+
+### RESTORE
+
+A successor session:
+
+1. receives the SessionStart context pack;
+2. checks lease ownership;
+3. reads the latest semantic handoff;
+4. checks for any newer mechanical freeze;
+5. verifies current source/Git state;
+6. continues the first unresolved next step.
+
+## Session ownership
+
+Continuity maintains one active lease per project. A host-supplied session ID is authoritative for that host session; do not invent another ID.
+
+If another live session owns the project, do not silently steal it.
+
+Explicit abandoned-session recovery:
+
+```bash
+continuity recover --host <host> --expected-owner <old-session-id>
+```
+
+Read `continuity/protocol/conflict-recovery.md`.
+
+## Automatic lifecycle behavior
+
+When installed, Continuity uses host hooks where supported.
+
+### SessionStart
+
+- registers exact host session ID;
+- acquires an active lease or surfaces a conflict;
+- resolves project identity;
+- restores latest semantic handoff;
+- restores any newer lifecycle freeze;
+- injects recent/relevant durable memory;
+- includes branch, HEAD, and index freshness.
+
+The model receives actual context, not only a reminder to run another command.
+
+### UserPromptSubmit
+
+Inject a bounded prompt-specific context pack:
+- relevant durable memories;
+- structural pointers;
+- project identity;
+- index freshness.
+
+Treat retrieval as candidates, not authority.
+
+### PostToolUse
+
+Edit-capable tools and shell operations mark the built-in structural index dirty.
+
+### Stop
+
+Stop is a **per-turn** event, not session end.
+
+If project changes occurred after the latest semantic handoff for the active session, Continuity gives one-shot feedback asking the agent to checkpoint before ending the turn. It must not loop indefinitely.
+
+### PreCompact
+
+Continuity writes a mechanical freeze before compaction.
+
+For Claude Code manual compaction, if project changes are still uncheckpointed, Continuity may block that manual compaction and require a semantic checkpoint first.
+
+Automatic compaction is never blocked.
+
+### PostCompact
+
+When the host exposes a compact summary, Continuity preserves it with a post-compaction freeze.
+
+### SessionEnd
+
+Continuity writes a final mechanical freeze, ends the session record, and releases the project lease.
+
+Read `continuity/protocol/compaction.md`.
+
+## Mechanical freeze vs semantic checkpoint
+
+They are intentionally different.
+
+A **semantic checkpoint** contains task meaning:
 - goal;
-- active instructions/constraints;
-- discoveries and assumptions;
+- constraints;
+- discoveries;
 - accomplished work;
-- exact next steps;
+- next steps;
 - relevant files;
-- verification already performed and what remains unverified.
+- verification.
 
-Continuity automatically adds Git branch, HEAD, working-tree status, and diffstat. Checkpoints are stored in SQLite and mirrored under .continuity/ for inspectability.
+A **mechanical freeze** contains lifecycle evidence:
+- project;
+- host;
+- host session ID;
+- lifecycle event;
+- Git snapshot;
+- host compact summary when available.
 
-## Successor protocol
+A freeze protects against unexpected context loss. It does not replace a semantic handoff.
 
-A successor session must:
+## Durable memory rules
 
-1. run continuity start --emit-context;
-2. run continuity resume if a handoff exists;
-3. verify that project root, branch, HEAD, and relevant files still match the checkpoint;
-4. state any mismatch before continuing;
-5. continue from the first unresolved next step rather than repeating completed work.
+Save:
+- decisions;
+- root causes;
+- conventions;
+- durable constraints;
+- non-obvious implementation details;
+- important failed approaches;
+- explicit user choices.
 
-## Automatic hooks
+Do not save:
+- passwords;
+- keys;
+- auth tokens;
+- raw transcripts;
+- temporary logs;
+- guesses presented as facts;
+- facts trivial to reread from one obvious source file.
 
-continuity install --agents claude,codex wires repository-local skill/instruction files and lifecycle hooks where the host supports them. Hooks are fail-soft: they inject restoration/checkpoint instructions but never fabricate a completed semantic handoff. A host that cannot programmatically create a brand-new chat/session still gets automatic session registration plus restoration on the next session.
+Pinned memory is for project-critical constraints:
 
-## Integrity rules
+```bash
+continuity remember "Compatibility constraint" "..." --kind constraint --topic api/v1 --pin
+```
 
-- Current source and Git state outrank stale memories.
-- Search hits are candidates; inspect enough evidence before relying on them.
-- Do not store secrets, credentials, or raw private transcripts.
-- Do not silently cross project boundaries.
-- If continuity data is missing, stale, ambiguous, or inconsistent, say so and rebuild/reconcile it.
+## Structural context rules
+
+Retrieval ladder:
+
+1. exact current source when known;
+2. Continuity local index;
+3. Graft when installed;
+4. Graphify when installed and indexed;
+5. broad repository traversal.
+
+The built-in index is a fallback orientation layer, not a full compiler or semantic-analysis engine.
+
+## Conflict rules
+
+When memory, handoff, structural data, and current source differ:
+
+1. current source/Git;
+2. fresh structural evidence;
+3. current durable memory;
+4. historical handoff prose.
+
+Never resolve a conflict merely by choosing the most recent prose.
+
+If two memory states may both be valid because of branches/environments, use distinct topic keys or record the scope explicitly.
+
+## Failure rules
+
+- Malformed hook input: no mutation.
+- Missing SessionStart session ID: no lease mutation.
+- Project without `.continuity/enabled.json`: hooks are no-op.
+- Malformed existing host config: installation fails; do not overwrite.
+- Lease conflict: surface it; do not steal ownership.
+- Stale handoff: show drift and reconcile.
+- Stale index: refresh before built-in structural use.
+- Missing continuity data: say it is missing; do not invent it.
+
+Read `continuity/protocol/security.md`.
+
+## Installation and maintenance
+
+```bash
+continuity install --agents claude,codex
+continuity install --agents claude,codex --dry-run
+continuity repair --agents claude,codex
+continuity uninstall --agents claude,codex
+continuity doctor
+continuity status
+```
+
+## CLI map
+
+- `start` — open/register a session and restore prior handoff context.
+- `end` — explicitly end/release an active manual session.
+- `recover` — explicitly recover ownership from an expected previous session.
+- `orient` — project/lease/index/handoff/memory orientation.
+- `status` — machine-readable current continuity status.
+- `remember` — save/upsert durable memory.
+- `memory-history` — inspect topic revision history.
+- `recall` — FTS memory search.
+- `index` — rebuild local structure.
+- `find` — search symbols/paths.
+- `graph` — inspect indexed edges.
+- `query` — Graft/Graphify/local structural query.
+- `checkpoint` — semantic handoff + Git evidence.
+- `resume` — latest handoff + drift validation.
+- `install` — install project integration.
+- `repair` — reapply integration.
+- `uninstall` — remove Continuity-owned integration.
+- `doctor` — diagnostics.
+- `hook` — host lifecycle entrypoint.
+
+## Protocol references
+
+Read only the reference needed for the current situation:
+
+- `continuity/protocol/session-open.md`
+- `continuity/protocol/retrieval.md`
+- `continuity/protocol/memory-write.md`
+- `continuity/protocol/checkpoint-handoff.md`
+- `continuity/protocol/compaction.md`
+- `continuity/protocol/conflict-recovery.md`
+- `continuity/protocol/security.md`
+
+Schemas:
+
+- `continuity/schemas/checkpoint.schema.json`
+- `continuity/schemas/memory.schema.json`
+- `continuity/schemas/session.schema.json`
+
+## Integrity invariant
+
+Continuity exists to reduce rediscovery without creating false certainty.
+
+If evidence stops, stop the claim.

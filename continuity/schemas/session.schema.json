@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Continuity Session Lease",
+  "type": "object",
+  "required": ["project_key", "session_id", "host", "status"],
+  "properties": {
+    "project_key": {"type": "string"},
+    "session_id": {"type": "string"},
+    "host": {"type": "string"},
+    "status": {"enum": ["active", "released"]},
+    "acquired_at": {"type": "integer"},
+    "heartbeat_at": {"type": "integer"},
+    "released_at": {"type": ["integer", "null"]}
+  }
+}
