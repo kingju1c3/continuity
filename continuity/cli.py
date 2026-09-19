@@ -134,15 +134,36 @@ def cmd_arm(a) -> int:
         )
         st.close()
         return 3
+    pending = pending_successor(st, ident.key)
+    goal = a.goal or ""
+    instructions = a.instructions or ""
+    inherited_from = None
+    if pending and pending.get("host") == host:
+        goal = str(pending.get("goal") or goal)
+        prior_instructions = str(pending.get("instructions") or "")
+        if prior_instructions:
+            instructions = prior_instructions + (("\n" + instructions) if instructions else "")
+        inherited_from = str(pending.get("predecessor_session") or "") or None
+
     state = arm_session(
         st,
         ident.key,
         sid,
         host,
-        goal=a.goal or "",
-        instructions=a.instructions or "",
+        goal=goal,
+        instructions=instructions,
         auto_successor=not a.no_auto_successor,
+        inherited_from=inherited_from,
     )
+    if pending and pending.get("host") == host:
+        pending.update(
+            {
+                "status": "consumed",
+                "successor_session": sid,
+                "consumed_at": int(__import__("time").time()),
+            }
+        )
+        st.set_state(ident.key, "successor_pending", pending)
     print(
         "Continuity armed. It will remain passive during ordinary turns and trigger at the "
         "host PreCompact boundary before compaction.\n"
