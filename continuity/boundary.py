@@ -186,6 +186,17 @@ def _safe_name(session_id: str) -> str:
     return f"continuity-{stamp}-{stem}"
 
 
+def _spawn_background(argv: list[str], cwd: Path):
+    return subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def launch_claude_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
     exe = shutil.which("claude")
     if not exe:
@@ -212,11 +223,7 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
     store.release_lease(ident.key, predecessor_session)
 
     try:
-        proc = subprocess.Popen(
-            [exe, "--bg", "--name", name, prompt],
-            cwd=str(ident.root), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
-        )
+        proc = _spawn_background([exe, "--bg", "--name", name, prompt], ident.root)
     except OSError as exc:
         store.acquire_lease(ident.key, predecessor_session, "claude")
         pending.update({"status": "failed", "reason": str(exc)})
