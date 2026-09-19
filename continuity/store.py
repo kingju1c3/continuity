@@ -216,6 +216,44 @@ class Store:
             raise
         return {"project_key": project_key, "session_id": sid, "host": host, "heartbeat_at": now}
 
+    def recover_lease(
+        self,
+        project_key: str,
+        sid: str,
+        host: str,
+        *,
+        expected_owner: str | None = None,
+    ) -> dict:
+        now = int(time.time())
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT * FROM session_leases WHERE project_key=?", (project_key,)
+            ).fetchone()
+            if row and row["status"] == "active":
+                if expected_owner is not None and row["session_id"] != expected_owner:
+                    raise LeaseConflict(
+                        f"expected active owner {expected_owner}, found {row['session_id']}"
+                    )
+                if row["session_id"] != sid:
+                    self.db.execute(
+                        "UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL",
+                        (now, row["session_id"]),
+                    )
+            self.db.execute(
+                "INSERT INTO session_leases(project_key,session_id,host,acquired_at,heartbeat_at,released_at,status) "
+                "VALUES(?,?,?,?,?,NULL,'active') "
+                "ON CONFLICT(project_key) DO UPDATE SET "
+                "session_id=excluded.session_id,host=excluded.host,acquired_at=excluded.acquired_at,"
+                "heartbeat_at=excluded.heartbeat_at,released_at=NULL,status='active'",
+                (project_key, sid, host, now, now),
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return {"project_key": project_key, "session_id": sid, "host": host, "heartbeat_at": now}
+
     def touch_lease(self, project_key: str, sid: str) -> bool:
         cur = self.db.execute(
             "UPDATE session_leases SET heartbeat_at=? WHERE project_key=? AND session_id=? AND status='active'",
