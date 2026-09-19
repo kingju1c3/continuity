@@ -67,6 +67,17 @@ continuity arm \
 
 Do this before substantive new work.
 
+If the `continuity` console command is unavailable, read `.continuity/enabled.json` and use the recorded `python` interpreter to invoke the same runtime:
+
+```bash
+"<recorded-python>" -m continuity arm \
+  --host auto \
+  --goal "<current user objective>" \
+  --instructions "<critical constraints>"
+```
+
+Do not guess an interpreter path. If the enable marker is missing or its interpreter no longer exists, report that host integration needs repair.
+
 Then tell the user, briefly, that Continuity is armed and will remain passive until a compaction/transfer boundary.
 
 Do **not** keep invoking the skill manually each turn. The host hooks remain registered for the session where supported, and the runtime arm state is durable.
