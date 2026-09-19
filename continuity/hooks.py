@@ -189,14 +189,22 @@ def run_hook(host: str) -> int:
         if event_name == "Stop":
             idx = store.index_state(ident.key)
             dirty_at = idx.get("dirty_at") if idx.get("dirty") else None
-            if dirty_at and sid and not store.session_has_handoff(ident.key, sid):
+            handoff_at = store.latest_handoff_time(ident.key, sid) if sid else None
+            handoff_is_stale = bool(
+                dirty_at
+                and (
+                    handoff_at is None
+                    or (handoff_at * 1_000_000_000) < int(dirty_at)
+                )
+            )
+            if sid and handoff_is_stale:
                 marker_key = f"stop-feedback:{sid}"
                 prior = store.get_state(ident.key, marker_key)
                 if prior != dirty_at:
                     store.set_state(ident.key, marker_key, dirty_at)
                     _emit(
                         "Stop",
-                        "Continuity detected project changes without a semantic handoff for this session. "
+                        "Continuity detected project changes newer than this session's latest semantic handoff. "
                         "Before ending this turn, run continuity checkpoint with the goal, constraints, "
                         "discoveries, accomplished work, exact next steps, relevant files, and verification. "
                         "The checkpoint command refreshes the structural index and binds the handoff to the active session.",
