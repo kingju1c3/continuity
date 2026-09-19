@@ -44,7 +44,7 @@ def render_markdown(p: dict) -> str:
     def s(k: str) -> str:
         return str(p.get(k) or "(none recorded)")
 
-    return f"""# Continuity Handoff
+    text = f"""# Continuity Handoff
 
 - Created: {p.get('created_at')}
 - Kind: {p.get('kind') or 'semantic'}
@@ -81,6 +81,26 @@ def render_markdown(p: dict) -> str:
 ## Diffstat
 {git.get('diffstat') or '(none or unavailable)'}
 """
+    boundary = p.get("automatic_boundary_context")
+    if isinstance(boundary, dict):
+        text += "\n## Automatic Boundary Context\n"
+        text += "\nThis section is machine-captured evidence. Verify it against current source.\n"
+        changed = boundary.get("changed_files") or []
+        if changed:
+            text += "\n### Changed Files\n" + "\n".join(f"- {x}" for x in changed) + "\n"
+        memories = boundary.get("recent_memory") or []
+        if memories:
+            text += "\n### Recent Durable Memory\n"
+            for item in memories:
+                text += f"- [{item.get('kind')}] {item.get('title')} ({item.get('topic_key') or '-'})\n"
+        transcript = boundary.get("transcript_tail") or {}
+        text += "\n### Transcript Tail\n"
+        if transcript.get("available"):
+            text += str(transcript.get("text") or "") + "\n"
+            text += "\n_" + str(transcript.get("warning") or "Best-effort transcript evidence.") + "_\n"
+        else:
+            text += "(unavailable: " + str(transcript.get("reason") or "unknown") + ")\n"
+    return text
 
 
 def write_checkpoint(root: Path, payload: dict) -> Path:

@@ -1,13 +1,41 @@
 # Session Open Protocol
 
-Use this procedure at every Continuity-enabled session start.
+Every host session is registered by exact host session ID when host hooks provide one.
 
-1. Accept the host-provided session ID as the exact session identity. Do not invent a replacement ID when the host already supplied one.
-2. Restore the Continuity context injected by the SessionStart hook.
-3. Check for a lease conflict. If another session still owns the project, do not silently take ownership. Reconcile or use `continuity recover --expected-owner <id>` only when explicit recovery is intended.
-4. Run `continuity orient` when the injected context is insufficient or ambiguous.
-5. If a previous handoff exists, verify project root, branch, HEAD, working tree, and relevant files against current source.
-6. If a newer mechanical freeze exists than the latest semantic handoff, treat the freeze as evidence that the prior session may have lost context before completing a semantic checkpoint.
-7. Continue from the first unresolved next step only after verification.
+## Unarmed ordinary session
 
-Never describe historical memory or a handoff as current truth when the source tree disagrees.
+An unarmed session should be quiet:
+
+1. register exact session identity;
+2. acquire the project lease or surface conflict;
+3. do not inject a large continuity pack;
+4. wait for /continuity to be invoked.
+
+## Armed/inherited successor
+
+When a session is armed or consumes a pending successor transfer:
+
+1. acquire ownership;
+2. restore latest handoff;
+3. restore any newer mechanical freeze;
+4. include branch/HEAD/index freshness;
+5. surface lease conflicts;
+6. verify current source before editing.
+
+Use:
+
+```bash
+continuity resume
+continuity orient
+continuity status
+```
+
+## Pending successor inheritance
+
+Claude successors are matched to the staged successor name when available.
+
+Codex uses the first fresh project session within the pending-transfer TTL. This is why predecessor ownership is released before the user starts the fresh Codex session.
+
+## Authority
+
+Current source/Git > fresh structure > current durable memory > handoff prose > mechanical summaries.

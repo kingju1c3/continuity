@@ -12,10 +12,11 @@ MARKER_END = "<!-- continuity:end -->"
 AGENT_BLOCK = (
     MARKER_START
     + "\n## Continuity\n"
-    + "This project uses the /continuity protocol. At session start, restore Continuity context before editing. "
-      "Search durable project memory before repeating prior work. Prefer structural orientation before broad raw-file reads. "
-      "Before compaction, session end, or explicit handoff, create a semantic Continuity checkpoint that records goal, "
-      "constraints, discoveries, accomplished work, ordered next steps, relevant files, and verification.\n"
+    + "This project supports the Continuity passive handoff protocol. Invoke it with /continuity in Claude Code or "
+      "$continuity in Codex. Invocation must arm the exact current host session with continuity arm, then remain quiet "
+      "during ordinary turns. At the host PreCompact boundary, "
+      "Continuity alerts the user, captures a detailed machine-backed handoff, and transfers ownership to a fresh "
+      "successor session when the host can do so safely. Current source and Git state always outrank historical memory.\n"
     + MARKER_END
     + "\n"
 )
@@ -91,8 +92,17 @@ def _skill_text() -> str:
 def _install_skill_bundle(target: Path) -> None:
     package_root = Path(__file__).resolve().parent
     target.mkdir(parents=True, exist_ok=True)
-    (target / "SKILL.md").write_text(_skill_text(), encoding="utf-8")
-    for name in ("protocol", "schemas"):
+    skill = _skill_text()
+    # Skill-scoped Claude hooks must use the same Python that owns this Continuity
+    # installation; relying on a console-script PATH would make activation brittle.
+    hook_command = f'\"{sys.executable}\" -m continuity hook --host claude'
+    yaml_hook_command = hook_command.replace("'", "''")
+    skill = skill.replace(
+        'command: "continuity hook --host claude"',
+        f"command: '{yaml_hook_command}'",
+    )
+    (target / "SKILL.md").write_text(skill, encoding="utf-8")
+    for name in ("protocol", "schemas", "agents"):
         src = package_root / name
         if src.is_dir():
             shutil.copytree(src, target / name, dirs_exist_ok=True)
@@ -138,7 +148,13 @@ def _command(host: str) -> str:
     return f'"{sys.executable}" -m continuity hook --host {host}'
 
 
-def _handler(host: str, *, timeout: int = 10, context_limit: int | None = None) -> dict:
+def _handler(
+    host: str,
+    *,
+    timeout: int = 10,
+    context_limit: int | None = None,
+    status_message: str | None = None,
+) -> dict:
     h: dict = {
         "type": "command",
         "command": _command(host),
@@ -146,46 +162,50 @@ def _handler(host: str, *, timeout: int = 10, context_limit: int | None = None) 
     }
     if context_limit is not None:
         h["additionalContextLimit"] = context_limit
+    if status_message:
+        h["statusMessage"] = status_message
     return h
 
 
 def _claude_entries() -> dict[str, dict]:
+    # Claude's expensive/session-specific hooks are installed by SKILL.md only after
+    # /continuity is invoked. Global hooks do exact session bookkeeping only.
     return {
         "SessionStart": {
-            "matcher": "startup|resume|clear|compact",
+            "matcher": "startup|resume|clear|compact|fork",
             "hooks": [_handler("claude", timeout=10)],
         },
-        "UserPromptSubmit": {"hooks": [_handler("claude", timeout=10)]},
-        "PostToolUse": {
-            "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
-            "hooks": [_handler("claude", timeout=10)],
-        },
-        "PreCompact": {"hooks": [_handler("claude", timeout=10)]},
-        "PostCompact": {"hooks": [_handler("claude", timeout=10)]},
-        "Stop": {"hooks": [_handler("claude", timeout=10)]},
         "SessionEnd": {"hooks": [_handler("claude", timeout=3)]},
     }
 
 
 def _codex_entries() -> dict[str, dict]:
+    # Codex does not currently expose Claude-style skill-scoped hook registration.
+    # Keep global dispatchers, but hooks.py gates every expensive action on arm state.
     return {
         "SessionStart": {
-            "matcher": "startup|resume|clear|compact",
+            "matcher": "startup|resume|clear|compact|fork",
             "hooks": [_handler("codex", timeout=10, context_limit=5000)],
         },
         "UserPromptSubmit": {
-            "hooks": [_handler("codex", timeout=10, context_limit=3500)],
+            "hooks": [_handler("codex", timeout=10, context_limit=800)],
         },
         "PostToolUse": {
-            "matcher": "apply_patch|Write|Edit|MultiEdit|Bash|Shell|shell",
-            "hooks": [_handler("codex", timeout=10, context_limit=1200)],
+            "matcher": "apply_patch|Write|Edit|MultiEdit|Bash|PowerShell|Shell|shell",
+            "hooks": [_handler("codex", timeout=10, context_limit=800)],
         },
-        "PreCompact": {"hooks": [_handler("codex", timeout=10)]},
+        "PreCompact": {
+            "hooks": [
+                _handler(
+                    "codex",
+                    timeout=25,
+                    status_message="Continuity: compaction boundary reached — preparing successor handoff…",
+                )
+            ]
+        },
         "PostCompact": {"hooks": [_handler("codex", timeout=10)]},
-        "Stop": {"hooks": [_handler("codex", timeout=10, context_limit=1200)]},
         "SessionEnd": {"hooks": [_handler("codex", timeout=3)]},
     }
-
 
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

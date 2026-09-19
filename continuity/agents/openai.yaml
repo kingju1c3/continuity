@@ -1,0 +1,7 @@
+interface:
+  display_name: "Continuity"
+  short_description: "Arm passive pre-compaction handoff and fresh-session transfer."
+  default_prompt: "Use $continuity to arm this exact session for passive handoff at the PreCompact boundary."
+
+policy:
+  allow_implicit_invocation: false
