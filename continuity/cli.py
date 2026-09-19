@@ -85,6 +85,32 @@ def cmd_end(a) -> int:
     return 0
 
 
+def cmd_recover(a) -> int:
+    ident, st = _ctx(a.path)
+    sid = a.session or f"{a.host}-{uuid.uuid4()}"
+    try:
+        st.recover_lease(
+            ident.key,
+            sid,
+            a.host,
+            expected_owner=a.expected_owner,
+        )
+    except LeaseConflict as exc:
+        print(f"RECOVERY REFUSED: {exc}", file=sys.stderr)
+        st.close()
+        return 3
+    st.start_session(
+        sid,
+        ident.key,
+        a.host,
+        str(ident.root),
+        {"manual": True, "recovered": True, "expected_owner": a.expected_owner},
+    )
+    print(f"recovered_session={sid}")
+    st.close()
+    return 0
+
+
 def cmd_remember(a) -> int:
     ident, st = _ctx(a.path)
     content = a.content if a.content is not None else sys.stdin.read()
@@ -129,6 +155,7 @@ def cmd_recall(a) -> int:
 
 def cmd_checkpoint(a) -> int:
     ident, st = _ctx(a.path)
+    refresh = _ensure_index(ident, st)
     sid = a.session
     host = a.host
     if not sid:
@@ -150,7 +177,10 @@ def cmd_checkpoint(a) -> int:
     )
     hid = st.add_handoff(ident.key, sid, payload)
     path = write_checkpoint(ident.root, payload)
-    print(f"handoff={hid}\nfile={path}\nsession={sid or '(none)'}")
+    print(
+        f"handoff={hid}\nfile={path}\nsession={sid or '(none)'}"
+        f"\nindex_refreshed={str(bool(refresh.get('refreshed'))).lower()}"
+    )
     st.close()
     return 0
 
@@ -367,6 +397,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("end")
     s.add_argument("--session")
     s.set_defaults(fn=cmd_end)
+
+    s = sub.add_parser("recover")
+    s.add_argument("--host", default="manual")
+    s.add_argument("--session")
+    s.add_argument("--expected-owner")
+    s.set_defaults(fn=cmd_recover)
 
     s = sub.add_parser("remember")
     s.add_argument("title")
