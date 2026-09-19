@@ -1,0 +1,219 @@
+"""The native face of a tool adapter.
+
+Nothing subclasses this by hand. A tool is sandboxed code, and
+``sandbox.bridge`` builds a subclass of this class at load whose ``run``
+forwards into a box. What lives here is the half the *tool registry* needs to
+see: ``ToolResult``, ``to_schema``, and the declarations both read.
+
+Tools are the on-demand capability layer of Second Brain. A tool accepts
+structured input, inspects local state or external systems, and returns a
+ToolResult that is useful both to frontends and to the LLM.
+
+Unlike tasks, tools do not run automatically over every file. They are
+called explicitly by the agent, the UI, or other tools and return
+immediately.
+
+Tool schemas map directly into LLM function calling:
+    - name        -> function name
+    - description -> function description
+    - parameters  -> JSON schema for arguments
+
+The same tool contract is used everywhere: REPL, installed frontends, package
+commands, and agent turns. See ``templates/tool_template.py`` for what an
+author actually writes.
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+logger = logging.getLogger("Tool")
+
+
+@dataclass(init=False)
+class ToolResult:
+    """
+    The standardized result returned by every tool.
+
+    success:
+        Whether the tool call succeeded.
+    error:
+        Human-readable failure reason when success is False.
+    data:
+        Structured payload for frontends, tables, or debugging. This is not
+        sent directly to the LLM.
+    llm_summary:
+        Concise model-facing summary of what happened. On success, this should
+        carry the facts, changes, paths, counts, or constraints the model
+        needs for its next step.
+    attachment_paths:
+        Local file paths for frontend rendering. These are not sent directly to
+        the LLM, although image paths may later be passed back on a model call.
+    traceback:
+        Where a sandboxed tool broke, in its own frames. Set only when the code
+        raised; empty for a tool that reported an ordinary failure. Reaches the
+        model beside ``error``, so it can fix the line it actually wrote.
+    """
+    success: bool = True
+    error: str = ""
+    data: Any = None
+    llm_summary: str = ""
+    attachment_paths: list[str] = field(default_factory=list)
+    traceback: str = ""
+
+    def __init__(
+        self,
+        success: bool = True,
+        error: str = "",
+        data: Any = None,
+        llm_summary: str = "",
+        attachment_paths: list[str] | None = None,
+        traceback: str = "",
+    ):
+        """Initialize the tool result."""
+        self.success = success
+        self.error = error
+        self.data = data
+        self.llm_summary = llm_summary
+        self.attachment_paths = self._normalize_attachment_paths(attachment_paths)
+        self.traceback = traceback
+
+    @staticmethod
+    def _normalize_attachment_paths(*path_lists) -> list[str]:
+        """Internal helper to normalize attachment paths."""
+        normalized = []
+        seen = set()
+        for paths in path_lists:
+            if not paths:
+                continue
+            for path in paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                normalized.append(path)
+        return normalized
+
+    def to_dict(self, base_url: str = "") -> dict:
+        """Serialize for HTTP API responses.
+
+        ``traceback`` is deliberately absent: this is the public HTTP/MCP shape,
+        and a stack trace is an internal diagnostic rather than part of it.
+
+        Args:
+            base_url: If provided, each attachment gets a fetchable ``url``
+                      pointing at the ``/files`` endpoint (e.g. ``http://host:port``).
+        """
+        from pathlib import Path
+        from urllib.parse import quote
+        from parsing import get_modality
+
+        attachments = []
+        for p in self.attachment_paths:
+            modality = get_modality(Path(p).suffix)
+            att = {"path": p, "modality": modality}
+            if base_url:
+                att["url"] = f"{base_url}/files?path={quote(p, safe='')}"
+            attachments.append(att)
+
+        return {
+            "success": self.success,
+            "error": self.error,
+            "data": self.data,
+            "llm_summary": self.llm_summary,
+            "attachments": attachments,
+        }
+
+    @staticmethod
+    def failed(error: str) -> "ToolResult":
+        """Handle failed."""
+        return ToolResult(success=False, error=error)
+
+
+class BaseTool:
+    """
+    The contract every tool implements.
+
+    Class attributes (override these):
+        name:
+            Stable identifier used everywhere the tool is referenced.
+        description:
+            Short operational description. This is also the LLM-visible tool
+            description, so it should explain what the tool does, when to use
+            it, and any important limits.
+        parameters:
+            JSON Schema describing the input arguments.
+        requires_services:
+            Service names that must be loaded before the tool can run.
+
+    Methods (override these):
+        run(context, **kwargs) -> ToolResult
+    """
+
+    # --- Identity ---
+    name: str = ""
+    description: str = ""
+    parameters: dict = {}
+
+    # --- Service requirements ---
+    requires_services: list[str] = []
+    dependencies_files: list[str] = []
+    dependencies_pip: list[str] = []
+    # Tool names this tool invokes via context.call_tool. Declared deps stay
+    # callable (hidden) when this tool is whitelisted into an agent scope,
+    # even when the call site isn't a literal string the regex fallback can see.
+    dependencies_tools: list[str] = []
+
+    # --- Agent controls ---
+    # Max times the agent can call this tool per message. Unset means the
+    # kernel's `default_tool_max_calls` setting; a number here is a claim that
+    # this particular tool is bounded, not a request for more room.
+    max_calls: int | None = None
+
+    # --- Discovery ---
+    # When False, the plugin discoverer skips this tool. Use for tools that
+    # need per-call construction args and are instantiated manually instead.
+    auto_register: bool = True
+
+    # --- Config settings this plugin needs ---
+    # Each entry is a tuple:
+    # (title, variable_name, description, default, type_info)
+    # Same format as SETTINGS_DATA in config_data.py.
+    config_settings: list = []
+
+    def __init_subclass__(cls, **kwargs):
+        """Internal helper to handle init subclass."""
+        super().__init_subclass__(**kwargs)
+        for attr in ("parameters", "requires_services", "dependencies_files", "dependencies_pip", "dependencies_tools", "config_settings"):
+            value = getattr(cls, attr)
+            if isinstance(value, (dict, list)):
+                setattr(cls, attr, value.copy())
+
+    # --- Agent system-prompt contribution ---
+    # Guidance injected into the agent's system prompt when this tool is in scope.
+    # Declare a plain string, or override with ``def agent_prompt(self, ctx)``
+    # when the text depends on live state. ``ctx`` is a PromptContext,
+    # carrying the session facts ``prompt_cues.SESSION_FACTS`` names —
+    # session_key, conversation_id, user_id, profile_name, frontend_name,
+    # security_mode — plus db/services/orchestrator/config/scope. The
+    # collector accepts either shape.
+    agent_prompt: str = ""
+
+    # When a method-shaped contribution goes stale, and therefore which
+    # block of the prompt it rides in. See ``prompt_cues.py`` for the
+    # ladder; "" means the default rung.
+    agent_prompt_refresh: str = ""
+
+    def run(self, context, **kwargs) -> ToolResult:
+        """Execute the base tool tool."""
+        raise NotImplementedError(f"Tool '{self.name}' must implement run()")
+
+    def to_schema(self) -> dict:
+        """Export the tool as an OpenAI-compatible function schema."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+        }

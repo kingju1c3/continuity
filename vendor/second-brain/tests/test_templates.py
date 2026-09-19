@@ -1,0 +1,206 @@
+"""The templates teach the contract, so the contract checks the templates.
+
+``agent/system_prompt_static.md`` tells the agent every turn that templates are
+the source of truth for authoring each family. That makes them load-bearing
+documentation: a template still teaching ``run(self, context)`` propagates the
+old contract into every plugin written from it, and nothing would notice.
+
+The examples inside them are therefore real, uncommented code, run through the
+same validator a plugin faces. That is the whole point — commented-out examples
+are what rotted last time, because nothing could check them.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+
+from sandbox.validator import ERROR, validate_file
+
+TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+
+# Migrated to the SDK: these must validate and must not mention the old
+# contract anywhere.
+SANDBOXED = ["tool_template.py", "task_template.py", "command_template.py",
+             "service_template.py", "script_template.py", "hook_template.py",
+             "frontend_template.py", "llm_backend_template.py",
+             "parser_template.py"]
+
+# Deliberately still native, each for a stated reason carried in a banner at
+# the top of the file. Listed explicitly so that adding a template forces a
+# decision about which group it belongs to, rather than silently defaulting
+# into the unchecked one. Empty since frontends were bridged — kept because
+# the next family to be added may well arrive before its contract does.
+NATIVE = {}
+
+# The validator rules a template is allowed to break, and only these. Both are
+# rules about DISCOVERY — one class per file, and the family prefix in the
+# filename — which cannot apply to files that are never discovered. Showing
+# several variants side by side is worth more than obeying them here, and
+# hook_template.py has to hold services because that is where hooks live.
+# Every other finding is a real failure.
+DISCOVERY_ONLY = (
+    "only services may share a file",
+    "discovery finds plugins by filename",
+)
+
+
+# The one template that is not Python, because the family is not. A widget is
+# one HTML file — no base class, no entry point, nothing imported — so the
+# validator has nothing to say about it and the checks below are about what it
+# *teaches* instead.
+WIDGET = "widget_template.html"
+
+
+def _templates() -> list:
+    """Every template on disk, so a new one cannot be added unnoticed."""
+    return sorted(p.name for p in TEMPLATES.glob("*_template.py"))
+
+
+def test_every_template_is_accounted_for():
+    """A new template must be classified as sandboxed or deliberately native."""
+    assert set(_templates()) == set(SANDBOXED) | set(NATIVE)
+
+
+@pytest.mark.parametrize("filename", SANDBOXED)
+def test_sandboxed_template_validates(filename):
+    """The examples must be code that would actually load."""
+    report = validate_file(TEMPLATES / filename)
+    real = [f for f in report.of(ERROR)
+            if not any(rule in f.message for rule in DISCOVERY_ONLY)]
+    assert not real, f"{filename} would not load:\n" + "\n".join(
+        f.render() for f in real)
+
+
+# Templates that legitimately import no plugin base class. A script has no
+# base class at all; an LLM backend has one, but it is not a *plugin* base —
+# it lives in ``guest.llm`` beside the parser contract, because a backend
+# belongs to no family and discovery never registers it.
+NO_PLUGIN_BASE = {"script_template.py", "llm_backend_template.py",
+                  "parser_template.py"}
+
+# The base classes a plugin template has to subclass one of. ``guest.llm`` and
+# ``guest.parsing`` are contract modules too, but neither carries a *plugin*
+# base, which is what the families below are checked for.
+PLUGIN_BASE_MODULES = {"guest", "guest.bases", "sandbox.guest",
+                       "sandbox.guest.bases"}
+
+
+def _imports_a_plugin_base(tree) -> bool:
+    """Whether a parsed template imports the guest plugin contract."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(a.name in PLUGIN_BASE_MODULES for a in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            if (node.module or "") in PLUGIN_BASE_MODULES:
+                return True
+    return False
+
+
+@pytest.mark.parametrize("filename", SANDBOXED)
+def test_sandboxed_template_uses_the_sdk(filename):
+    """It must import a guest contract, not a native one."""
+    source = (TEMPLATES / filename).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    if filename not in NO_PLUGIN_BASE:
+        assert _imports_a_plugin_base(tree), (
+            f"{filename} does not import the SDK plugin contract")
+    if filename == "llm_backend_template.py":
+        assert "from guest.llm import" in source, (
+            "a backend template must teach the guest LLM contract")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                ("plugins.", "runtime.", "state_machine.", "pipeline.")):
+            pytest.fail(f"{filename} imports kernel module {node.module}")
+
+
+@pytest.mark.parametrize("filename", SANDBOXED)
+def test_sandboxed_template_drops_the_old_contract(filename):
+    """None of the pre-sandbox vocabulary may survive, in code or in prose.
+
+    Prose counts: the agent reads the docstring as instruction, so a stale
+    sentence teaches the old contract just as effectively as stale code.
+    """
+    source = (TEMPLATES / filename).read_text(encoding="utf-8")
+    for term in ("ToolResult", "TaskResult", "build_services", "context.db",
+                 "context.services", "context.config", "context.call_tool",
+                 "import logging"):
+        assert term not in source, f"{filename} still mentions {term}"
+
+
+@pytest.mark.parametrize("filename", sorted(NATIVE))
+def test_native_template_says_so(filename):
+    """A template still on the old contract must carry its banner.
+
+    Without one, an agent reading it beside the migrated templates has no way
+    to tell that this family works differently.
+    """
+    source = (TEMPLATES / filename).read_text(encoding="utf-8")
+    assert "STILL THE NATIVE CONTRACT" in source
+
+
+@pytest.mark.parametrize("filename", sorted(NATIVE))
+def test_native_template_imports_nothing(filename):
+    """Documentation must not be able to break the app by being imported."""
+    tree = ast.parse((TEMPLATES / filename).read_text(encoding="utf-8"))
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import,
+                                                           ast.ImportFrom))]
+    assert not imports, f"{filename} executes imports at module level"
+
+
+def test_the_widget_template_exists_and_is_html():
+    """The one family whose template is not Python.
+
+    Listed here rather than left out, because the glob above cannot see it:
+    ``*_template.py`` is how every other template is found, so an HTML one is
+    invisible to the accounting test and could rot indefinitely without a
+    single failure. This is that accounting.
+    """
+    assert (TEMPLATES / WIDGET).is_file()
+    assert sorted(p.name for p in TEMPLATES.glob("*_template.html")) == [WIDGET]
+
+
+def test_the_widget_template_teaches_the_bridge():
+    """A widget reaches the kernel one way, and cannot reach it any other."""
+    source = (TEMPLATES / WIDGET).read_text(encoding="utf-8")
+
+    # The whole SDK, and the only door out of an opaque origin.
+    assert "brain.call" in source
+    assert "brain.on" in source
+
+    # The three the sandbox makes unreachable. Naming them is the point: an
+    # author who does not know they are gone will reach for `fetch` first, and
+    # a widget that fails silently at the network layer is a long afternoon.
+    for absent in ("fetch", "localStorage", "window.parent"):
+        assert absent in source, f"the template must say why {absent} is gone"
+
+    # The family that is refused, and the reason it is refused.
+    assert "frontend." in source
+
+
+def test_the_widget_template_writes_no_colour_of_its_own():
+    """The style rule the template states, applied to the template.
+
+    "Never write a hex colour" is the one piece of the styling contract that
+    can be checked rather than asked for, and a template that broke it would
+    teach the opposite of what it says two paragraphs up. Every apparent colour
+    in this app is a token, so a literal here is either a mistake or a decision
+    that needs to be made somewhere a person will see it.
+    """
+    import re
+
+    source = (TEMPLATES / WIDGET).read_text(encoding="utf-8")
+    # Prose mentions one as an example of what not to do; that sentence is the
+    # teaching, so it is allowed and nothing else is.
+    body = source.replace("`#1a1a1a`", "")
+    found = re.findall(r"#[0-9a-fA-F]{3,8}", body)
+    assert not found, f"{WIDGET} hard-codes {found}; use var(--sb-*)"
+
+    # Same rule, the other two ways it is broken.
+    assert "prefers-color-scheme" not in body.replace(
+        "`prefers-color-scheme` media", "")
+    assert "font-family:" not in body

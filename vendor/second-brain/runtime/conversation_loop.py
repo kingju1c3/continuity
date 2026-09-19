@@ -1,0 +1,1768 @@
+"""Drive one participant's turn through cs.enact() until end_turn.
+
+This file is the agent-side equivalent of PokerMonster's `run_game` inner
+loop. While turn priority belongs to a participant, repeatedly:
+    1. ask the participant for the next action  (`_next_action`)
+    2. enact it through the state machine       (`cs.enact(...)`)
+    3. translate the action's events back into provider-shaped history rows
+
+There is exactly ONE labeled `cs.enact(...)` call site in this file — inside
+`_enact_logged`, the gateway every agent-side enact flows through so the
+action ledger records each move (the `end_turn` and over-budget enacts
+included).
+
+The class is named `ConversationLoop` (not `AgentMachine`) because the same
+shape supports user-user or agent-agent conversations in the future. Today
+only the agent path is wired; a user-side `_next_action` would just block
+until input arrives.
+"""
+
+from __future__ import annotations
+
+
+import contextlib
+import inspect
+import json
+import logging
+import time
+from typing import Any, Callable
+
+from agent.system_prompt import SYSTEM_CONTEXT_MARKER
+from agent.tool_registry import DEFAULT_TOOL_MAX_CALLS
+from events.event_bus import bus
+from events.event_channels import (
+    AGENT_LLM_CALL_FINISHED,
+    AGENT_LLM_CALL_STARTED,
+    SESSION_MESSAGE,
+)
+from state_machine.serialization import save_history_message
+from runtime.ledger import record_enact
+from runtime.token_stripper import ModelTextFilter, filter_text
+
+logger = logging.getLogger("ConversationLoop")
+
+
+def _clean(text: str | None) -> str:
+    """The one cleaner. Deltas run through the same filter, incrementally."""
+    return filter_text(text or "")
+
+
+def _accepts_on_call(chat) -> bool:
+    """Whether this brain can hand back a stopper for the call it is placing.
+
+    A real :class:`llm.registry.Brain` can; anything else duck-typed into the
+    brain slot may not, and ``usable_brain`` has never required more than
+    ``chat(request, on_delta=None)``. Asked rather than tried, because
+    catching ``TypeError`` around the call would also swallow one raised
+    *inside* the backend — turning a provider bug into a silently
+    uninterruptible call.
+
+    Not being able to offer one is not a failure: it means this brain cannot
+    be stopped mid-call, which is what the behaviour was for everybody before
+    the slot existed.
+    """
+    try:
+        params = inspect.signature(chat).parameters
+    except (TypeError, ValueError):
+        return False
+    return ("on_call" in params
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values()))
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    """Cap a string by keeping the head and tail and inserting a marker.
+
+    Used to keep oversized tool results from blowing the context window
+    while preserving enough signal that the LLM can tell what kind of
+    payload was elided.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    return f"{text[:head]}\n…[truncated {len(text) - max_chars} chars]…\n{text[-tail:]}"
+
+
+def tool_summary(tool_result, max_chars: int) -> str:
+    """What a *successful* tool call amounts to, as one string.
+
+    Public and module-level because two different consumers need the same
+    answer and used to have only one of them: the transcript row the model
+    reads back next turn (``_format_tool_result``), and the ``tool_status``
+    event a frontend renders (``runtime_config.tool_callbacks``). The event
+    carried no result at all, so every frontend showed a tool call whose
+    outcome was visible only when it failed.
+
+    Same cap for both, so the copy on the wire and the copy in the database
+    are byte-identical rather than merely similar — a frontend that shows one
+    live and the other on reload must not appear to change its mind.
+
+    ``llm_summary`` is what a tool is meant to fill in; the ``data`` fallback
+    is for tools that filled in only the structured half. Raises whatever
+    ``json.dumps`` raises on a payload it cannot serialize — both callers
+    already have to answer for that, and differently.
+    """
+    text = (getattr(tool_result, "llm_summary", None)
+            or json.dumps(getattr(tool_result, "data", None), default=str))
+    return _truncate_middle(text, max_chars)
+
+
+def _attachment_paths(result) -> list[str]:
+    """Files an enact's underlying ``ToolResult`` put in front of the person.
+
+    The ``call_tool`` action carries the real ``ToolResult`` under its own
+    ``data["result"]``, which is the same unwrap ``_format_tool_result`` does.
+    Every other action type has no such payload and answers with nothing.
+    """
+    tool_result = _tool_result(result)
+    return [str(p) for p in (getattr(tool_result, "attachment_paths", None) or [])]
+
+
+def _tool_result(result):
+    """The ``ToolResult`` an enact wrapped, or None for every other action.
+
+    The ``call_tool`` action carries it under its own ``data["result"]``, which
+    is the unwrap ``_format_tool_result`` already does. One accessor because
+    two ledger fields need the same reach into the same place.
+    """
+    payload = getattr(result, "data", None)
+    return payload.get("result") if isinstance(payload, dict) else None
+
+
+def _tool_outcome(result) -> tuple[bool, str] | None:
+    """A wrapped tool's own verdict as ``(ok, error)``, or None if there is no
+    tool underneath.
+
+    ``ToolResult`` spells these ``success``/``error`` where an ``ActionResult``
+    spells them ``ok``/``error.message``, which is why the enact site cannot
+    simply hand the inner object to the ledger and be done.
+    """
+    tool_result = _tool_result(result)
+    if tool_result is None or not hasattr(tool_result, "success"):
+        return None
+    return bool(tool_result.success), str(getattr(tool_result, "error", "") or "")
+
+
+def _prompt_sections(prompt: Any) -> list[dict[str, Any]]:
+    """Normalize legacy string prompts and sectioned prompt messages.
+
+    Accepts ``system``-role messages (the cacheable prefix) and a single
+    ``user``-role message tagged ``[SYSTEM CONTEXT UPDATE]`` (the dynamic
+    block that gets merged into the latest user turn).
+    """
+    if isinstance(prompt, list):
+        out = []
+        for m in prompt:
+            if not isinstance(m, dict) or not m.get("content"):
+                continue
+            role = m.get("role", "system")
+            if role == "system":
+                out.append(dict(m))
+            elif role == "user" and (m.get("content") or "").lstrip().startswith(SYSTEM_CONTEXT_MARKER):
+                out.append(dict(m))
+        return out
+    return [{"role": "system", "content": prompt or ""}]
+
+
+def _for_provider(msg: dict[str, Any]) -> dict[str, Any]:
+    """One history row as a provider will be shown it.
+
+    A transcript row keeps the person's words and the files they attached
+    apart — the files are a record in their own column. A model reads one
+    message, so the pointer lines are rendered back in here, and the key that
+    carried them is dropped: ``messages`` goes to a provider API verbatim, and
+    a field no schema knows is either rejected or silently believed.
+
+    This is the single place history becomes provider messages, which is what
+    makes rendering here safe. Anything else holding this history — a rewrite
+    back to the database, a client, a memory extractor — keeps the two apart.
+
+    ``author`` is dropped here for the same reason and is checked *before* the
+    attachments shortcut below: it rides on rows that carry no files at all —
+    a cancel notice, a doorman's note — so returning ``msg`` unchanged on the
+    no-attachments path would send a key no provider schema knows straight to
+    the API.
+    """
+    if not msg.get("attachments") and "author" not in msg and "turn_id" not in msg:
+        return msg
+    from attachments.attachment import with_pointers
+
+    out = {key: value for key, value in msg.items()
+           if key not in ("attachments", "author", "turn_id")}
+    if msg.get("attachments"):
+        out["content"] = with_pointers(msg.get("content") or "", msg["attachments"])
+    return out
+
+
+def _split_current_turn(history: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split prior transcript from the latest user-led turn.
+
+    Deliberately still asks only about ``role``, unlike ``latest_user_text``.
+    The row this finds is where the ``[SYSTEM CONTEXT UPDATE]`` block gets
+    merged, so an authored row (a cancel notice, a doorman's note) is a
+    perfectly good host for it — the block is kernel text either way. Changing
+    turn-splitting to skip them would move the merge point for no gain.
+    """
+    idx = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
+    return (history, []) if idx is None else (history[:idx], history[idx:])
+
+
+class ConversationLoop:
+    """Drive a participant's turn until they end it.
+
+    For an agent: ask the LLM, translate the response into typed actions
+    (`send_text`, `call_tool`, `end_turn`), dispatch each through
+    `cs.enact()`. Tool execution lives inside `CallTool` (via the shared
+    `_CallableAction._run` path), so this loop never touches the registry
+    directly — it only orchestrates.
+    """
+
+    OVER_BUDGET_MESSAGE = "[WARNING: Second Brain has hit the tool-call limit.]"
+    OVER_BUDGET_NUDGE = "You've hit the tool-call limit. Summarize what you have and stop calling tools."
+    # This is a backstop against a *runaway* tool, not a second opinion on a
+    # tool that already bounded its own output — and at 12000 it was the
+    # second. ``read_file`` caps itself at 20_000 chars and says so in its own
+    # result ("pass offset/limit to page further"), so the kernel then elided
+    # ~8000 characters out of the *middle* of a file the agent was about to
+    # match ``old_text`` against. The agent could see the marker but had no way
+    # to page around a cap it was never told about, so every ``edit_file``
+    # replace drawn from the middle of a large file failed as "old_text was not
+    # found" — and the agent learned to route around the tool with shell
+    # commands. Keep this >= the largest self-capping tool's own ceiling; the
+    # constant it must not undercut lives in the store, in tool_read_file.py.
+    MAX_TOOL_RESULT_CHARS = 20000
+    # An error has its own, smaller budget. It was never truncated at all,
+    # which was fine while an error was a sentence and stopped being fine the
+    # moment it could carry a stack — or an exception whose str() is a
+    # parser's entire input document.
+    MAX_TOOL_ERROR_CHARS = 4000
+    # How many times the doormen at the end_turn doorway may send the agent
+    # back inside per drive. A stubborn doorman can never trap the agent
+    # (the Claude Code stop_hook_active lesson): past this, the turn ends.
+    DOORMAN_FIRE_LIMIT = 3
+
+    def __init__(
+        self,
+        llm,
+        tool_registry,
+        config: dict,
+        system_prompt: str | Callable[[], str],
+        on_tool_start=None,
+        on_tool_result=None,
+        on_notice=None,
+        cancel_event=None,
+        runtime=None,
+        session_key: str | None = None,
+        on_delta=None,
+    ):
+        """Initialize the conversation loop."""
+        self.llm = llm
+        self.tool_registry = tool_registry
+        self.config = config
+        self.system_prompt = system_prompt
+        self.on_tool_start = on_tool_start
+        self.on_tool_result = on_tool_result
+        self.on_notice = on_notice
+        # Sink for streamed text-delta payloads (see AGENT_TEXT_DELTA in
+        # events/event_channels.py). None = streaming off, which the loop
+        # spells by leaving ``LLMRequest.stream`` false.
+        self.on_delta = on_delta
+        self.cancel_event = cancel_event
+        self.runtime = runtime
+        self.session_key = session_key
+        self.cancelled = False
+        self.running = False
+        # One-shot guard for the empty-response nudge retry (per turn).
+        self._empty_response_retried = False
+        # Set by the compaction layer around overflow retries: the retried
+        # call runs non-streaming (the aborted stream was already closed).
+        self._retry_without_streaming = False
+        self._tool_call_counts: dict[str, int] = {}
+        # Pending tool calls from the latest LLM response. The loop drains this
+        # one-per-iteration so each tool call goes through its own `enact()`.
+        self._pending_tool_calls: list[dict[str, Any]] = []
+        # The LLM's accompanying text for the current tool-call batch. It
+        # rides along on the FIRST CallTool action of the batch so the
+        # provider transcript keeps its assistant-text-with-tool-calls shape.
+        self._assistant_text_for_pending: str | None = None
+        self._final_text: str | None = None
+        self._used_attachments_for_last_action = False
+        self._active_db = None
+        self._active_conversation_id = None
+        # Live-stream bookkeeping for the current LLM call (see _emit_delta /
+        # _finish_stream). A stream is "open" between the first delta and its
+        # done event; abnormal exits close it with aborted=True.
+        self._stream_id: str | None = None
+        self._stream_seq = 0
+        self._stream_emitted = False
+        # The same filter _clean() uses, fed incrementally. Not a twin of it —
+        # literally the same class, which is what makes the streamed text and
+        # the final text agree.
+        self._stream_filter: ModelTextFilter | None = None
+        # The brain that actually took the most recent call (escorts may swap
+        # request.llm per call); the ledger records this, not the default.
+        self._last_llm_used = None
+        # End-turn doorman state (reset per drive). The once-flags shape the
+        # NEXT model call only: ephemeral notes are shown to the model without
+        # entering history; the overrides narrow/force the toolbox for a
+        # doorman-demanded call.
+        self._doorman_fires = 0
+        self._pending_ephemeral_notes: list[str] = []
+        self._tools_override_once: list | None = None
+        self._tool_choice_once = None
+        self._suppress_tools_once = False
+        # How this drive ended, for the ``turn_finish`` observers one layer up
+        # (``TurnOutcome.reason``). ``drive`` has nine ways out and returns one
+        # tuple, so the facts that tell them apart — ``restarting``,
+        # ``action_failed``, whether the iteration budget ran out — are locals
+        # that die at the return. An attribute survives it, which is the whole
+        # reason this is not a fourth element of the tuple: the caller must be
+        # able to read it in its own ``finally``, including when ``drive``
+        # raised and returned nothing at all.
+        self._exit_reason = ""
+
+    def _call_limit(self, tool) -> int:
+        """How many times `tool` may be called this message.
+
+        The registry owns the answer, because it holds the config the default
+        comes from. The fallback is for a registry that predates the method
+        (test doubles, mostly): a declared number, else the kernel default.
+        """
+        resolve = getattr(self.tool_registry, "call_limit", None)
+        if callable(resolve):
+            return resolve(tool)
+        return getattr(tool, "max_calls", None) or DEFAULT_TOOL_MAX_CALLS
+
+    @property
+    def max_tool_calls(self) -> int:
+        """Return max tool calls."""
+        return (
+            getattr(self.tool_registry, "max_tool_calls", 0)
+            or sum(self._call_limit(t) for t in getattr(self.tool_registry, "tools", {}).values())
+            or 1
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public entrypoint
+    # ──────────────────────────────────────────────────────────────────────
+
+    def drive(
+        self,
+        cs,
+        actor_id: str,
+        history: list[dict[str, Any]],
+        db=None,
+        conversation_id: int | None = None,
+    ) -> tuple[str | None, list[dict[str, Any]], list[str]]:
+        """Run iterations of choose-action / enact / record until turn ends.
+
+        `history` is the provider-shaped transcript and is mutated in place;
+        `new_messages` is what was appended this turn (returned for adapters).
+
+        Attachments queued on ``cs.pending_attachments`` are bundled and
+        passed to the LLM on the first call of the turn; the bundle is
+        then cleared (``per_turn`` lifecycle) or kept for the next turn
+        (``persistent`` lifecycle).
+        """
+        self.running = True
+        self.cancelled = False
+        self._empty_response_retried = False
+        self._tool_call_counts.clear()
+        self._pending_tool_calls.clear()
+        self._assistant_text_for_pending = None
+        self._final_text = None
+        self._active_db = db
+        self._active_conversation_id = conversation_id
+        self._doorman_fires = 0
+        self._pending_ephemeral_notes.clear()
+        self._tools_override_once = None
+        self._tool_choice_once = None
+        self._suppress_tools_once = False
+        # Reset here rather than in the ``finally`` below, because the caller
+        # reads it *after* ``drive`` returns. Production builds a fresh loop
+        # per drive (``runtime_config.build_loop``), but tests reuse one rig
+        # across several, so the stale value has to be cleared on the way in.
+        self._exit_reason = ""
+
+        new_messages: list[dict[str, Any]] = []
+        attachments: list[str] = []
+        action_failed = False
+        restarting = False
+
+        from attachments.attachment import AttachmentBundle
+        bundle = AttachmentBundle.from_iterable(cs.pending_attachments)
+        if getattr(cs, "attachment_lifecycle", "per_turn") == "per_turn":
+            cs.pending_attachments = []
+
+        # Generous upper bound so multi-call rounds (k tool calls per LLM turn,
+        # potentially several rounds) cannot infinite-loop.
+        max_iterations = (self.max_tool_calls + 1) * 4
+
+        try:
+            for _ in range(max_iterations):
+                # Two different endings, deliberately no longer one branch:
+                # a person stopped the turn, or the state machine handed
+                # priority back mid-flight. They leave by the same door and
+                # mean opposite things to a ``turn_finish`` observer.
+                if self._cancelled():
+                    self._exit_reason = "cancelled"
+                    break
+                if cs.turn_priority != actor_id:
+                    self._exit_reason = "priority_handoff"
+                    break
+
+                queued_attachments = self._drain_queued_messages(
+                    history, new_messages)
+                if queued_attachments:
+                    bundle = self._merge_bundles(
+                        bundle, AttachmentBundle.from_iterable(
+                            queued_attachments))
+                self._used_attachments_for_last_action = False
+                action_type, content = self._next_action(cs, history, bundle)
+                if not action_type:
+                    # ``_next_action`` only declines when it noticed a cancel.
+                    self._exit_reason = self._exit_reason or "no_action"
+                    break
+                if self._used_attachments_for_last_action:
+                    # Only the first LLM call of the turn sees the bundle.
+                    bundle = AttachmentBundle()
+
+                if self._cancelled():
+                    self._exit_reason = "cancelled"
+                    break
+                if action_type == "end_turn":
+                    # The doorman at the exit: the agent says "I'm done" —
+                    # registered end_turn hooks may let it leave, send it back
+                    # inside with a note, or demand one last tool call.
+                    gate = self._doorman_gate(cs, content, history, new_messages, db, conversation_id)
+                    if gate == "redrive":
+                        restarting = True
+                        self._exit_reason = "redrive"
+                        break
+                    if gate == "again":
+                        continue
+                    # gate == "end": fall through and enact end_turn.
+                if action_type == "call_tool":
+                    # Refusals decided by the loop itself (unparseable JSON
+                    # arguments, per-tool budget) are synthesized as failed
+                    # results without enacting: the state machine never sees
+                    # garbage args, the frontend still gets its ✕ status,
+                    # and the error row lands in history for the LLM to read.
+                    args = (content or {}).get("args") or {}
+                    if "__invalid_arguments__" in args:
+                        refusal = (f"Invalid JSON in tool arguments: {args['__invalid_arguments__']}", "invalid_arguments")
+                    else:
+                        refusal = (self._tool_budget_error(content), "tool_budget_exceeded")
+                    if refusal[0]:
+                        from state_machine.errors import ActionResult
+                        result = ActionResult.fail("call_tool", refusal[0], code=refusal[1])
+                        started = self._tool_started(action_type, content)
+                        self._tool_finished(started, result=result)
+                        self._absorb(result, action_type, content, history, new_messages, attachments, db, conversation_id)
+                        continue
+                started = self._tool_started(action_type, content)
+                try:
+                    result = self._enact_logged(cs, action_type, content, actor_id)
+                except Exception as e:
+                    self._tool_finished(started, error=str(e))
+                    raise
+                self._tool_finished(started, result=result)
+
+                self._absorb(result, action_type, content, history, new_messages, attachments, db, conversation_id)
+                if action_type == "call_tool":
+                    staged = self._drain_hook_attachments()
+                    if staged:
+                        bundle = self._merge_bundles(bundle, staged)
+
+                if self._restart_requested():
+                    # A tool asked the runtime to re-drive this turn (e.g.
+                    # escalation). Exit without end_turn so the agent keeps
+                    # priority; the re-driven loop finishes the logical turn.
+                    restarting = True
+                    self._exit_reason = "redrive"
+                    break
+                if not result.ok:
+                    if action_type == "call_tool":
+                        # A failed tool action (unknown/hallucinated tool name,
+                        # out-of-scope tool, invalid input) is feedback, not a
+                        # turn-ender: _absorb already recorded the error as the
+                        # tool result, so ask the LLM again and let it correct
+                        # course. max_iterations bounds a repeat offender.
+                        continue
+                    action_failed = True
+                    self._exit_reason = "action_failed"
+                    break
+                if action_type == "end_turn":
+                    self._exit_reason = "model_finished"
+                    break
+            else:
+                # ``for``/``else``: the loop ran every iteration without
+                # breaking, which is precisely what "ran out of budget" means
+                # and is the one ending with no ``break`` of its own to label.
+                self._exit_reason = "budget_exhausted"
+
+            if cs.turn_priority == actor_id and not restarting and not self._restart_requested():
+                # The barrier before anything else that ends the turn. It used
+                # to live only inside the two doorways, which meant a turn
+                # leaving by any *other* route — a failed non-tool action, a
+                # cancel, a priority handoff — walked out past its own
+                # children and their reports were never delivered. That is
+                # the quiet failure this whole mechanism exists to prevent,
+                # so it is asked on every path out rather than on the two
+                # that happened to be doorways.
+                #
+                # Every path out *except* a cancel. ``subagents.cancel_for``
+                # already stopped this turn's children, so there is nothing
+                # left worth delivering — and a barrier that collects sets
+                # ``restarting``, which re-drives. The re-drive is not even
+                # cancelled: ``_drive_agent_turn``'s finally clears
+                # ``cancel_event`` on the way past. That is a whole fresh
+                # agent turn arriving after the person said stop.
+                if not self._cancelled() and self._subagent_barrier(self._session()):
+                    restarting = True
+                    self._exit_reason = "redrive"
+                else:
+                    # Only nudge the LLM for a wrap-up when the loop genuinely
+                    # ran out of budget/iterations — a failed action ending the
+                    # turn would make the "you've hit the tool-call limit"
+                    # premise false.
+                    if not self._cancelled() and not action_failed:
+                        self._finish_over_budget(cs, actor_id, history, new_messages, attachments, db, conversation_id)
+                    if not self._restart_requested():
+                        self._enact_logged(cs, "end_turn", None, actor_id)
+
+            if self._cancelled():
+                self._record_cancellation(history, new_messages, db, conversation_id)
+            return self._final_text, new_messages, attachments
+        finally:
+            # Belt-and-braces: a cancel or unexpected exit can leave a stream
+            # open; close it so frontends drop the partial line.
+            self._finish_stream(aborted=True)
+            self._active_db = None
+            self._active_conversation_id = None
+            self.running = False
+
+    def _enact_logged(self, cs, action_type: str, content: Any, actor_id: str):
+        """Gateway for every agent-side enact: run it, append the outcome to
+        the action ledger, re-raise on failure. Ledger writes are best-effort
+        and can never break the turn (see runtime/ledger.py)."""
+        enact_started = time.perf_counter()
+        try:
+            # ──────────────────── THE enact() SITE ────────────────────
+            result = cs.enact(action_type, content, actor_id)
+            # ──────────────────────────────────────────────────────────
+        except Exception as e:
+            self._record_ledger(action_type, content, actor_id, None, str(e), enact_started)
+            raise
+        self._record_ledger(action_type, content, actor_id, result, None, enact_started)
+        return result
+
+    def _record_ledger(self, action_type, content, actor_id, result, error_message, enact_started):
+        """Internal helper to append one agent-side enact to the ledger."""
+        session = self._session()
+        data = {"llm": getattr(self._last_llm_used or self.llm, "model_name", None)}
+        if turn_id := getattr(session, "turn_id", None):
+            data["turn_id"] = turn_id
+        # Doorway-forced acts (queued agent actions, doorman-required tools)
+        # carry their origin so the audit trail distinguishes model-chosen
+        # moves from script-forced ones.
+        forced_by = (content or {}).get("_forced_by") if isinstance(content, dict) else None
+        if forced_by:
+            data["hook"] = forced_by
+        # Files the tool put in front of the person. These reach a frontend as
+        # an ``attachments`` render frame and are then *gone*:
+        # ``conversation_messages`` has no metadata column, and
+        # ``serialization._record`` writes only role/content/tool_call_id/
+        # tool_name — so a reload cannot tell that a turn showed anything at
+        # all. The same paths ``_format_tool_result`` pulls for the live frame,
+        # kept where they outlive the event.
+        paths = _attachment_paths(result)
+        if paths:
+            data["attachments"] = paths
+        record_enact(
+            self._active_db, origin="agent_enact",
+            session_key=self.session_key,
+            conversation_id=self._active_conversation_id,
+            user_id=getattr(session, "user_id", None),
+            actor_id=actor_id, action_type=action_type, content=content,
+            result=result, error_message=error_message,
+            duration_ms=int((time.perf_counter() - enact_started) * 1000),
+            data=data,
+            # The enact says the tool was called; this says how the call went.
+            # Without it a failing tool is indistinguishable in the table from
+            # a working one, which is why edit_file could be unreliable for
+            # weeks with 39k ledger rows recording nothing about it.
+            outcome=_tool_outcome(result),
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Picking the next action (the LLM half of the loop)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _next_action(
+        self,
+        cs,
+        history: list[dict[str, Any]],
+        bundle,
+    ) -> tuple[str | None, Any]:
+        """Return `(action_type, content)` for the agent's next move.
+
+        Drains pending tool calls from the previous LLM response one at a time
+        before issuing the next LLM request. When the LLM returns text-only,
+        emits `send_text` first and then `end_turn` on the following iteration.
+        """
+        # 1) Still have pending tool calls? Issue one. The first call of a
+        #    batch carries the assistant's accompanying text (if any).
+        if self._cancelled():
+            return None, None
+        if self._pending_tool_calls:
+            tc = self._pending_tool_calls.pop(0)
+            try:
+                args = json.loads(tc.get("arguments") or "{}")
+            except json.JSONDecodeError as e:
+                args = {"__invalid_arguments__": str(e)}
+            content = {
+                "name": tc.get("name"),
+                "args": args,
+                "_tool_call_id": tc.get("id"),
+                "_assistant_text": self._assistant_text_for_pending,
+            }
+            self._assistant_text_for_pending = None  # only first call carries it
+            return "call_tool", content
+
+        # 1b) Doorway-queued agent actions (session.pending_agent_actions):
+        #     tool calls injected by hooks/tools, waiting at the loop
+        #     boundary. Never drained mid tool-call batch (step 1 runs
+        #     first), so an assistant/tool-result pair is never split.
+        queued = self._pop_agent_action()
+        if queued is not None:
+            return queued
+
+        # 2) Final text was already emitted but turn isn't ended → end it.
+        if self._final_text is not None and cs.turn_priority == "agent":
+            text = self._final_text
+            return "end_turn", {"final_text": text}
+
+        # 3) Otherwise call the LLM for the next response. The call travels
+        #    through the model-call escort chain (registered escorts outermost,
+        #    then the kernel's context guard, then the empty-response nudge —
+        #    see _invoke). The
+        #    doorman once-flags shape exactly one call: a narrowed/forced
+        #    toolbox and ephemeral notes shown to the model but kept out of
+        #    history.
+        from attachments.attachment import AttachmentBundle
+        schemas = self.tool_registry.get_all_schemas() if self.tool_registry else None
+        if self._tools_override_once is not None:
+            schemas = self._tools_override_once
+        if self._suppress_tools_once:
+            schemas = None
+        tool_choice = self._tool_choice_once
+        self._tools_override_once = None
+        self._tool_choice_once = None
+        self._suppress_tools_once = False
+        self._used_attachments_for_last_action = bool(bundle)
+        messages = self._messages(history)
+        if self._pending_ephemeral_notes:
+            messages = [*messages, *({"role": "user", "content": n} for n in self._pending_ephemeral_notes)]
+            self._pending_ephemeral_notes.clear()
+        response = self._invoke(messages, schemas or None, bundle, history, tool_choice=tool_choice)
+
+        # Cancelled while the model was answering. Everything below this line
+        # *renders* — narration to the frontend, a final reply, an open stream
+        # closed with text — so it is the last point at which the answer can
+        # be dropped rather than shown. Dropping it is the whole promise of
+        # ``/cancel``: no agent output after the cancel lands. The response is
+        # discarded, not recorded; the turn ends where the person stopped it.
+        if self._cancelled():
+            self._finish_stream(aborted=True)
+            return None, None
+
+        if getattr(response, "has_tool_calls", False):
+            self._pending_tool_calls = list(response.tool_calls)
+            cleaned = _clean(getattr(response, "content", None))
+            # Cleaned, not raw. This rides on the first tool-call history row
+            # and is therefore replayed into every later prompt — storing the
+            # raw text fed the model its own reasoning tags back, which is the
+            # most likely reason it started emitting them in the wrong places.
+            self._assistant_text_for_pending = cleaned or None
+            # Surface the model's mid-turn explanatory text to live frontends.
+            self._finish_stream(cleaned, "narration")
+            if cleaned and self.runtime is not None and self.session_key:
+                self.runtime.push_message(self.session_key, cleaned)
+            # Recurse to immediately return the first call as an action.
+            return self._next_action(cs, history, AttachmentBundle())
+
+        # Text-only response: emit `send_text` now; next iteration will end_turn.
+        text = _clean(getattr(response, "content", ""))
+        self._finish_stream(text, "final")
+        self._final_text = text
+        return "send_text", text
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Translating action results back into provider-shaped history rows
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _absorb(
+        self,
+        result,
+        action_type: str,
+        content: Any,
+        history: list[dict[str, Any]],
+        new_messages: list[dict[str, Any]],
+        attachments: list[str],
+        db,
+        conversation_id,
+    ) -> None:
+        """Read the action's outcome and append matching history rows."""
+        if action_type == "send_text":
+            text = content if isinstance(content, str) else ""
+            self._record({"role": "assistant", "content": text}, history, new_messages, db, conversation_id)
+            return
+
+        if action_type == "call_tool":
+            tc_id = (content or {}).get("_tool_call_id") or "tc_unknown"
+            name = (content or {}).get("name") or "unknown"
+            args = (content or {}).get("args") or {}
+            assistant_text = (content or {}).get("_assistant_text")
+            assistant_msg = {
+                "role": "assistant",
+                "content": assistant_text,
+                "tool_calls": [{
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args, default=str)},
+                }],
+            }
+            self._record(assistant_msg, history, new_messages, db, conversation_id)
+
+            tool_text, tool_paths = self._format_tool_result(name, result, args)
+            attachments.extend(tool_paths)
+            self._record(
+                {"role": "tool", "tool_call_id": tc_id, "name": name, "content": tool_text},
+                history, new_messages, db, conversation_id,
+            )
+            return
+
+        if action_type == "end_turn":
+            # Final text, if any, was already recorded as a SendText. EndTurn
+            # itself does not emit a history row.
+            return
+
+    def _format_tool_result(self, name: str, result, args: dict[str, Any]) -> tuple[str, list[str]]:
+        """Serialize the action's outcome into `(text, attachment_paths)`."""
+        if "__invalid_arguments__" in (args or {}):
+            return json.dumps({"error": f"Invalid JSON in tool arguments: {args['__invalid_arguments__']}"}), []
+
+        # Killed by ``/cancel`` rather than by anything about the tool. What
+        # the box actually reported is a corpse's error ("box died during
+        # 'run'"), which would read to the model next turn as a broken tool
+        # and invite a retry of work the person just stopped. The row itself
+        # is not optional: an assistant ``tool_calls`` row with no matching
+        # tool row is an invalid transcript, so this is written even though
+        # nothing renders it.
+        if self._cancelled():
+            return json.dumps({"error": "Interrupted by user."}), []
+
+        # The `call_tool` action's data carries the underlying ToolResult.
+        payload = (getattr(result, "data", None) or {})
+        tool_result = payload.get("result")
+
+        # Action-level failure (legality, exec error) → tool error message.
+        if not getattr(result, "ok", True):
+            err = getattr(result, "error", None)
+            return json.dumps({"error": _truncate_middle(
+                err.message if err else "Tool failed.",
+                self.MAX_TOOL_ERROR_CHARS)}), []
+
+        # ToolResult-level failure.
+        if tool_result is not None and not getattr(tool_result, "success", True):
+            failed = {"error": _truncate_middle(
+                str(getattr(tool_result, "error", "") or "Tool failed."),
+                self.MAX_TOOL_ERROR_CHARS)}
+            # A named key rather than multiprocessing's triple-quote fence:
+            # that fence exists because its channel is a bare string, and this
+            # one is JSON, where the key says what the blob is with no
+            # convention to learn. Absent on native tools, which have no field.
+            trace = str(getattr(tool_result, "traceback", "") or "")
+            if trace:
+                failed["traceback"] = _truncate_middle(
+                    trace, self.MAX_TOOL_ERROR_CHARS)
+            return json.dumps(failed), []
+
+        # Ok action with no underlying ToolResult (e.g. an approval was
+        # requested): surface the action's own message, never a bare "null"
+        # the model can't interpret.
+        if tool_result is None:
+            return getattr(result, "message", None) or "(tool produced no result)", []
+
+        paths = list(getattr(tool_result, "attachment_paths", []) or [])
+        try:
+            return tool_summary(tool_result, self.MAX_TOOL_RESULT_CHARS), paths
+        except (TypeError, ValueError) as e:
+            return json.dumps({"error": f"Result serialization failed: {e}"}), []
+
+    def _drain_hook_attachments(self):
+        """Collect attachments staged by tools/services for the next LLM call."""
+        from attachments.attachment import AttachmentBundle
+        session = self._session()
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        return AttachmentBundle.from_iterable(hooks.drain_attachments(session)) if hooks and session else AttachmentBundle()
+
+    def _merge_bundles(self, current, staged):
+        """Append newly staged attachments without losing an existing bundle."""
+        from attachments.attachment import AttachmentBundle
+        bundle = AttachmentBundle.from_iterable(current)
+        for attachment in staged:
+            bundle.append(attachment)
+        return bundle
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Build provider messages with the dynamic context ahead of the turn.
+
+        Sectioned prompts come in as ``[system_combined, user_context_update]``.
+        The system message stays at position 0 (cacheable). The context-update
+        message is placed as **its own row immediately before** the latest real
+        user turn.
+
+        It used to be prepended into that user row instead, welded onto the
+        person's own words. That kept strict role alternation, and it is what
+        made the block hardest for a model to read as anything other than
+        something the user said — no amount of "not authored by the user" text
+        inside a user message undoes the role it arrives in. Its own row at
+        least makes the seam visible.
+
+        Two properties survive the change and one does not. The **placement**
+        is identical: ``_split_current_turn`` finds the same row, and in an
+        agentic run — one user message followed by dozens of assistant and tool
+        rows — the block still lands at index 1, ahead of the whole transcript,
+        so everything the turn-stable clock and ``turn_prompt_tokens`` exist
+        for still holds. **Tool-call adjacency** survives too: the insertion
+        point is immediately before a ``user`` row, and no user row ever sits
+        between an assistant's ``tool_calls`` and the ``tool`` rows answering
+        them. What is forfeited is **strict alternation** — the block and the
+        user's message are now two consecutive ``user`` rows. OpenAI-shaped
+        APIs accept that; an API that requires alternation does not, and for
+        one that also refuses a ``system`` row outside position 0 there is no
+        arrangement that satisfies both.
+        """
+        prompt = self.system_prompt() if callable(self.system_prompt) else self.system_prompt
+        sections = _prompt_sections(prompt)
+        clean_history = [_for_provider(m) for m in history
+                         if m.get("role") != "system"]
+
+        ctx_idx = next(
+            (i for i, m in enumerate(sections)
+             if m.get("role") == "user"
+             and (m.get("content") or "").lstrip().startswith(SYSTEM_CONTEXT_MARKER)),
+            None,
+        )
+        if ctx_idx is None:
+            return [*sections, *clean_history]
+
+        ctx_msg = sections[ctx_idx]
+        prefix = sections[:ctx_idx] + sections[ctx_idx + 1:]
+        # One expression for both cases: a history with no user row at all — a
+        # re-drive picking up mid-turn — splits as all-prior and empty tail, so
+        # the block lands last, which is where it belongs when there is no turn
+        # to precede.
+        prior, tail = _split_current_turn(clean_history)
+        return [*prefix, *prior, ctx_msg, *tail]
+
+    def _tool_budget_error(self, content: Any) -> str | None:
+        """Internal helper to handle tool budget error."""
+        name = (content or {}).get("name") or "unknown"
+        tool = (getattr(self.tool_registry, "tools", {}) or {}).get(name) if self.tool_registry else None
+        if not tool:
+            return None
+        used, limit = self._tool_call_counts.get(name, 0), self._call_limit(tool)
+        if used >= limit:
+            return f"Tool '{name}' has reached its call limit ({limit}). Try a different approach."
+        self._tool_call_counts[name] = used + 1
+        return None
+
+    def _invoke(self, messages, tools, attachments=None, history=None, tool_choice=None):
+        """Issue one model call through the escort chain.
+
+        The request is materialized as a ``ModelRequest`` so escorts standing
+        at the ``llm_call`` doorway can rewrite it (swap the brain, edit
+        messages, force a tool), place the call themselves, and inspect the
+        response before the loop sees it. The onion, outermost first:
+        registered escorts → the kernel's context guard (compaction) → the
+        kernel's empty-response nudge → the backend. The two kernel layers are
+        always installed by the loop itself — context safety never depends on
+        what happens to be registered.
+        """
+        from runtime.hooks import ModelRequest
+
+        request = ModelRequest(
+            llm=self._brain_name(), messages=messages, tools=tools,
+            tool_choice=tool_choice, attachments=attachments or None,
+        )
+
+        handler = self._empty_response_layer(self._call_backend)
+        if history is not None:
+            handler = self._compaction_layer(handler, history)
+        session = self._session()
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        if hooks is not None and session is not None:
+            handler = hooks.wrap_llm_call(session, self.runtime, handler)
+        return handler(request)
+
+    def _empty_response_layer(self, proceed):
+        """The kernel's own innermost escort: retry an empty response once.
+
+        Empty text-only responses happen with weak models — often right after
+        a tool error. Nudge once with an ephemeral message that is NOT recorded
+        in history, then accept whatever comes back. One retry per turn.
+
+        This used to also catch a bare think block that stripped to nothing.
+        It can't happen any more: the filter deletes only a matched pair, so
+        text with nowhere to go is released rather than eaten. What is left
+        here is a genuine provider outcome, not a symptom.
+        """
+        def layer(request):
+            response = proceed(request)
+            if getattr(response, "has_tool_calls", False):
+                return response
+            if _clean(getattr(response, "content", "") or ""):
+                return response
+            if self._empty_response_retried:
+                return response
+            self._empty_response_retried = True
+            logger.warning("LLM returned an empty response; retrying once with a nudge.")
+            self._finish_stream(aborted=True)  # drop any streamed whitespace
+            from runtime.hooks import ModelRequest
+            retry = ModelRequest(
+                llm=request.llm,
+                messages=[*request.messages, {"role": "user", "content": (
+                    "Your last response was empty. Send the user a substantive "
+                    "reply summarizing where things stand (or call a tool)."
+                )}],
+                tools=request.tools, tool_choice=request.tool_choice,
+                params=request.params, attachments=None,
+            )
+            return proceed(retry)
+        return layer
+
+    def _route_attachments(self, llm, messages, attachments):
+        """Split a bundle into what this model reads natively and what it does not.
+
+        Kernel work, deliberately. It used to live on ``BaseLLM``, which meant
+        every backend inherited a method reaching into ``attachments.*`` — a
+        kernel import in the one place that most needs to be isolatable. Doing
+        it here means the box receives plain dicts and the fallback text is
+        already in the prompt.
+
+        Returns ``(messages, native)`` where ``native`` is a list of
+        ``{path, modality, file_name}`` dicts.
+        """
+        if not attachments:
+            return messages, []
+        from attachments.attachment import AttachmentBundle
+
+        bundle = (attachments if isinstance(attachments, AttachmentBundle)
+                  else AttachmentBundle.from_iterable(attachments))
+        if not bundle:
+            return messages, []
+        native, suffix = bundle.split_for_llm(
+            getattr(llm, "capabilities", {}) or {},
+            getattr(llm, "native_modalities", None)
+            or {"image", "audio", "video"})
+        # Everything a backend legitimately needs to build a provider payload:
+        # the bytes' location, what kind of thing it is, and the extension it
+        # will derive a mime type from. ``parsed_text`` rides along so a
+        # backend that decides at the last moment it cannot send the file
+        # natively still has the text to fall back to.
+        crossable = [{
+            "path": getattr(item, "path", ""),
+            "extension": getattr(item, "extension", ""),
+            "file_name": getattr(item, "file_name", ""),
+            "modality": getattr(item, "modality", ""),
+            "parsed_text": getattr(item, "parsed_text", None),
+        } for item in (native or [])]
+        if not suffix:
+            return messages, crossable
+        return self._append_to_last_user(messages, suffix), crossable
+
+    @staticmethod
+    def _append_to_last_user(messages, suffix: str):
+        """Add the text fallback to the last user message, whatever its shape.
+
+        ``content`` is usually a string but may already be a list of content
+        blocks when a caller pre-built them; both are handled rather than
+        assumed.
+        """
+        out = [dict(message) for message in messages]
+        for index in range(len(out) - 1, -1, -1):
+            if out[index].get("role") != "user":
+                continue
+            content = out[index].get("content")
+            if isinstance(content, list):
+                out[index]["content"] = [*content,
+                                         {"type": "text", "text": f"\n\n{suffix}"}]
+            else:
+                out[index]["content"] = f"{content or ''}\n\n{suffix}".strip()
+            break
+        return out
+
+    def _brain_name(self) -> str:
+        """The profile name of this loop's default brain.
+
+        ``ModelRequest.llm`` carries a *name*, not a brain. An escort swaps
+        models by naming one, which is the same handle-not-the-thing move as
+        ``<secret:...>``: it works identically for a native escort and a
+        sandboxed one (which could never be handed a live object anyway), and
+        it means a hook cannot hold a reference to a model past the call.
+        """
+        return getattr(self.llm, "name", "") or ""
+
+    def _brain(self, ref):
+        """The brain a request names, falling back to the loop's default."""
+        from llm import resolve
+
+        config = (getattr(self.runtime, "config", None) if self.runtime
+                  else None) or {}
+        if ref is None or ref == "":
+            return self._default_brain()
+        return resolve(ref, config) or self._default_brain()
+
+    def _default_brain(self):
+        """This loop's own brain.
+
+        Nothing adapts it any more. A directly injected model object used to
+        be wrapped in a ``NativeBrain`` on the way past, because a backend
+        could still be an in-process service exposing ``chat_with_tools``.
+        Every backend runs in a box now, so whatever is injected here has to
+        speak ``chat`` like a real one.
+        """
+        return self.llm
+
+    def _call_backend(self, request):
+        """The innermost step of the escort onion: the actual backend call,
+        bracketed by the AGENT_LLM_CALL_STARTED / _FINISHED bus events (which
+        report the brain that actually took the call, post-escorts)."""
+        llm = self._brain(request.llm)
+        self._last_llm_used = llm
+        streaming = (self.on_delta is not None
+                     and getattr(llm, "supports_streaming", False)
+                     and not self._retry_without_streaming)
+        llm_call_started = time.time()
+        bus.emit(AGENT_LLM_CALL_STARTED, {
+            "session_key": self.session_key,
+            "model": getattr(llm, "model_name", None),
+            "streaming": streaming,
+        })
+        # Armed for the duration of the call, so ``/cancel`` on another thread
+        # can end it. This is the one long block in the turn that cancellation
+        # could not previously reach: a streaming backend's only outbound
+        # Request is a one-way notice, so starving it reaches nothing and this
+        # thread sits on the pipe until the provider is done. What gets armed
+        # is the box the pool leased — hence a slot filled from inside the
+        # call rather than a stopper we could name up front.
+        # Asked of the session by name rather than by type, like every other
+        # session read in this file: a turn can be driven against a stand-in
+        # that carries only the few attributes its test needs, and a loop that
+        # insists on the full dataclass fails on the rig instead of the code.
+        # A session that cannot offer a slot simply cannot be interrupted
+        # mid-call, which is what the old behaviour was for everybody.
+        interruptible = getattr(self._session(), "interruptible", None)
+        with (interruptible() if interruptible is not None
+              else contextlib.nullcontext(None)) as slot:
+            on_call = getattr(slot, "arm", None)
+            try:
+                response = self._invoke_inner(request, streaming, on_call=on_call)
+            except Exception as e:
+                self._emit_llm_finished(llm, llm_call_started, ok=False, error=str(e))
+                raise
+        self._emit_llm_finished(llm, llm_call_started, ok=True, response=response)
+        return response
+
+    def _emit_llm_finished(self, llm, started_at, *, ok, response=None, error=None):
+        """Announce the outcome of one LLM call (paired with AGENT_LLM_CALL_STARTED).
+
+        The three token counts are the provider's own, taken from the ``usage``
+        block of its response rather than computed here — no tokenizer is
+        involved, and none would be as accurate, since only the provider knows
+        how it serialised the chat template and tool schemas.
+
+        ``None`` means *the provider did not say*, which is not zero. A
+        provider that ignores ``stream_options={"include_usage": True}``
+        reports nothing, and a consumer that averages a missing count as zero
+        would understate cost without ever looking wrong.
+
+        ``prompt_tokens`` is also recorded on the session, because it is the
+        only measurement of how full the context window is that anybody in the
+        process has — no tokenizer here could match the provider's own count of
+        a chat template it serialised itself. The prompt does not read this
+        field directly; ``HookRegistry.start_turn`` freezes it per turn first.
+        See ``RuntimeSession.last_prompt_tokens``.
+        """
+        session = self._session()
+        tokens = getattr(response, "prompt_tokens", None)
+        if session is not None and tokens is not None:
+            session.last_prompt_tokens = tokens
+        bus.emit(AGENT_LLM_CALL_FINISHED, {
+            "session_key": self.session_key,
+            "model": getattr(llm, "model_name", None),
+            "ok": ok,
+            "error": error,
+            "duration_s": round(time.time() - started_at, 3),
+            # Billed input for this one call: the whole conversation so far,
+            # which is why the value climbs across a turn. Summing it over a
+            # task gives total billed input, not context size.
+            "prompt_tokens": getattr(response, "prompt_tokens", None),
+            # The discounted share of ``prompt_tokens``, not an addition to it.
+            "cached_prompt_tokens": getattr(response, "cached_prompt_tokens", None),
+            "completion_tokens": getattr(response, "completion_tokens", None),
+            "has_tool_calls": bool(getattr(response, "has_tool_calls", False)),
+        })
+
+    def _invoke_inner(self, request, streaming, on_call=None):
+        """Issue one LLM call with streaming.
+
+        Wrapped by ``_call_backend``, which brackets it with the
+        AGENT_LLM_CALL_STARTED / _FINISHED bus events. Extra provider kwargs
+        (``request.params``, ``tool_choice``) are forwarded only when set, so
+        backends and test fakes that don't accept them are never surprised.
+        ``on_call`` follows the same rule for the same reason — it is how the
+        cancel path learns which box is serving this call, and a brain that
+        does not offer one simply cannot be interrupted mid-call.
+        Failures — including error-shaped responses — are raised; the
+        compaction layer above catches context-limit ones and retries.
+
+        The resolved profile's own params (reasoning effort and anything it
+        declares as extras) go *underneath* the request's, so an escort that
+        set one overrides the profile and one that set none inherits it. This
+        happens here rather than where ``ModelRequest`` is built because an
+        escort may swap ``request.llm``: params belong to the profile that
+        ends up taking the call, not to the one the turn started with."""
+        from llm import LLMRequest
+
+        llm = self._brain(request.llm)
+        kwargs = dict(getattr(llm, "params", None) or {})
+        kwargs.update(request.params or {})
+        if request.tool_choice is not None and getattr(llm, "supports_tool_choice", False):
+            kwargs["tool_choice"] = request.tool_choice
+        # Attachment routing is the kernel's, not the backend's: split against
+        # this model's declared capabilities here, so what crosses the boundary
+        # is only what the backend should send natively.
+        messages, native = self._route_attachments(
+            llm, request.messages, request.attachments)
+        outgoing = LLMRequest(
+            messages=messages, tools=request.tools, attachments=native,
+            params=kwargs, stream=streaming)
+        try:
+            if streaming:
+                import uuid
+                self._stream_id = f"st_{uuid.uuid4().hex[:12]}"
+                self._stream_seq = 0
+                self._stream_emitted = False
+                self._stream_filter = ModelTextFilter()
+            extra = ({"on_call": on_call}
+                     if on_call is not None and _accepts_on_call(llm.chat)
+                     else {})
+            response = llm.chat(
+                outgoing, on_delta=self._emit_delta if streaming else None,
+                **extra)
+        except Exception:
+            # Any deltas already shown are now stale — tell frontends to
+            # discard the partial line before the retry/raise above.
+            self._finish_stream(aborted=True)
+            raise
+        if getattr(response, "is_error", False):
+            self._finish_stream(aborted=True)
+            err = getattr(response, "error", None) or getattr(response, "content", None) or "LLM provider error."
+            raise RuntimeError(err)
+        return response
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Streaming (AGENT_TEXT_DELTA emission; only active when both on_delta
+    # is wired AND the backend advertises supports_streaming)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _emit_delta(self, fragment: str) -> bool:
+        """Backend-facing on_delta callback. Returns False to abort the stream.
+
+        Fragments pass through the same filter _clean() uses, so thinking
+        blocks and EOS tokens never reach frontends and what streams in is
+        what the whole-message path will deliver."""
+        if fragment and self._stream_id is not None:
+            if self._stream_filter is not None:
+                fragment = self._stream_filter.feed(fragment)
+            self._send_delta(fragment)
+        return not self._cancelled()
+
+    def _send_delta(self, fragment: str) -> None:
+        """Emit one already-filtered delta payload."""
+        if not fragment:
+            return
+        self._stream_seq += 1
+        self._stream_emitted = True
+        try:
+            self.on_delta({
+                "stream_id": self._stream_id,
+                "seq": self._stream_seq,
+                "delta": fragment,
+                "done": False,
+                "aborted": False,
+            })
+        except Exception:
+            logger.exception("on_delta sink raised; continuing")
+
+    def _finish_stream(self, final_text: str | None = None, kind: str | None = None,
+                       aborted: bool = False) -> None:
+        """Close the open stream, if any. No-op unless deltas were emitted.
+
+        A clean close carries ``final_text`` — the CLEANED text, which the
+        deltas already agree with because both came out of the same filter
+        (``ModelTextFilter``; ``filter_text`` is it fed one fragment). That is
+        what lets frontends dedup the duplicate whole message.
+        """
+        # Release any tail the filter was withholding as a possible partial
+        # tag (it wasn't one if we got here without more input).
+        if not aborted and self._stream_filter is not None and self._stream_id is not None:
+            self._send_delta(self._stream_filter.flush())
+        emitted, stream_id, seq = self._stream_emitted, self._stream_id, self._stream_seq
+        self._stream_id, self._stream_seq, self._stream_emitted = None, 0, False
+        self._stream_filter = None
+        if not emitted:
+            return
+        payload = {"stream_id": stream_id, "seq": seq + 1, "delta": "",
+                   "done": True, "aborted": aborted}
+        if not aborted:
+            payload["final_text"] = final_text or ""
+            payload["kind"] = kind or "final"
+        try:
+            self.on_delta(payload)
+        except Exception:
+            logger.exception("on_delta sink raised on done; continuing")
+
+    def _compaction_layer(self, proceed, history):
+        """The kernel's context-safety escort, always installed by the loop.
+
+        Outward (reactive): a context-limit failure from any inner layer is
+        caught here — compact ``history``, rebuild the prompt from it, and
+        retry through the same inner onion, so the retry gets the post-escort
+        brain, bus events, and streaming like any other call. If the
+        post-compact retry still overflows, emergency-truncate and try once
+        more before surfacing the unrecoverable error. Inward (proactive):
+        after a successful call, compact when it used most of the brain's
+        context window, so the next call starts small.
+        """
+        from llm import is_context_limit_error
+        from runtime.hooks import ModelRequest
+
+        def rebuilt(request):
+            # The prompt is rebuilt from the (now smaller) history; ephemeral
+            # additions and attachments from the failed call are dropped.
+            return ModelRequest(
+                llm=request.llm, messages=self._messages(history),
+                tools=request.tools, tool_choice=request.tool_choice,
+                params=request.params, attachments=None,
+            )
+
+        def layer(request):
+            try:
+                response = proceed(request)
+            except Exception as e:
+                if not is_context_limit_error(e):
+                    raise
+                logger.warning("Context limit hit, compacting and retrying: %s", e)
+                self._compact(history)
+                # Retries run non-streaming: the aborted stream was already
+                # closed, and a second partial line would only confuse.
+                self._retry_without_streaming = True
+                try:
+                    try:
+                        return proceed(rebuilt(request))
+                    except Exception as retry_error:
+                        if not is_context_limit_error(retry_error):
+                            raise
+                        logger.warning("Post-compact retry still over context, doing emergency truncation: %s", retry_error)
+                    self._emergency_truncate(history)
+                    try:
+                        return proceed(rebuilt(request))
+                    except Exception as final_error:
+                        if is_context_limit_error(final_error):
+                            raise RuntimeError("Context limit reached even after compacting. Use /new to start fresh.") from final_error
+                        raise
+                finally:
+                    self._retry_without_streaming = False
+            self._compact_if_needed(request, response, history)
+            return response
+        return layer
+
+    def _emergency_truncate(self, history) -> None:
+        """Last-resort shrink that does NOT call the LLM. Keeps only the
+        most recent user message (and any in-flight tool_call/result pair
+        that immediately follows it), aggressively truncating any string
+        content. Used when compaction itself can't help — either because
+        the compactor service did not produce a summary, the summary came
+        back empty, or the post-compact retry still overflowed.
+
+        Like ``_split_current_turn`` this asks only about ``role``: keeping an
+        authored row is keeping context the model needs (a cancel notice most
+        of all), and this path is already discarding almost everything."""
+        if not history:
+            return
+        last_user_idx = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
+        if last_user_idx is None:
+            keep = history[-1:]
+        else:
+            keep = history[last_user_idx:]
+        cap = 2000
+        shrunk = []
+        for msg in keep:
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > cap:
+                msg = {**msg, "content": _truncate_middle(content, cap)}
+            shrunk.append(msg)
+        original_count = len(history)
+        history[:] = [
+            {"role": "user", "author": "truncation", "content": "[Earlier conversation dropped to fit context. Continue from the message below.]"},
+            {"role": "assistant", "author": "truncation", "content": "Understood."},
+            *shrunk,
+        ]
+        logger.warning(f"Emergency-truncated history from {original_count} -> {len(history)} messages.")
+        if self.on_notice:
+            self.on_notice(f"Context overflow: dropped earlier messages to keep going (was {original_count}).")
+
+    def _compact_if_needed(self, request, response, history) -> None:
+        # Proactive compaction: trigger before hitting the context limit when
+        # the model's context_size is set. context_size == 0 disables proactive
+        # compaction; the reactive path of the compaction layer is the safety
+        # net. Measured against the brain that actually took the call
+        # (post-escort), not the loop's default.
+        """Internal helper to compact if needed."""
+        llm = self._brain(request.llm)
+        ctx, tok = getattr(llm, "context_size", 0), getattr(response, "prompt_tokens", 0)
+        if not ctx or not tok or tok / ctx < 0.80 or len(history) <= 2:
+            return
+        self._compact(history)
+
+    def _compact(self, history) -> None:
+        """Summarize the head of `history` in place via the compactor service.
+
+        The act itself lives in ``runtime.compaction`` because ``/compact``
+        performs the same one outside a turn. What stays here is the
+        *swallow*: compaction observes a turn's context pressure and must
+        never be the reason the turn fails. The command path deliberately
+        does not swallow — it has somebody waiting for an answer.
+
+        Imported locally because ``runtime.compaction`` imports this module
+        for its renderers, and a module-level import either way is a cycle.
+        """
+        from runtime.compaction import compact_history
+
+        try:
+            compact_history(self.runtime, self.session_key, history,
+                            db=self._active_db,
+                            conversation_id=self._active_conversation_id,
+                            on_notice=self.on_notice)
+        except Exception as e:
+            logger.debug("Compaction failed: %s", e, exc_info=True)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # The end_turn doorway (doorman gate + budget exhaustion)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _subagent_barrier(self, session) -> bool:
+        """Hold the ending turn open until its background children report.
+
+        Stacked here rather than registered as an ``end_turn`` hook, for the
+        reason the compaction layer is stacked one moment over: collecting
+        children must not depend on which plugins are installed.
+        ``sdk.agent.spawn(wait=False)`` is reachable from any script, and a
+        child nobody collects is work the model paid for and never sees.
+
+        Returns True when reports or queued user input wake the parent. The
+        caller re-drives either way; an unfinished child remains behind the
+        barrier and will be waited on again after the parent responds.
+        """
+        registry = getattr(self.runtime, "subagents", None) if self.runtime else None
+        if registry is None or session is None:
+            return False
+        if not registry.barrier(session):
+            return False
+        session.restart_turn = True
+        return True
+
+    def _doorman_gate(self, cs, content, history, new_messages, db, conversation_id) -> str:
+        """Consult the doormen when the agent tries to end its turn.
+
+        Returns ``"end"`` (let it leave), ``"again"`` (sent back inside — the
+        loop re-asks the model), or ``"redrive"`` (exit this drive; the
+        runtime re-drives the logical turn). Past the fire budget the doormen
+        are no longer consulted and the agent always gets to leave.
+        """
+        from runtime.hooks import Allow, Redrive, RequireTool, SendBack, TurnEnding
+
+        session = self._session()
+        # The kernel's barrier stands ahead of the doormen and ahead of the
+        # fire budget, because uncollected children are not a policy question.
+        # A turn that has spent its doorman budget must still not walk away
+        # from agents it started — and the barrier is not a doorman, so it has
+        # no budget to spend.
+        if self._subagent_barrier(session):
+            return "redrive"
+        if self._doorman_fires >= self.DOORMAN_FIRE_LIMIT:
+            return "end"
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        if hooks is None or session is None:
+            return "end"
+        ending = TurnEnding(
+            final_text=(content or {}).get("final_text"),
+            reason="model_finished",
+            doorman_fires=self._doorman_fires,
+        )
+        verdict = hooks.vet_end_turn(session, self.runtime, ending)
+        if verdict is None or isinstance(verdict, Allow):
+            return "end"
+        if isinstance(verdict, Redrive):
+            session.restart_turn = True
+            return "redrive"
+        self._doorman_fires += 1
+        if isinstance(verdict, SendBack):
+            note = (verdict.note or "").strip()
+            if note and not verdict.ephemeral:
+                # Recorded feedback keeps the transcript coherent: the note
+                # lands as a user row between the agent's two replies — but a
+                # doorman is not the person, so it says whose note it is.
+                self._record({"role": "user", "author": "doorman_note", "content": note}, history, new_messages, db, conversation_id)
+            elif note:
+                self._pending_ephemeral_notes.append(note)
+            if not verdict.allow_tools:
+                self._suppress_tools_once = True
+            self._final_text = None
+            return "again"
+        if isinstance(verdict, RequireTool):
+            schema = self._tool_schema(verdict.name)
+            if schema is None:
+                logger.warning(f"Doorman required unknown tool {verdict.name!r}; allowing end of turn.")
+                return "end"
+            self._grant_required_tool(cs, verdict.name, schema)
+            note = (verdict.note or "").strip() or (
+                f"Before finishing, you must call the '{verdict.name}' tool now."
+            )
+            self._pending_ephemeral_notes.append(note)
+            if getattr(self.llm, "supports_tool_choice", False):
+                # The real force: one call offering only that tool, with
+                # tool_choice pinned. (Checked against the drive's default
+                # brain; an escort that swaps llm per call keeps the pin only
+                # if its brain also honors tool_choice.)
+                self._tools_override_once = [schema]
+                self._tool_choice_once = {"type": "function", "function": {"name": verdict.name}}
+            # Without backend support this degrades to the prompt-level
+            # instruction alone — softer, but works on every backend.
+            self._final_text = None
+            return "again"
+        logger.warning(f"Unknown doorman verdict {verdict!r}; allowing end of turn.")
+        return "end"
+
+    def _grant_required_tool(self, cs, name: str, schema) -> None:
+        """Let the agent call the tool it is about to be handed.
+
+        **The rule is that the agent may only call what it can see, and this
+        keeps that true rather than bending it.** The forced call shows the model
+        exactly one tool, so for the length of that call the visible set *is*
+        this tool — but the participant's callable specs were built once, at the
+        start of the dispatch, from the registry as it looked then. A tool a
+        shaper had hidden is therefore missing from them, and the state machine
+        refuses the call the kernel just compelled: ``Tool not in agent scope``,
+        after the model did exactly as it was told.
+
+        Granting is narrow on purpose. One tool, named by a doorman, for the
+        turn it was named in — and self-clearing, because ``refresh_specs``
+        rebuilds the participant's tools from the registry on the next dispatch.
+        A profile that denies a tool still denies it: ``_tool_schema`` never
+        finds one outside the scoped registry, so there is nothing to bind.
+        """
+        participant = (cs.participants or {}).get("agent")
+        if participant is None or not isinstance(getattr(participant, "tools", None), dict):
+            return
+        if name in participant.tools:
+            return
+        from runtime.runtime_config import tool_spec
+
+        bound = tool_spec(self.tool_registry, schema)
+        if bound is not None:
+            participant.tools[bound[0]] = bound[1]
+
+    def _tool_schema(self, name: str):
+        """Find one tool's provider schema — visible first, then any callable one.
+
+        **Visibility is not the question a doorman is asking.** ``get_all_schemas``
+        answers with what the *model was shown*, and requiring a tool means
+        overriding exactly that: the forced call above replaces the toolbox with
+        this one schema and pins ``tool_choice`` to it, so whether the name was in
+        the catalogue never enters into the call being built.
+
+        Reading only the visible set made a shaper and its own doorman mutually
+        exclusive — hide a tool at ``shape_scope`` so it does not sit in every
+        prompt, and the ``end_turn`` hook that exists to demand it stopped being
+        able to find it. The miss was silent, too: an unknown name logs and lets
+        the turn end, so the symptom was chips that simply never appeared.
+
+        The fallback reads ``tools`` rather than the visible set, which
+        ``scoped_registry`` keeps deliberately separate (visible ⊆ callable). A
+        profile that denies a tool removes it from *both*, so this widens what a
+        doorman can reach without touching that boundary.
+        """
+        for schema in (self.tool_registry.get_all_schemas() if self.tool_registry else None) or []:
+            fn = schema.get("function", schema)
+            if fn.get("name") == name:
+                return schema
+        tool = (self.tool_registry.tools.get(name) if self.tool_registry else None)
+        return tool.to_schema() if tool is not None else None
+
+    def _pop_agent_action(self):
+        """Return the next doorway-queued agent action as a call_tool, if any.
+
+        Entries on ``session.pending_agent_actions`` are dicts:
+        ``{"name": tool_name, "args": {...}, "forced_by": <hook label>}``.
+        Each drains through the same enact/absorb/ledger path as a
+        model-chosen call, with a synthetic tool_call_id and a ledger stamp
+        marking who queued it.
+        """
+        session = self._session()
+        if session is None or not getattr(session, "pending_agent_actions", None):
+            return None
+        with session.lock:
+            if not session.pending_agent_actions:
+                return None
+            entry = session.pending_agent_actions.pop(0)
+        name = (entry or {}).get("name")
+        if not name:
+            logger.warning(f"Ignoring malformed queued agent action: {entry!r}")
+            return self._pop_agent_action()
+        import uuid
+        return "call_tool", {
+            "name": name,
+            "args": dict((entry or {}).get("args") or {}),
+            "_tool_call_id": f"tc_hook_{uuid.uuid4().hex[:8]}",
+            "_assistant_text": None,
+            "_forced_by": (entry or {}).get("forced_by") or "pending_agent_actions",
+        }
+
+    def _finish_over_budget(self, cs, actor_id, history, new_messages, attachments, db, conversation_id) -> None:
+        """The doorman consult at budget exhaustion.
+
+        The kernel's own default doorman lives here: when every registered
+        doorman abstains, the classic wrap-up runs — one text-only model call
+        nudging the agent to summarize what it has (this used to be the
+        hardcoded ``_over_budget_summary``). A registered doorman can wave
+        the exhausted turn through silently (``Allow``), replace the wrap-up
+        note (``SendBack``), or hand the turn back for a re-drive
+        (``Redrive``). ``RequireTool`` degrades to its note here: with the
+        iteration budget spent there is nothing left to run a tool with.
+        """
+        from runtime.hooks import Allow, Redrive, RequireTool, SendBack, TurnEnding
+
+        verdict = None
+        session = self._session()
+        # Same barrier, same reason: an exhausted turn with pending children
+        # still owes the model their reports before it stops.
+        if self._subagent_barrier(session):
+            return
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        if hooks is not None and session is not None and self._doorman_fires < self.DOORMAN_FIRE_LIMIT:
+            verdict = hooks.vet_end_turn(session, self.runtime, TurnEnding(
+                final_text=None, reason="budget_exhausted", doorman_fires=self._doorman_fires,
+            ))
+        if isinstance(verdict, Allow):
+            return  # a doorman explicitly waved the silent exit through
+        if isinstance(verdict, Redrive):
+            if session is not None:
+                session.restart_turn = True
+            return
+        note = self.OVER_BUDGET_NUDGE
+        if isinstance(verdict, SendBack) and (verdict.note or "").strip():
+            self._doorman_fires += 1
+            note = verdict.note.strip()
+        elif isinstance(verdict, RequireTool):
+            self._doorman_fires += 1
+            logger.warning(f"Doorman required tool {verdict.name!r} at budget exhaustion; degrading to a note.")
+            note = (verdict.note or "").strip() or note
+        try:
+            nudge = {"role": "user", "content": note}
+            response = self._invoke(self._messages([*history, nudge]), None, None, history)
+            text = _clean(getattr(response, "content", "")) or self.OVER_BUDGET_MESSAGE
+        except Exception:
+            text = self.OVER_BUDGET_MESSAGE
+        self._finish_stream(text, "final")
+        self._final_text = text
+        self._absorb(self._enact_logged(cs, "send_text", text, actor_id), "send_text", text, history, new_messages, attachments, db, conversation_id)
+
+    CANCEL_NOTICE = (
+        "[The user cancelled the previous turn. Everything it had started — "
+        "tool calls, background agents — was stopped and produced no results, "
+        "and nothing from it is still coming. Do not resume that work, report "
+        "on it, or offer to wait for it unless you are asked to.]"
+    )
+
+    def _record_cancellation(self, history, new_messages, db, conversation_id) -> None:
+        """Leave one row saying the turn was stopped.
+
+        Without it a cancelled turn leaves **no trace in the transcript at
+        all**: the last rows are the agent's own tool calls — five successful
+        ``spawn_subagent`` results, say — and the next user message simply
+        follows. The model reads its own plan back, sees no evidence anything
+        ended, and offers to wait for results that were cancelled minutes ago.
+
+        Written here rather than queued on ``session.pending_user_inputs``,
+        which was the first attempt and was worse than the problem: that list
+        is a *drive trigger*, drained by ``handle_action``'s closing-race
+        check into a fresh ``send_text`` — so the notice started a whole new
+        agent turn, and one that was no longer cancelled, since the flag is
+        cleared on the way out. Recorded on the loop's own thread, at the one
+        point the turn is known to be over, it reaches the model at its next
+        call and starts nothing.
+
+        One sentence for every cancel, rather than a tailored one: what
+        differs between "a tool was running" and "five agents were running" is
+        not something the model needs to act on differently, and the branch
+        cost a boolean threaded through two files.
+        """
+        self._record({"role": "user", "author": "cancel_notice",
+                      "content": self.CANCEL_NOTICE},
+                     history, new_messages, db, conversation_id)
+
+    def _cancelled(self) -> bool:
+        """Internal helper to handle cancelled."""
+        return self.cancelled or bool(self.cancel_event and self.cancel_event.is_set())
+
+    def _session(self):
+        """The RuntimeSession this loop is driving, if the runtime knows it."""
+        if self.runtime is None or not self.session_key:
+            return None
+        return (getattr(self.runtime, "sessions", {}) or {}).get(self.session_key)
+
+    def _restart_requested(self) -> bool:
+        """True when this session asked for the turn to be re-driven."""
+        return bool(getattr(self._session(), "restart_turn", False))
+
+    def _drain_queued_messages(self, history, new_messages) -> list:
+        """Absorb user messages queued while this turn was running.
+
+        The busy guard in ``ConversationRuntime.handle_action`` appends
+        mid-turn text and attachment payloads to ``session.pending_user_inputs``.
+        At each loop boundary (never mid tool-call batch, which would split an
+        assistant/tool-result pair) they are written straight into history as
+        user rows — mirroring ``inject_user_message``, NOT ``cs.enact`` (a
+        user send_text is wrong-turn illegal while the agent holds priority,
+        and ``SendText`` would flip priority). Draining also clears
+        ``_final_text`` so the loop asks the LLM again instead of taking the
+        end_turn shortcut in ``_next_action``.
+        """
+        if self._pending_tool_calls:
+            return []
+        session = self._session()
+        if session is None or not getattr(session, "pending_user_inputs", None):
+            return []
+        with session.lock:
+            queued = list(session.pending_user_inputs)
+            session.pending_user_inputs.clear()
+        if not queued:
+            return []
+        newly_attached = []
+        for item in queued:
+            action_type = item.get("action_type") or "send_text"
+            payload = item.get("payload")
+            if action_type == "send_attachment":
+                text = payload.get("text") or ""
+                records = list(payload.get("records") or [])
+                attached = list(payload.get("attachments") or [])
+                newly_attached.extend(attached)
+                if getattr(session.cs, "attachment_lifecycle", "per_turn") == "persistent":
+                    session.cs.pending_attachments.extend(attached)
+                msg = {"role": "user", "content": text}
+                if records:
+                    msg["attachments"] = records
+            else:
+                msg = {"role": "user", "content": (
+                    payload if isinstance(payload, str)
+                    else str((payload or {}).get("text") or ""))}
+            # _record emits the SESSION_MESSAGE for each drained row.
+            self._record(msg, history, new_messages,
+                         self._active_db, self._active_conversation_id)
+        self._final_text = None
+        return newly_attached
+
+    def _record(self, msg, history, new_messages, db, conversation_id):
+        """Append one transcript row and announce it on the bus.
+
+        This is the single choke point for agent-turn history rows, so the
+        SESSION_MESSAGE emission here is what makes the channel a complete
+        live feed of the transcript (assistant text, tool-call rows, tool
+        results, and drained mid-turn user rows alike).
+
+        ``author`` rides along for the same reason it is a column: ``actor_id``
+        below collapses every user-role row to ``"user"``, so on this channel a
+        cancel notice and a drained mid-turn message from the person read
+        identically. A UI built on the bus has the problem a UI built on the
+        table has."""
+        if turn_id := getattr(self._session(), "turn_id", None):
+            msg["turn_id"] = turn_id
+        history.append(msg)
+        new_messages.append(msg)
+        if db is not None and conversation_id is not None:
+            save_history_message(db, conversation_id, msg)
+        role = msg.get("role", "")
+        payload = {
+            "session_key": self.session_key,
+            "role": role,
+            "content": msg.get("content") or "",
+            "actor_id": "user" if role == "user" else "agent",
+        }
+        if msg.get("turn_id"):
+            payload["turn_id"] = msg["turn_id"]
+        if msg.get("author"):
+            payload["author"] = msg["author"]
+        if msg.get("name"):
+            payload["name"] = msg["name"]
+        if msg.get("tool_call_id"):
+            payload["tool_call_id"] = msg["tool_call_id"]
+        if msg.get("tool_calls"):
+            payload["tool_calls"] = msg["tool_calls"]
+        bus.emit(SESSION_MESSAGE, payload)
+
+    def _tool_started(self, action_type: str, content: Any):
+        """Internal helper to handle tool started."""
+        if action_type != "call_tool":
+            return None
+        name = (content or {}).get("name") or "unknown"
+        call_id = (content or {}).get("_tool_call_id") or "tc_unknown"
+        args = (content or {}).get("args") or {}
+        if self.on_tool_start:
+            try:
+                self.on_tool_start(name, call_id, args)
+            except TypeError:
+                self.on_tool_start(name)
+        # The narration rides the returned tuple so the *finished* status can
+        # carry it too. A frontend that overwrites its started line in place (the
+        # REPL does) would otherwise lose the blurb the moment the tool returned,
+        # and the readable scrollback is the whole point of the declaration.
+        narration = args.get("narration") if isinstance(args, dict) else None
+        return name, call_id, narration
+
+    def _tool_finished(self, started, result=None, error: str | None = None):
+        """Internal helper to handle tool finished.
+
+        Silent on a cancelled turn. The tool was killed mid-run by the cancel
+        itself, so its ✕ says nothing about the tool and everything about the
+        thing the person already knows they did — and the promise is that
+        ``Cancelled.`` is the last line they see. The history row is still
+        written (see ``_format_tool_result``); only the status is dropped.
+        """
+        if not started or not self.on_tool_result or self._cancelled():
+            return
+        name, call_id, narration = started
+        try:
+            self.on_tool_result(name, call_id, result, error, narration)
+        except TypeError:
+            self.on_tool_result(name, (getattr(result, "data", None) or {}).get("result") if result else None)

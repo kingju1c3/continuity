@@ -1,0 +1,22 @@
+__pycache__/
+.pytest_cache/
+.pytest_tmp*
+pytest-cache-files-*/
+.pytest_tmp_profile_prefs
+*.tmp
+config.json
+database.db*
+.VSCodeCounter
+.claude
+.codex_smoke/
+.codex_pytest_tmp/
+.DS_Store
+.git
+.vscode
+.stress_driver/
+.hypothesis/
+desktop.ini
+.venv
+# Dev artifacts
+agent_text.txt
+user_text.txt

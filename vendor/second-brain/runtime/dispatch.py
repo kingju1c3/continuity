@@ -1,0 +1,240 @@
+"""Per-action dispatch helpers.
+
+The runtime's ``_dispatch`` is the single labeled enact() site for the
+user-side state machine. To keep the dispatch loop readable, the small
+per-action concerns (selecting the right ``content`` shape, mirroring
+state-machine results into the ``RuntimeResult``, emitting
+phase/turn-changed events, decorating forms for frontend rendering) are
+factored out here as plain functions.
+
+Each helper does one thing and is named after the question it answers, so
+the dispatch loop reads top-to-bottom like a checklist.
+"""
+
+from __future__ import annotations
+
+
+from typing import Any
+
+from events.event_bus import bus
+from events.event_channels import (
+    SESSION_MESSAGE,
+    SESSION_PHASE_CHANGED,
+    SESSION_TURN_CHANGED,
+)
+from state_machine.errors import ActionResult
+from state_machine.form_display import form_step_display
+from state_machine.serialization import save_history_message
+from runtime.session import RuntimeResult, RuntimeSession
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Payload shape helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def text_of(payload: dict | str | None) -> str:
+    """Extract plain text from an inbound frontend payload."""
+    return payload if isinstance(payload, str) else str((payload or {}).get("text") or "")
+
+
+def attachments_of(payload: dict | str | None):
+    """Pull a list of attachment dicts/dataclasses out of an inbound payload.
+
+    Used by ``iterate_agent_turn`` so callers can pass attachments through
+    to the agent without first emitting a SendAttachment action.
+    """
+    if not isinstance(payload, dict):
+        return []
+    return list(payload.get("attachments") or [])
+
+
+def actor_id_of(payload: dict | str | None) -> str | None:
+    """Extract an explicit actor ID from an inbound payload, when present."""
+    return (payload or {}).get("actor_id") if isinstance(payload, dict) else None
+
+
+def content_for_action(action_type: str, text: str, payload: Any) -> Any:
+    """Pick the right content shape per action type.
+
+    SendText accepts a plain string. Form/approval/attachment actions
+    accept the original payload so the action can read structured fields.
+    """
+    if action_type == "send_text":
+        return text
+    if action_type == "submit_form_text":
+        return text
+    return payload
+
+
+# ──────────────────────────────────────────────────────────────────────
+# After enact: read parsed-attachment results back out
+# ──────────────────────────────────────────────────────────────────────
+
+def text_after_action(action_type: str, text: str, result: ActionResult) -> str:
+    """Recover the user-visible text that should be mirrored into history after an action."""
+    if action_type != "send_attachment" or not result.ok:
+        return text
+    parsed = (result.data or {}).get("parsed")
+    return str((parsed or {}).get("text") or text) if isinstance(parsed, dict) else text
+
+
+def records_after_action(action_type: str, result: ActionResult) -> list:
+    """The files a message carried, as records for its transcript row.
+
+    Empty for everything else, which is what keeps the row shape one shape:
+    a message with no files simply has no column value.
+    """
+    if action_type != "send_attachment" or not result.ok:
+        return []
+    return list((result.data or {}).get("records") or [])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# After enact: side-effects to surface
+# ──────────────────────────────────────────────────────────────────────
+
+def emit_state_change(session: RuntimeSession, old_phase: str, old_priority: str) -> None:
+    """Broadcast phase and turn-priority changes caused by one user action."""
+    if session.cs.phase != old_phase:
+        bus.emit(SESSION_PHASE_CHANGED, {
+            "session_key": session.key,
+            "old_phase": old_phase,
+            "new_phase": session.cs.phase,
+        })
+    if session.cs.turn_priority != old_priority:
+        bus.emit(SESSION_TURN_CHANGED, {
+            "session_key": session.key,
+            "from_actor": old_priority,
+            "to_actor": session.cs.turn_priority,
+        })
+
+
+def absorb_user_action(
+    runtime,
+    session: RuntimeSession,
+    action_type: str,
+    text: str,
+    result: ActionResult,
+    records: list | None = None,
+) -> None:
+    """Translate user-side action outcomes into history rows + side effects.
+
+    Mirrors ``ConversationLoop._absorb`` but for actions originating from
+    the frontend. Only ``send_text`` / ``send_attachment`` (with text or
+    files) add a chat-transcript row; commands/forms/approvals have no
+    provider-history impact, only state-machine impact.
+
+    **Files count as content.** The guard used to be ``text`` alone, which
+    worked only because the pointer line was welded into it — a caption-less
+    attachment had non-empty text by accident. With the files in their own
+    column an uncaptioned photo is a row with no text and one attachment, and
+    reading the guard as "did the person say anything" would drop the only
+    record that it was ever sent.
+    """
+    if not result.ok:
+        return
+    # From the action for a ``send_attachment``; from the caller for the one
+    # path that bypasses it (``iterate_agent_turn`` puts attachments straight
+    # on a ``send_text`` payload).
+    records = records_after_action(action_type, result) or list(records or [])
+    if action_type in {"send_text", "send_attachment"} and (text or records):
+        msg = {"role": "user", "content": text}
+        if records:
+            msg["attachments"] = records
+        session.history.append(msg)
+        if runtime.db and session.conversation_id:
+            save_history_message(runtime.db, session.conversation_id, msg)
+        bus.emit(SESSION_MESSAGE, {
+            "session_key": session.key,
+            "role": "user",
+            "content": text,
+            "attachments": records,
+            "actor_id": "user",
+        })
+    note_user_command(runtime, session, result)
+
+
+def note_user_command(runtime, session: RuntimeSession, result: ActionResult) -> None:
+    """Mirror a completed slash command into provider history when the
+    ``reveal_user_commands`` kernel setting is on.
+
+    Keyed off a ``call_command``-typed event in the result so both direct
+    calls and form-completed calls (whose result is the replayed command's)
+    are noted, while form-start results (a ``form_step`` event) are not.
+    Records the command name and argument *names* only — argument values can
+    carry secrets (/setup API keys, /config values). No SESSION_MESSAGE is
+    emitted: the user already saw their own command.
+    """
+    if not (runtime.config or {}).get("reveal_user_commands"):
+        return
+    event = next((e for e in reversed(result.events or [])
+                  if e.get("type") == "call_command"), None)
+    if not event or not event.get("name"):
+        return
+    args = event.get("args") or {}
+    fields = f" (fields: {', '.join(sorted(args))})" if args else ""
+    msg = {"role": "user", "author": "command_note", "content": (
+        f"[SYSTEM NOTE] The user ran the slash command /{event['name']}{fields}. "
+        "Its output was shown directly to the user.")}
+    session.history.append(msg)
+    if runtime.db and session.conversation_id:
+        save_history_message(runtime.db, session.conversation_id, msg)
+
+
+def echo_callable_result(action_type: str, result: ActionResult, out: RuntimeResult) -> None:
+    """Surface command/tool return values to the frontend.
+
+    On ``callable_output`` rather than ``messages``: this is what a callable
+    *answered*, not something anybody said, and it was the largest population
+    making ``messages`` unreadable to a client — a `/config` table and the
+    agent's reply arrived as the same kind of thing. Frontends that do not
+    declare ``supports_callable_output`` still see it in the chat, flattened
+    by ``_render_result``, so nothing about the REPL or Telegram changes.
+
+    Note this serves ``call_tool`` too, which is why the field is not named for
+    commands alone.
+    """
+    if action_type not in {"call_command", "call_tool"} and getattr(result, "action", None) not in {"call_command", "call_tool"}:
+        return
+    if not result.ok:
+        return
+    value = (result.data or {}).get("result")
+    if value is not None:
+        out.callable_output.append(str(value))
+
+
+def decorate_form(session: RuntimeSession, out: RuntimeResult) -> None:
+    """If the session is now sitting on a form step, attach the form
+    descriptor to ``out`` so the frontend can render the next field."""
+    frame = session.cs.frame
+    if frame and frame.step:
+        display = form_step_display(frame.step)
+        display["allow_back"] = bool((frame.data or {}).get("form_history"))
+        out.form = {
+            "name": frame.name,
+            "action_type": frame.action_type,
+            "field": frame.step.to_dict(),
+            "collected": frame.data.get("args", {}),
+            "display": display,
+        }
+
+
+def latest_user_text(session: RuntimeSession) -> str:
+    """Return the latest user-authored text stored in session history.
+
+    ``role`` alone is not the test, because the kernel writes user rows the
+    person never typed — a ``/cancel`` notice, a ``reveal_user_commands`` note,
+    a doorman's ``SendBack``. Only ``author`` tells them apart.
+
+    No kernel caller left: this fed the new conversation's **title** until the
+    kernel went back to naming every conversation "New Conversation" and left
+    the real name to the ``update_titles`` package. Kept because "what did the
+    person actually say" is a question with one right answer and a tempting
+    wrong one, and because getting it wrong is silent — reading role alone
+    titled conversations "[The user cancelled the previous turn…]" with no sign
+    anything had gone amiss. ``tests/test_message_authorship.py`` holds that.
+    """
+    for msg in reversed(session.history):
+        if msg.get("role") == "user" and not msg.get("author"):
+            return msg.get("content") or ""
+    return ""

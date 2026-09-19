@@ -1,0 +1,254 @@
+"""The bus, inbound — the only place that knows both sides of a delivery.
+
+Emitting was always a Request; *hearing* needed building differently, because
+an event arrives at a plugin rather than being asked for — there is no Request
+to classify and no return value to translate. What there is instead is a
+subscription, and a subscription can leak. So it is **declared, not
+registered**, exactly as ``hooks`` are: the plugin never holds one, so it
+cannot forget to drop one.
+
+Two things this module owes the rest of the system:
+
+**Payloads are projections.** ``bus.request`` enriches a payload with a live
+``threading.Event`` and a result list (``events/event_bus.py``) so a subscriber
+can answer synchronously. Neither can cross a process boundary, and a
+sandboxed subscriber must not be able to satisfy a round trip it cannot be
+trusted to complete — a box that hangs would hang the publisher. ``project``
+drops them, along with anything else that will not serialize, and a sandboxed
+subscriber therefore sees ``bus.request`` as an ordinary fire-and-forget event.
+
+**Nothing here may raise.** ``EventBus.emit`` runs handlers on the publisher's
+own thread and swallows what they raise; a listener that let an exception out
+would be logged and ignored, but a listener that *blocked* would stall whoever
+published. Delivery is best-effort at every layer, which is the same failure
+policy the ledger has and for the same reason: an observer must never break
+the thing it observes.
+
+**And a guest never publishes on the thread that delivers** (``publish``). That
+last sentence used to be advice; it is now structural, because the failure it
+warns about was not hypothetical. A resident box serializes under one lock, and
+``poll`` holds that lock for its whole duration — so a service emitting from
+``poll`` parks its guest thread on the answer with the lock still held. The
+kernel then runs ``bus.emit`` on a pool worker, on the *publisher's* thread by
+``EventBus``'s own contract, and any subscriber that calls back into a service
+blocks on the lock the publisher is holding. Neither side moves again.
+
+That is precisely what the timekeeper did: fire ``subagent.spawn`` from
+``poll``, and ``SubagentRegistry`` answered by asking the timekeeper to pin the
+job's conversation. The deadlock wedged the box until the 600s hard ceiling
+killed it permanently, and every later ``cron.*`` call parked another sandbox
+worker on the same lock forever until the pool was gone and the whole process
+went deaf.
+
+A guest can never observe a subscriber — ``sdk.events.emit`` answers ``True``
+and nothing else, and ``project`` already strips the round-trip keys so a
+sandboxed subscriber cannot satisfy one. So answering immediately and
+delivering on a kernel thread costs nothing anybody can see, and it is the
+*one place* the fix belongs: a seventh subscriber cannot reintroduce this by
+forgetting to detach, because detaching is no longer the subscriber's job.
+This is the outbound twin of ``sandbox/handlers/kernel.py``'s ``_drive``.
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+
+logger = logging.getLogger("Sandbox")
+
+# What a payload may be built from. Anything else is dropped rather than
+# coerced: a plugin receiving ``"<Thread(worker, started)>"`` where it expected
+# an object is worse off than one receiving nothing, because the second case
+# is obvious and the first one is not.
+_SCALARS = (str, int, float, bool, type(None))
+
+# Keys ``bus.request`` adds for its synchronous round trip. Named rather than
+# inferred, so the reason they are gone is readable at the point of removal.
+_ROUND_TRIP_KEYS = frozenset({"reply", "result"})
+
+# How deep a payload may nest before it is treated as unserializable. Bus
+# payloads are flat by convention; the limit is here so a self-referential one
+# cannot spin.
+_MAX_DEPTH = 6
+
+
+def project(payload, _depth: int = 0):
+    """Reduce a bus payload to something that can cross into a box.
+
+    Returns ``None`` for anything that cannot be represented, which callers
+    treat as "nothing to deliver" rather than as an error.
+    """
+    if _depth > _MAX_DEPTH:
+        return None
+    if isinstance(payload, _SCALARS):
+        return payload
+    if isinstance(payload, dict):
+        clean = {}
+        for key, value in payload.items():
+            if not isinstance(key, str) or key in _ROUND_TRIP_KEYS:
+                continue
+            reduced = project(value, _depth + 1)
+            # A key whose value would not cross is dropped, not nulled: a
+            # subscriber checking ``"db" in payload`` should find it absent
+            # rather than present and useless.
+            if reduced is not None or value is None:
+                clean[key] = reduced
+        return clean
+    if isinstance(payload, (list, tuple, set)):
+        reduced = [project(item, _depth + 1) for item in payload]
+        return [item for item in reduced if item is not None]
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Outbound: a guest publishing, without lending the bus its thread.
+# ──────────────────────────────────────────────────────────────────────
+
+#: How many guest emits may wait for delivery. Bounded on purpose: an
+#: unbounded queue turns a runaway emitter into an out-of-memory, and a dropped
+#: event with a warning beside it is the recoverable version of that.
+QUEUE_CAP = 1024
+
+#: How long a guest emit waits for room in the queue. Short, because waiting
+#: here is the very coupling this indirection exists to remove — but not zero,
+#: so an ordinary burst is absorbed rather than dropped.
+ENQUEUE_TIMEOUT = 0.5
+
+#: One queue, one thread, so deliveries stay in the order they were published.
+#: Thread-per-emit would be simpler and would let a burst of events arrive out
+#: of order — cheap to write and very expensive to debug.
+_outbound: queue.Queue | None = None
+_dispatcher: threading.Thread | None = None
+_start_lock = threading.Lock()
+
+
+def _dispatch_forever(work: queue.Queue) -> None:
+    """Deliver queued events, one at a time, forever.
+
+    Runs every subscriber for a channel before taking the next event, so a slow
+    subscriber delays delivery rather than reordering it. Nothing escapes:
+    ``bus.emit`` already swallows what handlers raise, and this catches what it
+    does not so the thread cannot die and leave the queue filling.
+    """
+    from events.event_bus import bus
+
+    while True:
+        channel, payload = work.get()
+        try:
+            bus.emit(channel, payload)
+        except Exception:
+            logger.exception("dispatching %s failed", channel)
+        finally:
+            work.task_done()
+
+
+def _queue() -> queue.Queue:
+    """The outbound queue, starting the dispatcher on first use."""
+    global _outbound, _dispatcher
+    with _start_lock:
+        if _outbound is None:
+            _outbound = queue.Queue(maxsize=QUEUE_CAP)
+        if _dispatcher is None or not _dispatcher.is_alive():
+            _dispatcher = threading.Thread(
+                target=_dispatch_forever, args=(_outbound,),
+                daemon=True, name="bus-dispatch")
+            _dispatcher.start()
+        return _outbound
+
+
+def publish(channel: str, payload) -> bool:
+    """Hand one guest emit to the dispatcher. Returns whether it was queued.
+
+    The caller gets its answer without waiting for a single subscriber, which
+    is the whole point — see this module's docstring for the deadlock that
+    makes it mandatory rather than merely tidy.
+    """
+    if not isinstance(channel, str) or not channel.strip():
+        return False
+    try:
+        _queue().put((channel, payload), timeout=ENQUEUE_TIMEOUT)
+        return True
+    except queue.Full:
+        # Dropping is the lesser failure, but it is still a failure, so it is
+        # loud: a full queue means subscribers are not keeping up with a guest.
+        logger.warning("bus dispatch queue is full; dropped an emit on %s",
+                       channel)
+        return False
+
+
+def drain(timeout: float = 5.0) -> bool:
+    """Wait for queued events to be delivered. Returns whether it emptied.
+
+    For shutdown and for tests, which need a point at which "it was published"
+    and "it was delivered" are the same statement again.
+    """
+    work = _outbound
+    if work is None:
+        return True
+    deadline = threading.Event()
+    waiter = threading.Thread(target=lambda: (work.join(), deadline.set()),
+                              daemon=True, name="bus-drain")
+    waiter.start()
+    return deadline.wait(timeout=timeout)
+
+
+def build_listener(plugin, channel: str, deliver):
+    """A bus handler that carries one channel into a plugin's box.
+
+    ``deliver(channel, payload)`` is what actually crosses — supplied by the
+    bridge, which owns the box handle. Keeping it a parameter is what lets this
+    module stay ignorant of boxes, and lets a test deliver into a list.
+    """
+
+    def listener(payload=None):
+        """Deliver one event. Never raises, never blocks on an answer."""
+        try:
+            deliver(channel, project(payload))
+        except Exception:
+            # The bus would swallow this anyway; logging it here names the
+            # plugin, which the bus cannot do.
+            logger.exception("delivering %s to %s failed",
+                             channel, getattr(plugin, "name", "?"))
+
+    listener.__name__ = f"deliver_{channel}"
+    listener.__doc__ = (f"Carry {channel!r} into "
+                        f"{getattr(plugin, 'name', '?')}'s box.")
+    return listener
+
+
+def subscribe_all(plugin, channels, deliver) -> list:
+    """Stand a listener at every declared channel. Returns unsubscribers.
+
+    The unsubscribe callables are the *only* handle on these subscriptions —
+    ``EventBus.subscribe`` hands one back and keeps no other index — so the
+    caller must hold them for as long as the plugin is loaded.
+    """
+    from events.event_bus import bus
+
+    dropped = []
+    for channel in channels or []:
+        if not isinstance(channel, str) or not channel.strip():
+            logger.warning("%s declared an unusable channel %r; skipping",
+                           getattr(plugin, "name", "?"), channel)
+            continue
+        dropped.append(bus.subscribe(channel,
+                                     build_listener(plugin, channel, deliver)))
+    if dropped:
+        logger.info("%s is listening on %s", getattr(plugin, "name", "?"),
+                    ", ".join(sorted(c for c in channels if isinstance(c, str))))
+    return dropped
+
+
+def unsubscribe_all(unsubscribers) -> None:
+    """Step away from every channel.
+
+    A subscription outliving its plugin is a leak with no symptom — the box is
+    gone, so every delivery fails quietly forever — which is why this tolerates
+    anything rather than stopping at the first failure.
+    """
+    for drop in unsubscribers or []:
+        try:
+            drop()
+        except Exception:
+            logger.exception("could not unsubscribe a sandboxed listener")

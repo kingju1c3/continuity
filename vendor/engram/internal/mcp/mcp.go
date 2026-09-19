@@ -1,0 +1,3521 @@
+// Package mcp implements the Model Context Protocol server for Engram.
+//
+// This exposes memory tools via MCP stdio transport so ANY agent
+// (OpenCode, Claude Code, Cursor, Windsurf, etc.) can use Engram's
+// persistent memory just by adding it as an MCP server.
+//
+// Tool profiles allow agents to load only the tools they need:
+//
+//	engram mcp                    → all 23 tools (default)
+//	engram mcp --tools=agent      → 19 tools agents actually use (per skill files)
+//	engram mcp --tools=admin      → 4 tools for TUI/CLI (delete, stats, timeline, merge)
+//	engram mcp --tools=agent,admin → combine profiles
+//	engram mcp --tools=mem_save,mem_search → individual tool names
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/Gentleman-Programming/engram/v2/internal/diagnostic"
+	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
+	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v2/internal/timeutil"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+)
+
+const sourceProcessOverride = projectpkg.SourceProcessOverride
+
+// MCPConfig holds configuration for the MCP server.
+type MCPConfig struct {
+	// DefaultProject is a trusted process-level project override supplied by
+	// long-lived MCP hosts (for example, `engram mcp --project NAME` or
+	// ENGRAM_PROJECT). When set, it is used before cwd detection for MCP
+	// auto-resolution; per-call project arguments remain separately validated.
+	DefaultProject string
+
+	// BM25Floor overrides the default BM25 score floor used by FindCandidates
+	// during conflict candidate detection (REQ-001). The floor is the minimum
+	// acceptable BM25 rank (negative; closer to 0 = better match). Candidates
+	// whose score falls below this threshold are excluded.
+	//
+	// nil means "use the store default" (-2.0). An explicit pointer value
+	// (including 0.0) is forwarded directly. Using a pointer avoids the
+	// zero-value ambiguity where 0.0 would otherwise be indistinguishable
+	// from "not set".
+	BM25Floor *float64
+
+	// Limit overrides the maximum number of conflict candidates returned per
+	// mem_save call (REQ-001). nil means "use the store default" (3).
+	// An explicit pointer value (including 0) is forwarded directly.
+	Limit *int
+}
+
+var suggestTopicKey = store.SuggestTopicKey
+
+var addPromptIfMissing = func(s *store.Store, params store.AddPromptParams) (int64, bool, error) {
+	return s.AddPromptIfMissing(params)
+}
+
+var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
+	return s.Stats()
+}
+
+var loadContextStats = func(s *store.Store) (*store.Stats, error) {
+	return s.Stats()
+}
+
+func truncationWarning(metadata store.TruncationMetadata) string {
+	if !metadata.Truncated {
+		return ""
+	}
+	return fmt.Sprintf("\n⚠ WARNING: Content was truncated from %d to %d bytes. Consider splitting into smaller observations.", metadata.OriginalBytes, metadata.LimitBytes)
+}
+
+func absolutePathWarning(content string) string {
+	if !containsAbsoluteFilesystemPath(content) {
+		return ""
+	}
+	return "\n⚠ WARNING: Content contains an absolute filesystem path that may not be portable across machines. Use a repository-relative path instead."
+}
+
+// containsAbsoluteFilesystemPath recognizes common absolute path spellings
+// without relying on the host operating system. Route-like POSIX paths such as
+// /api/v1 are intentionally treated as ambiguous matches for this non-blocking warning.
+func containsAbsoluteFilesystemPath(content string) bool {
+	for i := 0; i < len(content); {
+		char, size := utf8.DecodeRuneInString(content[i:])
+		if char == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+		if uriEnd := uriTokenEnd(content, i); uriEnd > i {
+			i = uriEnd
+			continue
+		}
+
+		if isASCIILetter(content[i]) && i+2 < len(content) && content[i+1] == ':' && (content[i+2] == '/' || content[i+2] == '\\') {
+			return true
+		}
+		if content[i] == '\\' && i+2 < len(content) && content[i+1] == '\\' && content[i+2] != '\\' && content[i+2] != '/' {
+			return true
+		}
+		if content[i] == '/' && (i+1 == len(content) || content[i+1] != '/') && isAbsolutePathBoundary(content, i) {
+			return true
+		}
+		i += size
+	}
+	return false
+}
+
+func isAbsolutePathBoundary(content string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	previous, size := utf8.DecodeLastRuneInString(content[:index])
+	if previous == utf8.RuneError && size == 1 {
+		return false
+	}
+	return previous != '/' && !isPathWordCharacter(previous)
+}
+
+func uriTokenEnd(content string, start int) int {
+	if !isASCIILetter(content[start]) {
+		return start
+	}
+	if start > 0 {
+		previous, size := utf8.DecodeLastRuneInString(content[:start])
+		if (previous != utf8.RuneError || size != 1) && isPathWordCharacter(previous) {
+			return start
+		}
+	}
+
+	colon := start + 1
+	for colon < len(content) && (isASCIILetter(content[colon]) || content[colon] >= '0' && content[colon] <= '9' || content[colon] == '+' || content[colon] == '-' || content[colon] == '.') {
+		colon++
+	}
+	if colon >= len(content) || content[colon] != ':' {
+		return start
+	}
+
+	hasAuthority := colon+2 < len(content) && content[colon+1] == '/' && content[colon+2] == '/'
+	hasAuthoritylessFilePath := colon+1 < len(content) && content[colon+1] == '/' && strings.EqualFold(content[start:colon], "file")
+	if !hasAuthority && !hasAuthoritylessFilePath {
+		return start
+	}
+
+	end := colon + 2
+	if hasAuthority {
+		end++
+	}
+	for end < len(content) {
+		char, size := utf8.DecodeRuneInString(content[end:])
+		if char == utf8.RuneError && size == 1 || !isURITokenCharacter(char) {
+			break
+		}
+		end += size
+	}
+	return end
+}
+
+func isASCIILetter(char byte) bool {
+	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
+}
+
+func isPathWordCharacter(char rune) bool {
+	return unicode.IsLetter(char) || unicode.IsDigit(char) || unicode.IsMark(char) || char == '.' || char == '-' || char == '_'
+}
+
+func isURITokenCharacter(char rune) bool {
+	return isPathWordCharacter(char) || strings.ContainsRune(":/?#[]@!$&'()*+,;=%~", char)
+}
+
+var currentWorkingDirectory = func() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+func ensureImplicitSessionWithCWD(s *store.Store, sessionID, project string) error {
+	return s.CreateSession(sessionID, project, currentWorkingDirectory())
+}
+
+// runtimeSessionDirectory derives the worktree-specific key for omitted
+// registration and omitted-session lookup without changing project identity.
+func runtimeSessionDirectory(directory string) string {
+	if strings.TrimSpace(directory) == "" {
+		directory = currentWorkingDirectory()
+	}
+	return projectpkg.RuntimeWorktreeDirectory(directory)
+}
+
+// ─── Tool Profiles ───────────────────────────────────────────────────────────
+//
+// "agent" — tools AI agents use during coding sessions:
+//   mem_save, mem_search, mem_context, mem_session_summary,
+//   mem_session_start, mem_session_end, mem_get_observation,
+//   mem_suggest_topic_key, mem_capture_passive, mem_save_prompt
+//
+// "admin" — tools for manual curation, TUI, and dashboards:
+//   mem_update, mem_delete, mem_stats, mem_timeline, mem_merge_projects
+//
+// "all" (default) — every tool registered.
+
+// ProfileAgent contains the tool names that AI agents need.
+// Sourced from actual skill files and memory protocol instructions
+// across all 4 supported agents (Claude Code, OpenCode, Gemini CLI, Codex).
+var ProfileAgent = map[string]bool{
+	"mem_save":              true, // proactive save — referenced 17 times across protocols
+	"mem_search":            true, // search past memories — referenced 6 times
+	"mem_context":           true, // recent context from previous sessions — referenced 10 times
+	"mem_session_summary":   true, // end-of-session summary — referenced 16 times
+	"mem_session_start":     true, // register session start
+	"mem_session_end":       true, // mark session completed
+	"mem_get_observation":   true, // full observation content after search — referenced 4 times
+	"mem_suggest_topic_key": true, // stable topic key for upserts — referenced 3 times
+	"mem_capture_passive":   true, // extract learnings from text — referenced in Gemini/Codex protocol
+	"mem_save_prompt":       true, // save user prompts
+	"mem_update":            true, // update observation by ID — skills say "use mem_update when you have an exact ID to correct"
+	"mem_current_project":   true, // detect current project — recommended first call for agents (REQ-313)
+	"mem_list_projects":     true, // enumerate all known projects for cross-project discovery (engram#675)
+	"mem_judge":             true, // record verdict on a pending memory conflict (REQ-003, Phase D)
+	"mem_compare":           true, // persist an agent-judged semantic verdict via JudgeBySemantic (REQ-011, Phase G)
+	"mem_doctor":            true, // read-only operational diagnostics for agents
+	"mem_review":            true, // list/mark observations whose review_after lifecycle is stale
+	"mem_pin":               true, // local pin for context priority
+	"mem_unpin":             true, // local unpin for context priority
+}
+
+// ProfileAdmin contains tools for TUI, dashboards, and manual curation
+// that are NOT referenced in any agent skill or memory protocol.
+var ProfileAdmin = map[string]bool{
+	"mem_delete":         true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
+	"mem_stats":          true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
+	"mem_timeline":       true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
+	"mem_merge_projects": true, // destructive curation tool — not for agent use
+}
+
+// Profiles maps profile names to their tool sets.
+var Profiles = map[string]map[string]bool{
+	"agent": ProfileAgent,
+	"admin": ProfileAdmin,
+}
+
+// ResolveTools takes a comma-separated string of profile names and/or
+// individual tool names and returns the set of tool names to register.
+// An empty input means "all" — every tool is registered.
+func ResolveTools(input string) map[string]bool {
+	input = strings.TrimSpace(input)
+	if input == "" || input == "all" {
+		return nil // nil means register everything
+	}
+
+	result := make(map[string]bool)
+	for _, token := range strings.Split(input, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if token == "all" {
+			return nil
+		}
+		if profile, ok := Profiles[token]; ok {
+			for tool := range profile {
+				result[tool] = true
+			}
+		} else {
+			// Treat as individual tool name
+			result[token] = true
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// NewServer creates an MCP server with ALL tools registered (backwards compatible).
+func NewServer(s *store.Store) *server.MCPServer {
+	return NewServerWithConfig(s, MCPConfig{}, nil)
+}
+
+type coreToolDesc struct {
+	name string
+	desc string
+}
+
+var coreTools = []coreToolDesc{
+	{"mem_save", "mem_save — save decisions, bugs, discoveries, conventions PROACTIVELY (do not wait to be asked)"},
+	{"mem_search", "mem_search — find past work, decisions, or context from previous sessions"},
+	{"mem_context", "mem_context — get recent session history (call at session start or after compaction)"},
+	{"mem_session_summary", "mem_session_summary — save end-of-session summary (MANDATORY before saying \"done\")"},
+	{"mem_get_observation", "mem_get_observation — get full untruncated content of a search result by ID"},
+	{"mem_save_prompt", "mem_save_prompt — save user prompt for context"},
+	{"mem_current_project", "mem_current_project — detect current project from cwd (recommended first call)"},
+	{"mem_judge", "mem_judge — record a verdict on a pending memory conflict (judgment_required flow)"},
+	{"mem_compare", "mem_compare — persist a semantic verdict you have already judged externally"},
+}
+
+var deferredTools = []string{
+	"mem_update", "mem_review", "mem_pin", "mem_unpin", "mem_suggest_topic_key",
+	"mem_session_start", "mem_session_end", "mem_doctor", "mem_capture_passive",
+	"mem_stats", "mem_delete", "mem_timeline", "mem_merge_projects",
+}
+
+// memoryWritingTools contains every registered tool that can mutate persistent
+// or local memory/session bookkeeping.
+var memoryWritingTools = []string{
+	"mem_save", "mem_update", "mem_review", "mem_delete",
+	"mem_save_prompt", "mem_pin", "mem_unpin", "mem_session_summary",
+	"mem_session_start", "mem_session_end", "mem_capture_passive",
+	"mem_merge_projects", "mem_judge", "mem_compare",
+}
+
+func hasRegisteredMemoryWriter(allowlist map[string]bool) bool {
+	for _, tool := range memoryWritingTools {
+		if shouldRegister(tool, allowlist) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildServerInstructions dynamically generates the instructions for MCP clients
+// based on which tools are allowed/registered.
+func buildServerInstructions(allowlist map[string]bool) string {
+	var b strings.Builder
+	b.WriteString("Engram provides persistent memory that survives across sessions and compactions.\n\n")
+
+	var activeCore []string
+	for _, ct := range coreTools {
+		if shouldRegister(ct.name, allowlist) {
+			activeCore = append(activeCore, ct.desc)
+		}
+	}
+	if len(activeCore) > 0 {
+		b.WriteString("CORE TOOLS (always available — use without ToolSearch):\n")
+		for _, desc := range activeCore {
+			b.WriteString("  ")
+			b.WriteString(desc)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	var activeDeferred []string
+	for _, dt := range deferredTools {
+		if shouldRegister(dt, allowlist) {
+			activeDeferred = append(activeDeferred, dt)
+		}
+	}
+	if len(activeDeferred) > 0 {
+		b.WriteString("DEFERRED TOOLS (use ToolSearch when needed):\n  ")
+		b.WriteString(strings.Join(activeDeferred, ", "))
+		b.WriteString("\n\n")
+	}
+
+	if shouldRegister("mem_save", allowlist) {
+		b.WriteString("PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.\n\n")
+	}
+	if hasRegisteredMemoryWriter(allowlist) {
+		b.WriteString("## DELIVERY GUARANTEE\n\n" +
+			"Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.\n\n")
+	}
+
+	if shouldRegister("mem_save", allowlist) && shouldRegister("mem_judge", allowlist) {
+		b.WriteString("## CONFLICT SURFACING\n\n" +
+			"After mem_save: if judgment_required, iterate candidates[] and call mem_judge\n" +
+			"once per entry using that entry's judgment_id; never reuse the top-level judgment_id.\n" +
+			"Ask conversationally when confidence < 0.7 OR (relation in\n" +
+			"{supersedes, conflicts_with} AND type in {architecture, policy, decision}); else\n" +
+			"resolve with related | compatible | scoped | not_conflict. Pass evidence from user reply.")
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+// serverInstructions tells MCP clients when to use Engram's tools.
+// Retained as package-level variable for backward compatibility.
+var serverInstructions = buildServerInstructions(nil)
+
+// NewServerWithTools creates an MCP server registering only the tools in
+// the allowlist. If allowlist is nil, all tools are registered.
+func NewServerWithTools(s *store.Store, allowlist map[string]bool) *server.MCPServer {
+	return NewServerWithConfig(s, MCPConfig{}, allowlist)
+}
+
+// NewServerWithConfig creates an MCP server with full configuration including
+// default project detection and optional tool allowlist.
+func NewServerWithConfig(s *store.Store, cfg MCPConfig, allowlist map[string]bool) *server.MCPServer {
+	return newServerWithActivity(s, cfg, allowlist, NewSessionActivity(10*time.Minute))
+}
+
+func newServerWithActivity(s *store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) *server.MCPServer {
+	srv := server.NewMCPServer(
+		"engram",
+		"0.1.0",
+		server.WithToolCapabilities(true),
+		server.WithInstructions(buildServerInstructions(allowlist)),
+	)
+
+	registerTools(srv, s, cfg, allowlist, activity)
+	return srv
+}
+
+// shouldRegister returns true if the tool should be registered given the
+// allowlist. If allowlist is nil, everything is allowed.
+func shouldRegister(name string, allowlist map[string]bool) bool {
+	if allowlist == nil {
+		return true
+	}
+	return allowlist[name]
+}
+
+// registerTools registers all enabled MCP tools on the given server.
+func registerTools(srv *server.MCPServer, s *store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) {
+	writeQueue := newWriteQueue(defaultMCPWriteQueueSize)
+
+	// ─── mem_search (profile: agent, core — always in context) ─────────
+	if shouldRegister("mem_search", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_search",
+				mcp.WithDescription("Search your persistent memory across all sessions. Use this to find past decisions, bugs fixed, patterns used, files changed, or any context from previous coding sessions."),
+				mcp.WithTitleAnnotation("Search Memory"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("query",
+					mcp.Required(),
+					mcp.Description("Search query — natural language or keywords"),
+				),
+				mcp.WithString("type",
+					mcp.Description("Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern"),
+				),
+				mcp.WithString("project",
+					mcp.Description("Filter by project name. Ignored when all_projects=true."),
+				),
+				mcp.WithBoolean("all_projects",
+					mcp.Description("Search across every project instead of the current one. When true, the project argument is ignored and results may come from any project. Useful for recalling decisions logged elsewhere when you don't know the project key."),
+				),
+				mcp.WithString("scope",
+					mcp.Description("Filter by scope: project, personal, or global. Omit to apply no scope filter."),
+				),
+				mcp.WithString("match_mode",
+					mcp.Description("Token matching: \"all\" (default — every token must match, FTS5 AND) or \"any\" (any token matches — broader recall for multi-token queries). Any other value returns an error."),
+				),
+				mcp.WithString("response_format",
+					mcp.Description("Response format: omit for the legacy response, or use \"compact\" for bounded previews and structured results."),
+				),
+				mcp.WithNumber("limit",
+					mcp.Description("Max results (default: 10, max: 20)"),
+				),
+			),
+			handleSearch(s, cfg, activity),
+		)
+	}
+
+	// ─── mem_save (profile: agent, core — always in context) ───────────
+	if shouldRegister("mem_save", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_save",
+				mcp.WithTitleAnnotation("Save Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithDescription(`Save an important observation to persistent memory. Call this PROACTIVELY after completing significant work — don't wait to be asked.
+
+WHEN to save (call this after each of these):
+- Architectural decisions or tradeoffs
+- Bug fixes (what was wrong, why, how you fixed it)
+- New patterns or conventions established
+- Configuration changes or environment setup
+- Important discoveries or gotchas
+- File structure changes
+
+FORMAT for content — use this structured format:
+  **What**: [concise description of what was done]
+  **Why**: [the reasoning, user request, or problem that drove it]
+  **Where**: [files/paths affected, e.g. src/auth/middleware.ts, internal/store/store.go]
+  **Learned**: [any gotchas, edge cases, or decisions made — omit if none]
+
+TITLE should be short and searchable, like: "JWT auth middleware", "FTS5 query sanitization", "Fixed N+1 in user list"
+
+Examples:
+  title: "Switched from sessions to JWT"
+  type: "decision"
+  content: "**What**: Replaced express-session with jsonwebtoken for auth\n**Why**: Session storage doesn't scale across multiple instances\n**Where**: src/middleware/auth.ts, src/routes/login.ts\n**Learned**: Must set httpOnly and secure flags on the cookie, refresh tokens need separate rotation logic"
+
+  title: "Fixed FTS5 syntax error on special chars"
+  type: "bugfix"
+  content: "**What**: Wrapped each search term in quotes before passing to FTS5 MATCH\n**Why**: Users typing queries like 'fix auth bug' would crash because FTS5 interprets special chars as operators\n**Where**: internal/store/store.go — sanitizeFTS() function\n**Learned**: FTS5 MATCH syntax is NOT the same as LIKE — always sanitize user input"`),
+				mcp.WithString("title",
+					mcp.Required(),
+					mcp.Description("Short, searchable title (e.g. 'JWT auth middleware', 'Fixed N+1 query')"),
+				),
+				mcp.WithString("content",
+					mcp.Description("Structured content using **What**, **Why**, **Where**, **Learned** format. Required unless observation alias is provided."),
+				),
+				mcp.WithString("observation",
+					mcp.Description("Backward-compatible alias for content. Prefer content for new clients."),
+				),
+				mcp.WithString("type",
+					mcp.Description("Category: decision, architecture, bugfix, pattern, config, discovery, learning (default: manual)"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID to associate with. Only pass an ID you supplied to a successful mem_session_start registration, or the ID from an authoritative already-registered runtime binding; mem_session_start does not generate or return a new ID. Never invent one from a task name, issue number, or date. An unregistered ID is rejected with error_code=unknown_session; retry the same call with session_id omitted rather than guessing another value. When omitted (the common case), attempts unique active runtime-session selection using current worktree evidence; falls back to manual-save-{project} when no candidate remains, and rejects ambiguity rather than selecting by recency."),
+				),
+				mcp.WithString("scope",
+					mcp.Description("Scope for this observation: project (default), personal, or global"),
+				),
+				mcp.WithString("topic_key",
+					mcp.Description("Optional topic identifier for upserts (e.g. architecture/auth-model). Reuses and updates the latest observation in same project+scope."),
+				),
+				mcp.WithString("project",
+					mcp.Description("Optional explicit project for this memory. Accepted only when backed by known context (existing project, matching session, repo config, or ambiguous-project recovery); invalid or unbacked names fail loudly."),
+				),
+				mcp.WithString("project_choice_reason",
+					mcp.Description("Must be user_selected_after_ambiguous_project, and only after the user explicitly chose one of available_projects from an ambiguous_project error."),
+				),
+				mcp.WithString("recovery_token",
+					mcp.Description("Short-lived token returned by an ambiguous_project error. Required with project_choice_reason=user_selected_after_ambiguous_project."),
+				),
+				mcp.WithBoolean("capture_prompt",
+					mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for automated saves."),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleSave(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_update (profile: agent, deferred) ──────────────────────────
+	if shouldRegister("mem_update", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_update",
+				mcp.WithDescription("Update an existing observation by ID. Only provided fields are changed."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Update Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id",
+					mcp.Required(),
+					mcp.Description("Observation ID to update"),
+				),
+				mcp.WithString("title",
+					mcp.Description("New title"),
+				),
+				mcp.WithString("content",
+					mcp.Description("New content"),
+				),
+				mcp.WithString("type",
+					mcp.Description("New type/category"),
+				),
+				mcp.WithString("scope",
+					mcp.Description("New scope: project, personal, or global"),
+				),
+				mcp.WithString("topic_key",
+					mcp.Description("New topic key (normalized internally)"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleUpdate(s, cfg)),
+		)
+	}
+
+	// ─── mem_review (profile: agent, deferred) ──────────────────────────
+	if shouldRegister("mem_review", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_review",
+				mcp.WithDescription("Review observation lifecycle state. action=list returns observations whose review_after has passed; action=mark_reviewed resets one observation's review_after using its type decay policy."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Review Memories"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("action", mcp.Required(), mcp.Description("Action: list | mark_reviewed")),
+				mcp.WithString("project", mcp.Description("Optional project filter for action=list; omit to list all projects.")),
+				mcp.WithNumber("limit", mcp.Description("Max results for action=list (default: 10).")),
+				mcp.WithNumber("observation_id", mcp.Description("Observation id for action=mark_reviewed.")),
+				mcp.WithNumber("id", mcp.Description("Backward-compatible alias for observation_id.")),
+			),
+			queuedWriteHandler(writeQueue, handleReview(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_suggest_topic_key (profile: agent, deferred) ───────────────
+	if shouldRegister("mem_suggest_topic_key", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_suggest_topic_key",
+				mcp.WithDescription("Suggest a stable topic_key for memory upserts. Use this before mem_save when you want evolving topics (like architecture decisions) to update a single observation over time."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Suggest Topic Key"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("type",
+					mcp.Description("Observation type/category, e.g. architecture, decision, bugfix"),
+				),
+				mcp.WithString("title",
+					mcp.Description("Observation title (preferred input for stable keys)"),
+				),
+				mcp.WithString("content",
+					mcp.Description("Observation content used as fallback if title is empty"),
+				),
+			),
+			handleSuggestTopicKey(),
+		)
+	}
+
+	// ─── mem_delete (profile: admin, deferred) ──────────────────────────
+	if shouldRegister("mem_delete", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_delete",
+				mcp.WithDescription("Delete an observation by ID. Soft-delete by default; set hard_delete=true for permanent deletion."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Delete Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(true),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id",
+					mcp.Required(),
+					mcp.Description("Observation ID to delete"),
+				),
+				mcp.WithBoolean("hard_delete",
+					mcp.Description("If true, permanently deletes the observation"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleDelete(s)),
+		)
+	}
+
+	// ─── mem_save_prompt (profile: agent, eager) ────────────────────────
+	if shouldRegister("mem_save_prompt", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_save_prompt",
+				mcp.WithDescription("Save a user prompt to persistent memory. Use this to record what the user asked — their intent, questions, and requests — so future sessions have context about the user's goals."),
+				mcp.WithTitleAnnotation("Save User Prompt"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("content",
+					mcp.Required(),
+					mcp.Description("The user's prompt text"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID to associate with. Only pass an ID you supplied to a successful mem_session_start registration, or the ID from an authoritative already-registered runtime binding; mem_session_start does not generate or return a new ID. Never invent one from a task name, issue number, or date. An unregistered ID is rejected with error_code=unknown_session; retry the same call with session_id omitted rather than guessing another value. When omitted (the common case), attempts unique active runtime-session selection using current worktree evidence; falls back to manual-save-{project} when no candidate remains, and rejects ambiguity rather than selecting by recency."),
+				),
+				mcp.WithString("project",
+					mcp.Description("Optional recovery target only after ambiguous_project. Ignored unless project_choice_reason is user_selected_after_ambiguous_project."),
+				),
+				mcp.WithString("project_choice_reason",
+					mcp.Description("Must be user_selected_after_ambiguous_project, and only after the user explicitly chose one of available_projects from an ambiguous_project error."),
+				),
+				mcp.WithString("recovery_token",
+					mcp.Description("Short-lived token returned by an ambiguous_project error. Required with project_choice_reason=user_selected_after_ambiguous_project."),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleSavePrompt(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_pin / mem_unpin (profile: agent, deferred) ──────────────────
+	if shouldRegister("mem_pin", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_pin",
+				mcp.WithDescription("Pin a local observation so it appears before recent observations in memory context. Pinned state is local to this device and is not synced."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Pin Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id", mcp.Required(), mcp.Description("Observation ID to pin")),
+			),
+			handlePin(s, true),
+		)
+	}
+	if shouldRegister("mem_unpin", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_unpin",
+				mcp.WithDescription("Unpin a local observation so it only appears in normal recency order. Pinned state is local to this device and is not synced."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Unpin Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id", mcp.Required(), mcp.Description("Observation ID to unpin")),
+			),
+			handlePin(s, false),
+		)
+	}
+
+	// ─── mem_context (profile: agent, core — always in context) ────────
+	if shouldRegister("mem_context", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_context",
+				mcp.WithDescription("Get recent memory context from previous sessions. Shows recent sessions and observations to understand what was done before."),
+				mcp.WithTitleAnnotation("Get Memory Context"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project",
+					mcp.Description("Filter by project (omit for all projects)"),
+				),
+				mcp.WithString("scope",
+					mcp.Description("Filter observations by scope: project, personal, or global. Omit to apply no scope filter."),
+				),
+				mcp.WithNumber("max_bytes",
+					mcp.Description("Total context budget in bytes. Default 16384; values above 65536 are clamped to 65536."),
+				),
+				mcp.WithBoolean("compact",
+					mcp.Description("Drop the inline content preview from observation bullets to save tokens."),
+				),
+				// JW7: the old limit param was removed because handleContext never
+				// read it; max_bytes and compact ARE read and forwarded to
+				// FormatContextWithOptions (#1039).
+			),
+			handleContext(s, cfg, activity),
+		)
+	}
+
+	// ─── mem_stats (profile: admin, deferred) ───────────────────────────
+	if shouldRegister("mem_stats", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_stats",
+				mcp.WithDescription("Show memory system statistics — total sessions, observations, and projects tracked."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Memory Stats"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project",
+					mcp.Description("Project to echo in envelope context (omit for auto-detect; stats themselves are global aggregates)"),
+				),
+			),
+			handleStats(s, cfg, activity),
+		)
+	}
+
+	// ─── mem_timeline (profile: admin, deferred) ────────────────────────
+	if shouldRegister("mem_timeline", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_timeline",
+				mcp.WithDescription("Show chronological context around a specific observation. Use after mem_search to drill into the timeline of events surrounding a search result. This is the progressive disclosure pattern: search first, then timeline to understand context."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Memory Timeline"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("observation_id",
+					mcp.Required(),
+					mcp.Description("The observation ID to center the timeline on (from mem_search results)"),
+				),
+				mcp.WithNumber("before",
+					mcp.Description("Number of observations to show before the focus (default: 5)"),
+				),
+				mcp.WithNumber("after",
+					mcp.Description("Number of observations to show after the focus (default: 5)"),
+				),
+				mcp.WithString("project",
+					mcp.Description("Filter by project name (omit for auto-detect)"),
+				),
+			),
+			handleTimeline(s, cfg, activity),
+		)
+	}
+
+	// ─── mem_get_observation (profile: agent, eager) ────────────────────
+	if shouldRegister("mem_get_observation", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_get_observation",
+				mcp.WithDescription("Get the full content of a specific observation by ID. Use when you need the complete, untruncated content of an observation found via mem_search or mem_timeline."),
+				mcp.WithTitleAnnotation("Get Observation"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id",
+					mcp.Required(),
+					mcp.Description("The observation ID to retrieve"),
+				),
+			),
+			handleGetObservation(s, cfg, activity),
+		)
+	}
+
+	// ─── mem_session_summary (profile: agent, core — always in context) ─
+	if shouldRegister("mem_session_summary", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_session_summary",
+				mcp.WithTitleAnnotation("Save Session Summary"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithDescription(`Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete. This creates a structured summary that future sessions will use to understand what happened.
+
+FORMAT — use this exact structure in the content field:
+
+## Goal
+[One sentence: what were we building/working on in this session]
+
+## Instructions
+[User preferences, constraints, or context discovered during this session. Things a future agent needs to know about HOW the user wants things done. Skip if nothing notable.]
+
+## Discoveries
+- [Technical finding, gotcha, or learning 1]
+- [Technical finding 2]
+- [Important API behavior, config quirk, etc.]
+
+## Accomplished
+- ✅ [Completed task 1 — with key implementation details]
+- ✅ [Completed task 2 — mention files changed]
+- 🔲 [Identified but not yet done — for next session]
+
+## Next Steps
+- [What remains to be done — for the next session]
+
+## Relevant Files
+- path/to/file.ts — [what it does or what changed]
+- path/to/other.go — [role in the architecture]
+
+GUIDELINES:
+- Be CONCISE but don't lose important details (file paths, error messages, decisions)
+- Focus on WHAT and WHY, not HOW (the code itself is in the repo)
+- Include things that would save a future agent time
+- The Discoveries section is the most valuable — capture gotchas and non-obvious learnings
+- Relevant Files should only include files that were significantly changed or are important for context`),
+				mcp.WithString("content",
+					mcp.Required(),
+					mcp.Description("Full session summary using the Goal/Instructions/Discoveries/Accomplished/Next Steps/Relevant Files format"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID to associate with. Only pass an ID you supplied to a successful mem_session_start registration, or the ID from an authoritative already-registered runtime binding; mem_session_start does not generate or return a new ID. Never invent one from a task name, issue number, or date. An unregistered ID is rejected with error_code=unknown_session; retry the same call with session_id omitted rather than guessing another value. When omitted (the common case), attempts unique active runtime-session selection using current worktree evidence; falls back to manual-save-{project} when no candidate remains, and rejects ambiguity rather than selecting by recency."),
+				),
+				mcp.WithString("project",
+					mcp.Description("Optional explicit project for this memory. Accepted only when backed by known context (existing project, matching session, repo config, or ambiguous-project recovery); invalid or unbacked names fail loudly."),
+				),
+				mcp.WithString("project_choice_reason",
+					mcp.Description("Must be user_selected_after_ambiguous_project, and only after the user explicitly chose one of available_projects from an ambiguous_project error."),
+				),
+				mcp.WithString("recovery_token",
+					mcp.Description("Short-lived token returned by an ambiguous_project error. Required with project_choice_reason=user_selected_after_ambiguous_project."),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleSessionSummary(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_session_start (profile: agent, deferred) ───────────────────
+	if shouldRegister("mem_session_start", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_session_start",
+				mcp.WithDescription("Register the start of a new coding session. Call this at the beginning of a session to track activity."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Start Session"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("id",
+					mcp.Required(),
+					mcp.Description("Unique session identifier"),
+				),
+				mcp.WithString("directory",
+					mcp.Description("Working directory"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleSessionStart(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_session_end (profile: agent, deferred) ─────────────────────
+	if shouldRegister("mem_session_end", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_session_end",
+				mcp.WithDescription("Mark a coding session as completed with an optional summary."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("End Session"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("id",
+					mcp.Required(),
+					mcp.Description("Session identifier to close"),
+				),
+				mcp.WithString("summary",
+					mcp.Description("Summary of what was accomplished"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleSessionEnd(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_capture_passive (profile: agent, deferred) ─────────────────
+	if shouldRegister("mem_capture_passive", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_capture_passive",
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Capture Learnings"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithDescription(`Extract and save structured learnings from text output. Use this at the end of a task to capture knowledge automatically.
+
+The tool looks for sections like "## Key Learnings:" or "## Aprendizajes Clave:" and extracts numbered or bulleted items. Each item is saved as a separate observation.
+
+Duplicates are automatically detected and skipped — safe to call multiple times with the same content.`),
+				mcp.WithString("content",
+					mcp.Required(),
+					mcp.Description("The text output containing a '## Key Learnings:' section with numbered or bulleted items"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID to associate with. Only pass an ID you supplied to a successful mem_session_start registration, or the ID from an authoritative already-registered runtime binding; mem_session_start does not generate or return a new ID. Never invent one from a task name, issue number, or date. An unregistered ID is rejected with error_code=unknown_session; retry the same call with session_id omitted rather than guessing another value. When omitted (the common case), attempts unique active runtime-session selection using current worktree evidence; falls back to manual-save-{project} when no candidate remains, and rejects ambiguity rather than selecting by recency."),
+				),
+				mcp.WithString("source",
+					mcp.Description("Source identifier (e.g. 'subagent-stop', 'session-end')"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleCapturePassive(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_merge_projects (profile: admin, deferred) ──────────────────
+	if shouldRegister("mem_merge_projects", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_merge_projects",
+				mcp.WithDescription("Merge memories from multiple project name variants into one canonical name. Use when you discover project name drift (e.g. 'Engram' and 'engram' should be the same project). DESTRUCTIVE — moves all records from source names to the canonical name."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Merge Projects"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(true),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("from",
+					mcp.Required(),
+					mcp.Description("Comma-separated list of project names to merge FROM (e.g. 'Engram,engram-memory,ENGRAM')"),
+				),
+				mcp.WithString("to",
+					mcp.Required(),
+					mcp.Description("The canonical project name to merge INTO (e.g. 'engram')"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleMergeProjects(s)),
+		)
+	}
+
+	// ─── mem_current_project (profile: agent) ────────────────────────────
+	if shouldRegister("mem_current_project", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_current_project",
+				mcp.WithDescription("Detect the current project from the working directory. Returns project name, source (how it was detected), path, and available alternatives. NEVER errors — use this for discovery before writing. Recommended as the first call when starting a new session."),
+				mcp.WithTitleAnnotation("Detect Current Project"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+			),
+			handleCurrentProject(s, cfg),
+		)
+	}
+
+	// ─── mem_list_projects (profile: agent) ───────────────────────────────
+	if shouldRegister("mem_list_projects", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_list_projects",
+				mcp.WithDescription("List every project known to Engram, with per-project observation/session/prompt counts, ordered by observation count (same view as `engram projects list`). Use for cross-project discovery when the working directory matches no known project: pick the right project, then scope mem_search/mem_context to it. Returns a successful empty list when nothing is stored yet; a store failure returns a tool error."),
+				mcp.WithTitleAnnotation("List Known Projects"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+			),
+			handleListProjects(s),
+		)
+	}
+
+	// ─── mem_doctor (profile: agent, deferred) ──────────────────────────
+	if shouldRegister("mem_doctor", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_doctor",
+				mcp.WithDescription("Run read-only operational diagnostics. Returns the same structured envelope as `engram doctor --json`."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Run Engram Doctor"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project", mcp.Description("Project to diagnose (omit for auto-detect)")),
+				mcp.WithString("check", mcp.Description("Optional diagnostic check code to run")),
+			),
+			handleDoctor(s, cfg, activity),
+		)
+	}
+
+	// ─── mem_judge (profile: agent, eager) — REQ-003, Design §6 ─────────
+	if shouldRegister("mem_judge", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_judge",
+				mcp.WithDescription(`Record a verdict on a pending memory conflict surfaced by mem_save.
+
+WHEN TO CALL: After mem_save returns judgment_required=true, iterate candidates[] and call mem_judge once per entry using that entry's judgment_id.
+
+PARAMS:
+  judgment_id (required) — from candidates[].judgment_id in the mem_save response
+  relation    (required) — one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict
+  reason      (optional) — free-text explanation of the verdict
+  evidence    (optional) — JSON or text supporting the verdict
+  confidence  (optional) — float 0..1; default 1.0
+
+WHEN TO ASK USER:
+  - confidence < 0.7: surface to user before judging
+  - relation in {supersedes, conflicts_with} AND type in {architecture, policy, decision}: ask user
+  - otherwise: resolve silently
+
+SUCCESS: Returns the updated relation row with judgment_status="judged".
+ERROR: Returns IsError=true if judgment_id is unknown or relation verb is invalid. Row is NOT mutated on error.
+
+Re-judging an already-judged ID overwrites the verdict (deliberate revision).`),
+				mcp.WithTitleAnnotation("Judge Memory Conflict"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("judgment_id",
+					mcp.Required(),
+					mcp.Description("The judgment_id from candidates[] in the mem_save response (format: rel-<hex>)"),
+				),
+				mcp.WithString("relation",
+					mcp.Required(),
+					mcp.Description("Verdict: related | compatible | scoped | conflicts_with | supersedes | not_conflict"),
+				),
+				mcp.WithString("reason",
+					mcp.Description("Free-text explanation of the verdict"),
+				),
+				mcp.WithString("evidence",
+					mcp.Description("Supporting evidence (JSON or free text)"),
+				),
+				mcp.WithNumber("confidence",
+					mcp.Description("Confidence score 0.0..1.0 (default: 1.0)"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID for provenance (default: auto)"),
+				),
+			),
+			queuedWriteHandler(writeQueue, handleJudge(s, activity)),
+		)
+	}
+
+	// ─── mem_compare (profile: agent, eager) — REQ-011, Design §9 ────────
+	if shouldRegister("mem_compare", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_compare",
+				mcp.WithDescription(`Persist a semantic verdict you have already judged externally (with your LLM) into Engram.
+
+WHEN TO CALL: After you have evaluated two memories and reached a verdict, call mem_compare to PERSIST that verdict into the relation store. You do the judgment; mem_compare records it.
+
+PARAMS:
+  memory_id_a  (required) — integer id of the first observation (from mem_search or mem_get_observation)
+  memory_id_b  (required) — integer id of the second observation
+  relation     (required) — one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict
+  confidence   (required) — float 0..1; your self-reported confidence in the verdict
+  reasoning    (required) — explanation of the verdict, max 200 chars
+  model        (optional) — your model identifier, stored for provenance (e.g. "claude-haiku-4-5")
+
+BEHAVIOR:
+  - Persists the verdict via JudgeBySemantic with system provenance (marked_by_actor="engram").
+  - not_conflict: persists a judged relation and returns its sync_id, so future scans do not re-evaluate the pair.
+  - Idempotent: calling again for the same pair updates the existing row.
+  - Cross-project pairs are rejected.
+
+SUCCESS: Returns { "sync_id": "rel-..." } on every persisted verdict.
+ERROR: Returns IsError=true if IDs are unknown, relation is invalid, or cross-project pair.`),
+				mcp.WithTitleAnnotation("Compare Memory Pair (Persist Semantic Verdict)"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("memory_id_a",
+					mcp.Required(),
+					mcp.Description("Integer id of the first observation (from mem_search #id)"),
+				),
+				mcp.WithNumber("memory_id_b",
+					mcp.Required(),
+					mcp.Description("Integer id of the second observation (from mem_search #id)"),
+				),
+				mcp.WithString("relation",
+					mcp.Required(),
+					mcp.Description("Verdict: related | compatible | scoped | conflicts_with | supersedes | not_conflict"),
+				),
+				mcp.WithNumber("confidence",
+					mcp.Required(),
+					mcp.Description("Confidence score 0.0..1.0"),
+				),
+				mcp.WithString("reasoning",
+					mcp.Required(),
+					mcp.Description("Brief explanation of the verdict (max 200 chars)"),
+				),
+				mcp.WithString("model",
+					mcp.Description("Your model identifier for provenance (e.g. \"claude-haiku-4-5\")"),
+				),
+			),
+			handleCompare(s, activity),
+		)
+	}
+}
+
+// ─── Tool Handlers ───────────────────────────────────────────────────────────
+
+// handleListProjects serves mem_list_projects (engram#675): the MCP view of
+// `engram projects list`, backed by the same store query (ListProjectsWithStats)
+// so CLI and MCP never diverge. An empty store is a successful empty listing;
+// a store-query failure is surfaced as a tool error.
+func handleListProjects(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projects, err := s.ListProjectsWithStats()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("List projects failed: %v", err)), nil
+		}
+		if projects == nil {
+			projects = []store.ProjectStats{}
+		}
+		out, err := jsonMarshal(map[string]any{
+			"projects": projects,
+			"count":    len(projects),
+		})
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("List projects failed to encode response: %v", err)), nil
+		}
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+// handleCurrentProject implements mem_current_project. It NEVER returns an error
+// even on ambiguous cwd — it always returns a success result with whatever
+// detection info is available (REQ-313).
+func handleCurrentProject(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		cwd, _ := os.Getwd()
+		res := projectpkg.DetectProjectFull(cwd)
+		if processRes, ok, err := processProjectResult(cfg.DefaultProject); ok {
+			if err != nil {
+				res = projectpkg.DetectionResult{Source: projectpkg.SourceProcessOverride, Error: err}
+			} else {
+				res = processRes
+			}
+		}
+
+		envelope := map[string]any{
+			"project":            res.Project,
+			"project_source":     res.Source,
+			"project_path":       res.Path,
+			"cwd":                cwd,
+			"available_projects": res.AvailableProjects,
+		}
+		if res.Warning != "" {
+			envelope["warning"] = res.Warning
+		}
+		if res.Error != nil {
+			// REQ-313: not an error response — just surface the info.
+			envelope["error_hint"] = res.Error.Error()
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		query, _ := req.GetArguments()["query"].(string)
+		typ, _ := req.GetArguments()["type"].(string)
+		projectOverride, _ := req.GetArguments()["project"].(string)
+		scope, _ := req.GetArguments()["scope"].(string)
+		matchMode, _ := req.GetArguments()["match_mode"].(string)
+		responseFormat, _ := req.GetArguments()["response_format"].(string)
+		allProjects := boolArg(req, "all_projects", false)
+		limit := intArg(req, "limit", 10)
+
+		// Validate match_mode before any project resolution or DB work.
+		if matchMode != "" && matchMode != "all" && matchMode != "any" {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid match_mode %q: must be \"all\" or \"any\"", matchMode)), nil
+		}
+		if responseFormat != "" && responseFormat != "compact" {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid response_format %q: must be \"compact\"", responseFormat)), nil
+		}
+		compact := responseFormat == "compact"
+
+		// all_projects=true short-circuits project resolution: we search globally
+		// regardless of the project override or any auto-detected project. This
+		// keeps the cross-project flow independent of cwd-based detection so the
+		// agent can recall context from any project without knowing its key.
+		var detRes projectpkg.DetectionResult
+		var project string
+		if allProjects {
+			detRes = projectpkg.DetectionResult{Source: projectpkg.SourceAllProjects}
+		} else {
+			// Resolve project: validate override or auto-detect (REQ-310, REQ-311)
+			res, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+			if err != nil {
+				return readProjectErrorResult(activity, res, err), nil
+			}
+			detRes = res
+			project = detRes.Project
+			project, _ = store.NormalizeProject(project)
+			detRes.Project = project // JR2-1: keep envelope in sync with normalized query project
+		}
+
+		// REQ-391: personal scope is cross-project by definition. When scope=personal
+		// and no explicit project override was provided, clear the project filter so
+		// memories from all projects are visible (not just the cwd-detected one).
+		searchProject := project
+		if scope == "personal" && strings.TrimSpace(projectOverride) == "" {
+			searchProject = ""
+		}
+
+		sessionID := defaultSessionID(project)
+		activity.RecordToolCall(sessionID)
+
+		results, err := s.SearchPreviewsContext(ctx, query, store.SearchOptions{
+			Type:      typ,
+			Project:   searchProject,
+			Scope:     scope,
+			Limit:     limit,
+			MatchMode: matchMode,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
+		}
+
+		if len(results) == 0 {
+			// JW4: use respondWithProject even for empty results.
+			return respondWithProject(detRes, fmt.Sprintf("No memories found for: %q", query), nil), nil
+		}
+
+		// Batch-load relations for all results (REQ-002). Avoids N+1.
+		syncIDs := make([]string, 0, len(results))
+		for _, r := range results {
+			if r.SyncID != "" {
+				syncIDs = append(syncIDs, r.SyncID)
+			}
+		}
+		relationsMap := map[string]store.ObservationRelations{}
+		if len(syncIDs) > 0 {
+			if rm, relErr := s.GetRelationsForObservationsContext(ctx, syncIDs); relErr == nil {
+				relationsMap = rm
+			} else if errors.Is(relErr, context.Canceled) || errors.Is(relErr, context.DeadlineExceeded) {
+				return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", relErr)), nil
+			}
+			// Errors from relation loading are swallowed — search must not fail.
+		}
+
+		var b strings.Builder
+		if !compact {
+			fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		}
+		anyTruncated := false
+		structuredResults := make([]map[string]any, 0, len(results))
+		for i, r := range results {
+			projectDisplay := ""
+			if r.Project != nil {
+				projectDisplay = fmt.Sprintf(" | project: %s", *r.Project)
+			}
+			preview := r.Preview
+			if r.Truncated {
+				anyTruncated = true
+				preview += " [preview]"
+			}
+			stateDisplay := ""
+			if r.State() == store.ObservationStateNeedsReview {
+				stateDisplay = " | state: needs_review"
+			}
+			if !compact {
+				fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s%s\n",
+					i+1, r.ID, r.Type, r.Title,
+					preview,
+					timeutil.FormatLocal(r.CreatedAt), projectDisplay, r.Scope, stateDisplay)
+			}
+			entry := map[string]any{
+				"id":      r.ID,
+				"sync_id": r.SyncID,
+				"title":   r.Title,
+				"type":    r.Type,
+				"state":   r.State(),
+				"scope":   r.Scope,
+				"pinned":  r.Pinned,
+			}
+			if r.Project != nil {
+				entry["project"] = *r.Project
+			}
+			if r.TopicKey != nil && *r.TopicKey != "" {
+				entry["topic_key"] = *r.TopicKey
+			}
+			if r.ReviewAfter != nil {
+				entry["review_after"] = *r.ReviewAfter
+			}
+			if compact {
+				entry["preview"] = r.Preview
+				entry["truncated"] = r.Truncated
+			}
+			structuredResults = append(structuredResults, entry)
+
+			// Append relation annotations. Skip orphaned (filtered by store).
+			//
+			// Annotation format contract (REQ-012, Design §7):
+			//   supersedes: #<id> (<title>)            judged supersedes
+			//   superseded_by: #<id> (<title>)         judged superseded_by
+			//   conflicts: #<id> (<title>)             judged conflicts_with
+			//   conflict: contested by #<id> (pending) pending (UNCHANGED from Phase 1)
+			//
+			// <id> is the observation's integer primary key. <title> is the related
+			// observation's title; "(deleted)" when the observation is missing or soft-deleted.
+			// Prefixes (supersedes:, superseded_by:, conflicts:) are stable across Phase 3.
+			if rels, ok := relationsMap[r.SyncID]; ok {
+				if compact {
+					entry["relations"] = map[string]any{"as_source": rels.AsSource, "as_target": rels.AsTarget}
+				}
+				if !compact {
+					for _, rel := range rels.AsSource {
+						switch {
+						case rel.Relation == store.RelationSupersedes && rel.JudgmentStatus == store.JudgmentStatusJudged:
+							title := rel.TargetTitle
+							if rel.TargetMissing || title == "" {
+								title = "deleted"
+							}
+							fmt.Fprintf(&b, "    supersedes: #%d (%s)\n", rel.TargetIntID, title)
+						case rel.Relation == store.RelationConflictsWith && rel.JudgmentStatus == store.JudgmentStatusJudged:
+							title := rel.TargetTitle
+							if rel.TargetMissing || title == "" {
+								title = "deleted"
+							}
+							fmt.Fprintf(&b, "    conflicts: #%d (%s)\n", rel.TargetIntID, title)
+						case rel.JudgmentStatus == store.JudgmentStatusPending:
+							// UNCHANGED from Phase 1 — byte-for-byte preserved.
+							fmt.Fprintf(&b, "    conflict: contested by #%s (pending)\n", rel.TargetID)
+						}
+					}
+					for _, rel := range rels.AsTarget {
+						switch {
+						case rel.Relation == store.RelationSupersedes && rel.JudgmentStatus == store.JudgmentStatusJudged:
+							title := rel.SourceTitle
+							if rel.SourceMissing || title == "" {
+								title = "deleted"
+							}
+							fmt.Fprintf(&b, "    superseded_by: #%d (%s)\n", rel.SourceIntID, title)
+						case rel.JudgmentStatus == store.JudgmentStatusPending:
+							// UNCHANGED from Phase 1 — byte-for-byte preserved.
+							fmt.Fprintf(&b, "    conflict: contested by #%s (pending)\n", rel.SourceID)
+						}
+					}
+				}
+			}
+			if !compact {
+				b.WriteString("\n")
+			}
+		}
+		if !compact && anyTruncated {
+			fmt.Fprintf(&b, "---\nResults above are previews (300 chars). To read the full content of a specific memory, call mem_get_observation(id: <ID>).\n")
+		}
+
+		resultText := b.String()
+		if compact {
+			resultText = fmt.Sprintf("Found %d memories.", len(results))
+		}
+		if nudge := activity.NudgeIfNeededForProject(sessionID, project); nudge != "" {
+			resultText += nudge
+		}
+
+		// JW4: use respondWithProject for the success path (REQ-314).
+		return respondWithProject(detRes, resultText, map[string]any{"results": structuredResults}), nil
+	}
+}
+
+func handlePin(s *store.Store, pinned bool) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := int64(intArg(req, "id", 0))
+		if id == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		var err error
+		if pinned {
+			err = s.PinObservation(id)
+		} else {
+			err = s.UnpinObservation(id)
+		}
+		if err != nil {
+			return mcp.NewToolResultError("Failed to update pin state: " + err.Error()), nil
+		}
+
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError("Updated pin state but failed to reload observation: " + err.Error()), nil
+		}
+		state := "unpinned"
+		if pinned {
+			state = "pinned"
+		}
+		out, _ := jsonMarshal(map[string]any{
+			"result":  fmt.Sprintf("Memory #%d %s", id, state),
+			"id":      obs.ID,
+			"sync_id": obs.SyncID,
+			"pinned":  obs.Pinned,
+		})
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		title, _ := req.GetArguments()["title"].(string)
+		content, _ := req.GetArguments()["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			if observation, _ := req.GetArguments()["observation"].(string); strings.TrimSpace(observation) != "" {
+				content = observation
+			}
+		}
+		if strings.TrimSpace(content) == "" {
+			return mcp.NewToolResultError("content is required for mem_save (use content, or observation for backward-compatible clients)"), nil
+		}
+		// Reject titleless saves before any project resolution or session
+		// creation, so a rejected mem_save leaves no session behind (#459). The
+		// store applies the same rule as a backstop, and this message keeps the
+		// "Failed to save" prefix so callers read one wording either way.
+		if err := store.ValidateObservationTitle(title); err != nil {
+			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+		}
+		typ, _ := req.GetArguments()["type"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		scope, _ := req.GetArguments()["scope"].(string)
+		topicKey, _ := req.GetArguments()["topic_key"].(string)
+		projectChoice, _ := req.GetArguments()["project"].(string)
+		_, explicitProjectProvided := req.GetArguments()["project"]
+		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
+		recoveryToken, _ := req.GetArguments()["recovery_token"].(string)
+		capturePrompt := boolArg(req, "capture_prompt", true)
+		recoverySessionID := sessionID
+		if strings.TrimSpace(recoverySessionID) == "" {
+			recoverySessionID = defaultSessionID("")
+		}
+		validateRecoveryToken := func(res projectpkg.DetectionResult, choice string) (bool, bool) {
+			if strings.TrimSpace(recoveryToken) == "" {
+				return false, false
+			}
+			return true, activity.ValidateAmbiguousProjectRecoveryToken(recoverySessionID, recoveryToken, strings.TrimSpace(choice), res.AvailableProjects, res.Path)
+		}
+
+		// Resolve write project using the full MCP precedence: explicit request,
+		// existing session association, process override, repo config/directory detection, then cwd fallback.
+		detRes, err := resolveSaveWriteProjectWithProcessOverride(s, projectChoice, explicitProjectProvided, projectChoiceReason, sessionID, validateRecoveryToken, cfg.DefaultProject)
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
+		}
+		project := detRes.Project
+
+		// Normalize project name and capture warning
+		normalized, normWarning := store.NormalizeProject(project)
+		project = normalized
+
+		if typ == "" {
+			typ = "manual"
+		}
+		if sessionID == "" {
+			sessionID, err = resolveFallbackSessionID(s, project)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+			}
+		}
+		suggestedTopicKey := suggestTopicKey(typ, title, content)
+
+		// Check for similar existing projects (only when this project has no existing observations)
+		var similarWarning string
+		if project != "" {
+			existingNames, _ := s.ListProjectNames()
+			isNew := true
+			for _, e := range existingNames {
+				if e == project {
+					isNew = false
+					break
+				}
+			}
+			if isNew && len(existingNames) > 0 {
+				matches := projectpkg.FindSimilar(project, existingNames, 3)
+				if len(matches) > 0 {
+					bestMatch := matches[0].Name
+					obsCount, _ := s.CountObservationsForProject(bestMatch)
+					similarWarning = fmt.Sprintf("⚠️ Project %q has no memories. Similar project found: %q (%d memories). Consider using that name instead.", project, bestMatch, obsCount)
+				}
+			}
+		}
+
+		// Ensure the implicit MCP session exists with the current working directory.
+		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+
+		truncation := s.ContentTruncation(content)
+
+		savedID, err := s.AddObservation(store.AddObservationParams{
+			SessionID: sessionID,
+			Type:      typ,
+			Title:     title,
+			Content:   content,
+			Project:   project,
+			Scope:     scope,
+			TopicKey:  topicKey,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+		}
+		savedObservation, savedObservationErr := s.GetObservation(savedID)
+
+		if capturePrompt && activity != nil {
+			if prompt, ok := activity.CurrentPrompt(sessionID, project); ok {
+				if _, _, promptErr := addPromptIfMissing(s, store.AddPromptParams{
+					SessionID: sessionID,
+					Content:   prompt,
+					Project:   project,
+				}); promptErr != nil {
+					fmt.Fprintf(os.Stderr, "engram: auto prompt capture error (non-fatal): %v\n", promptErr)
+				}
+			}
+		}
+
+		if activity != nil {
+			activity.RecordSaveForProject(sessionID, project)
+		}
+
+		msg := fmt.Sprintf("Memory saved: %q (%s)", title, typ)
+		if topicKey == "" && suggestedTopicKey != "" {
+			msg += fmt.Sprintf("\nSuggested topic_key: %s", suggestedTopicKey)
+		}
+		msg += truncationWarning(truncation)
+		if savedObservationErr == nil {
+			msg += absolutePathWarning(savedObservation.Content)
+		}
+		if normWarning != "" {
+			msg += "\n" + normWarning
+		}
+		if similarWarning != "" {
+			msg += "\n" + similarWarning
+		}
+
+		// Post-transaction conflict candidate detection (REQ-001).
+		// Errors are logged and swallowed — detection failure never fails the save.
+		extra := map[string]any{"truncation": truncation}
+		// Build CandidateOptions, forwarding any MCPConfig overrides.
+		// nil fields mean "use store defaults"; explicit pointer values override.
+		candOpts := store.CandidateOptions{
+			Project:   project,
+			Scope:     scope,
+			BM25Floor: cfg.BM25Floor, // nil → store default (-2.0); explicit value overrides
+		}
+		if cfg.Limit != nil {
+			candOpts.Limit = *cfg.Limit
+		}
+		candidates, candErr := s.FindCandidates(savedID, candOpts)
+		if candErr != nil {
+			// Log only — do not fail the save.
+			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
+		}
+
+		// Fetch the saved observation's sync_id for the envelope (REQ-001).
+		var savedSyncID string
+		if savedObservationErr == nil {
+			savedSyncID = savedObservation.SyncID
+			extra["id"] = savedID
+			extra["sync_id"] = savedSyncID
+			extra["state"] = savedObservation.State()
+			if savedObservation.ReviewAfter != nil {
+				extra["review_after"] = *savedObservation.ReviewAfter
+			}
+		}
+		if len(candidates) > 0 {
+			extra["judgment_required"] = true
+			extra["judgment_status"] = "pending"
+			extra["judgment_id"] = candidates[0].JudgmentID // first candidate's rel sync_id (design convenience)
+			candList := make([]map[string]any, 0, len(candidates))
+			for _, c := range candidates {
+				entry := map[string]any{
+					"id":          c.ID,
+					"sync_id":     c.SyncID,
+					"title":       c.Title,
+					"type":        c.Type,
+					"score":       c.Score,
+					"judgment_id": c.JudgmentID,
+				}
+				if c.TopicKey != nil {
+					entry["topic_key"] = *c.TopicKey
+				}
+				candList = append(candList, entry)
+			}
+			extra["candidates"] = candList
+
+			msg += fmt.Sprintf("\nCONFLICT REVIEW PENDING — %d candidate(s); use mem_judge to record verdicts.", len(candidates))
+		} else {
+			extra["judgment_required"] = false
+		}
+
+		// Update detRes to reflect normalized project for envelope accuracy
+		detRes.Project = project
+		return respondWithProject(detRes, msg, extra), nil
+	}
+}
+
+func handleSuggestTopicKey() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		typ, _ := req.GetArguments()["type"].(string)
+		title, _ := req.GetArguments()["title"].(string)
+		content, _ := req.GetArguments()["content"].(string)
+
+		if strings.TrimSpace(title) == "" && strings.TrimSpace(content) == "" {
+			return mcp.NewToolResultError("provide title or content to suggest a topic_key"), nil
+		}
+
+		topicKey := suggestTopicKey(typ, title, content)
+		if topicKey == "" {
+			return mcp.NewToolResultError("could not suggest topic_key from input"), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Suggested topic_key: %s", topicKey)), nil
+	}
+}
+
+func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := int64(intArg(req, "id", 0))
+		if id == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		update := store.UpdateObservationParams{}
+		if v, ok := req.GetArguments()["title"].(string); ok {
+			update.Title = &v
+		}
+		if v, ok := req.GetArguments()["content"].(string); ok {
+			update.Content = &v
+		}
+		if v, ok := req.GetArguments()["type"].(string); ok {
+			update.Type = &v
+		}
+		if v, ok := req.GetArguments()["scope"].(string); ok {
+			update.Scope = &v
+		}
+		if v, ok := req.GetArguments()["topic_key"].(string); ok {
+			update.TopicKey = &v
+		}
+
+		if update.Title == nil && update.Content == nil && update.Type == nil && update.Project == nil && update.Scope == nil && update.TopicKey == nil {
+			return mcp.NewToolResultError("provide at least one field to update"), nil
+		}
+
+		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, true)
+		if err != nil {
+			return writeProjectErrorResult(nil, "", detRes, err), nil
+		}
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
+		}
+		resolvedProject, _ := store.NormalizeProject(detRes.Project)
+		storedProject := ""
+		if obs.Project != nil {
+			storedProject, _ = store.NormalizeProject(*obs.Project)
+		}
+		if storedProject == "" {
+			return errorWithMeta("project_required", "The stored observation has no project identity", knownWriteProjects(s, detRes)), nil
+		}
+		if storedProject != resolvedProject {
+			return errorWithMeta("project_mismatch", "The current project does not own this observation", knownWriteProjects(s, detRes)), nil
+		}
+		if detRes.Source == projectpkg.SourceDirBasename {
+			session, err := s.GetSession(obs.SessionID)
+			if err != nil || strings.TrimSpace(session.Directory) == "" || runtimeSessionDirectory(session.Directory) != runtimeSessionDirectory(detRes.Path) {
+				return errorWithMeta("project_mismatch", "The current project does not own this observation", knownWriteProjects(s, detRes)), nil
+			}
+		}
+
+		var truncation *store.TruncationMetadata
+		if update.Content != nil {
+			metadata := s.ContentTruncation(*update.Content)
+			truncation = &metadata
+		}
+
+		obs, err = s.UpdateObservation(id, update)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
+		}
+
+		msg := fmt.Sprintf("Memory updated: #%d %q (%s, scope=%s)", obs.ID, obs.Title, obs.Type, obs.Scope)
+		extra := map[string]any{}
+		if truncation != nil {
+			msg += truncationWarning(*truncation)
+			extra["truncation"] = *truncation
+		}
+
+		return respondWithProject(detRes, msg, extra), nil
+	}
+}
+
+func handleReview(s *store.Store, cfg MCPConfig, activities ...*SessionActivity) server.ToolHandlerFunc {
+	activity := recoveryActivity(activities)
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		action, _ := req.GetArguments()["action"].(string)
+		switch strings.TrimSpace(action) {
+		case "list":
+			projectFilter, _ := req.GetArguments()["project"].(string)
+			limit := intArg(req, "limit", 10)
+			detRes, _ := projectpkg.Resolve(projectpkg.ResolutionOptions{Mode: projectpkg.ResolutionAll})
+			if strings.TrimSpace(projectFilter) != "" {
+				var err error
+				detRes, err = resolveReadProject(s, projectFilter)
+				if err != nil {
+					var upe *unknownProjectError
+					if errors.As(err, &upe) {
+						return errorWithMeta("unknown_project",
+							fmt.Sprintf("Project %q not found in store", upe.Name),
+							upe.AvailableProjects,
+						), nil
+					}
+					return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
+				}
+				projectFilter = detRes.Project
+			}
+
+			observations, err := s.ObservationsNeedingReview(projectFilter, limit)
+			if err != nil {
+				return mcp.NewToolResultError("Review list error: " + err.Error()), nil
+			}
+
+			structured := make([]map[string]any, 0, len(observations))
+			if len(observations) == 0 {
+				return respondWithProject(detRes, "No memories need review.", map[string]any{"observations": structured}), nil
+			}
+
+			var b strings.Builder
+			fmt.Fprintf(&b, "Found %d memories needing review:\n\n", len(observations))
+			for i, obs := range observations {
+				projectDisplay := ""
+				if obs.Project != nil {
+					projectDisplay = fmt.Sprintf(" | project: %s", *obs.Project)
+				}
+				reviewDisplay := ""
+				if obs.ReviewAfter != nil {
+					reviewDisplay = fmt.Sprintf(" | review_after: %s", *obs.ReviewAfter)
+				}
+				fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    state: %s%s%s\n",
+					i+1, obs.ID, obs.Type, obs.Title, obs.State(), projectDisplay, reviewDisplay)
+
+				entry := map[string]any{
+					"id":      obs.ID,
+					"sync_id": obs.SyncID,
+					"title":   obs.Title,
+					"type":    obs.Type,
+					"state":   obs.State(),
+				}
+				if obs.Project != nil {
+					entry["project"] = *obs.Project
+				}
+				if obs.ReviewAfter != nil {
+					entry["review_after"] = *obs.ReviewAfter
+				}
+				structured = append(structured, entry)
+			}
+			return respondWithProject(detRes, b.String(), map[string]any{"observations": structured}), nil
+
+		case "mark_reviewed":
+			id := int64(intArg(req, "observation_id", 0))
+			if id == 0 {
+				id = int64(intArg(req, "id", 0))
+			}
+			if id == 0 {
+				return mcp.NewToolResultError("observation_id is required for mark_reviewed"), nil
+			}
+			detRes, detErr := resolveReadProjectWithProcessOverride(s, "", cfg.DefaultProject)
+			if detErr != nil {
+				return readProjectErrorResult(activity, detRes, detErr), nil
+			}
+			markReviewed := s.MarkReviewed
+			if detRes.Project != "" {
+				markReviewed = func(observationID int64) error {
+					return s.MarkReviewedForProject(observationID, detRes.Project)
+				}
+			}
+			if err := markReviewed(id); err != nil {
+				if detRes.Project != "" && errors.Is(err, store.ErrObservationNotFound) {
+					return mcp.NewToolResultError("Failed to mark reviewed: observation not found in resolved project"), nil
+				}
+				return mcp.NewToolResultError("Failed to mark reviewed: " + err.Error()), nil
+			}
+			obs, err := s.GetObservation(id)
+			if err != nil {
+				return mcp.NewToolResultError("Marked reviewed but failed to reload observation: " + err.Error()), nil
+			}
+			extra := map[string]any{"id": obs.ID, "sync_id": obs.SyncID, "state": obs.State()}
+			if obs.ReviewAfter != nil {
+				extra["review_after"] = *obs.ReviewAfter
+			}
+			msg := fmt.Sprintf("Memory marked reviewed: #%d %q (%s)", obs.ID, obs.Title, obs.Type)
+			return respondWithProject(detRes, msg, extra), nil
+
+		default:
+			return mcp.NewToolResultError("action must be one of: list, mark_reviewed"), nil
+		}
+	}
+}
+
+func handleDelete(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := int64(intArg(req, "id", 0))
+		if id == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		hardDelete := boolArg(req, "hard_delete", false)
+		if err := s.DeleteObservation(id, hardDelete); err != nil {
+			return mcp.NewToolResultError("Failed to delete memory: " + err.Error()), nil
+		}
+
+		mode := "soft-deleted"
+		if hardDelete {
+			mode = "permanently deleted"
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Memory #%d %s", id, mode)), nil
+	}
+}
+
+func handleSavePrompt(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		content, _ := req.GetArguments()["content"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		projectChoice, _ := req.GetArguments()["project"].(string)
+		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
+		recoveryToken, _ := req.GetArguments()["recovery_token"].(string)
+		recoverySessionID := sessionID
+		if strings.TrimSpace(recoverySessionID) == "" {
+			recoverySessionID = defaultSessionID("")
+		}
+		validateRecoveryToken := func(res projectpkg.DetectionResult, choice string) (bool, bool) {
+			if strings.TrimSpace(recoveryToken) == "" {
+				return false, false
+			}
+			return true, activity.ValidateAmbiguousProjectRecoveryToken(recoverySessionID, recoveryToken, strings.TrimSpace(choice), res.AvailableProjects, res.Path)
+		}
+
+		var detRes projectpkg.DetectionResult
+		var err error
+		if strings.TrimSpace(sessionID) != "" {
+			detRes, err = resolveSaveWriteProjectWithProcessOverride(s, "", false, "", sessionID, nil, cfg.DefaultProject)
+		} else {
+			detRes, err = resolveWriteProjectWithChoiceAndProcessOverride(s, projectChoice, projectChoiceReason, validateRecoveryToken, cfg.DefaultProject)
+		}
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
+		}
+		project, _ := store.NormalizeProject(detRes.Project)
+
+		if sessionID == "" {
+			sessionID, err = resolveFallbackSessionID(s, project)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to save prompt: " + err.Error()), nil
+			}
+		}
+
+		// Ensure the implicit MCP session exists with the current working directory.
+		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+
+		truncation := s.ContentTruncation(content)
+		_, err = s.AddPrompt(store.AddPromptParams{
+			SessionID: sessionID,
+			Content:   content,
+			Project:   project,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Failed to save prompt: " + err.Error()), nil
+		}
+
+		if activity != nil {
+			activity.RecordPrompt(sessionID, project, content)
+		}
+
+		detRes.Project = project
+		msg := fmt.Sprintf("Prompt saved: %q", truncate(content, 80)) + truncationWarning(truncation)
+		return respondWithProject(detRes, msg, map[string]any{"truncation": truncation}), nil
+	}
+}
+
+// mem_context output budget constants (issue #1039). The MCP tool must
+// never render the unbounded legacy context: absent arguments resolve to the
+// #1012 Claude Code hook budget, and explicit values are clamped to the same
+// ceiling the HTTP /context endpoint enforces.
+const (
+	// memContextDefaultMaxBytes is the default context budget for mem_context,
+	// matching the 16 KiB window the #1012 Claude Code hook budget uses so MCP
+	// context output stays aligned with hook context output.
+	memContextDefaultMaxBytes = 16 * 1024
+
+	// memContextMaxPinned caps the "### Pinned" section in mem_context output.
+	// Pinning is a hand-bounded action, but an unbounded pinned list could
+	// still dominate the response before MaxBytes applies.
+	memContextMaxPinned = 20
+
+	// memContextMaxBytesCeiling mirrors the HTTP server's contextMaxBytes
+	// ceiling for GET /context, keeping both transports' budgets aligned.
+	memContextMaxBytesCeiling = 64 * 1024
+)
+
+// memContextMaxBytes resolves the optional max_bytes tool argument (MCP
+// numbers arrive as float64). Absent, mistyped, non-positive, NaN, or any
+// fractional value falls back to the default budget — the MCP path must
+// never resolve to the unbounded legacy rendering, a byte budget is an
+// integer quantity (int(1.5) truncating to 1 would be a silent budget the
+// caller never requested), and int(f) of a fraction in (0,1) truncates to
+// 0, which ContextOptions treats as the unbounded zero value. The ceiling
+// comparison happens in float64 BEFORE the int conversion, because
+// converting an out-of-range float to int is spec-undefined in Go.
+func memContextMaxBytes(raw any) int {
+	v, ok := raw.(float64)
+	if !ok || !(v > 0) || v != math.Trunc(v) {
+		return memContextDefaultMaxBytes
+	}
+	if v > float64(memContextMaxBytesCeiling) {
+		return memContextMaxBytesCeiling
+	}
+	return int(v)
+}
+
+// memContextTruncationMarker mirrors the store's contextTruncationMarker
+// (internal/store/store.go): a visible marker that replaces the cut tail so
+// the omission is explicit.
+const memContextTruncationMarker = "\n[truncated]\n"
+
+// memContextMaxStatsProjects caps how many project names the "Memory stats"
+// suffix lists before degrading to "+N more". The join over every project in
+// the store is the unbounded part of the suffix (#1039, CodeRabbit major on
+// PR #1074); capping it keeps the suffix structurally small so the reserved
+// context budget stays meaningful even on stores with hundreds of projects.
+const memContextMaxStatsProjects = 8
+
+// formatContextProjects renders the projects list for the mem_context stats
+// suffix: "none", the full join, or the first memContextMaxStatsProjects
+// names plus a "+N more" overflow marker.
+func formatContextProjects(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	if len(names) <= memContextMaxStatsProjects {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s, +%d more", strings.Join(names[:memContextMaxStatsProjects], ", "), len(names)-memContextMaxStatsProjects)
+}
+
+// clampMemContextResult caps the complete mem_context tool result — context
+// block, stats line, and nudge — at the resolved byte budget, mirroring the
+// store's limitContextBytes semantics: a UTF-8-safe cut with the visible
+// [truncated] marker appended when it fits, and a bare UTF-8-safe prefix cut
+// for budgets smaller than the marker itself.
+func clampMemContextResult(result string, maxBytes int) string {
+	if maxBytes <= 0 || len(result) <= maxBytes {
+		return result
+	}
+	if maxBytes < len(memContextTruncationMarker) {
+		return truncateMemContextUTF8(result, maxBytes)
+	}
+	return truncateMemContextUTF8(result, maxBytes-len(memContextTruncationMarker)) + memContextTruncationMarker
+}
+
+// truncateMemContextUTF8 mirrors the store's truncateUTF8Prefix: never split
+// a UTF-8 sequence when cutting.
+func truncateMemContextUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if maxBytes >= len(s) {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
+}
+
+func handleContext(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projectOverride, _ := req.GetArguments()["project"].(string)
+		scope, _ := req.GetArguments()["scope"].(string)
+		compact, _ := req.GetArguments()["compact"].(bool)
+
+		// Resolve project: validate override or auto-detect (REQ-310, REQ-311)
+		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			return readProjectErrorResult(activity, detRes, err), nil
+		}
+		project := detRes.Project
+		project, _ = store.NormalizeProject(project)
+		detRes.Project = project // JR2-1: keep envelope in sync with normalized query project
+
+		// REQ-391: personal scope is cross-project by definition. When scope=personal
+		// and no explicit project override was provided, clear the project filter so
+		// observations from all projects are returned (not just the cwd-detected one).
+		contextProject := project
+		if scope == "personal" && strings.TrimSpace(projectOverride) == "" {
+			contextProject = ""
+		}
+
+		sessionID := defaultSessionID(project)
+		activity.RecordToolCall(sessionID)
+
+		// #1039: render a bounded context instead of the unbounded legacy
+		// FormatContext output — 16 KiB by default, capped at 20 pinned rows,
+		// with optional max_bytes/compact tuning from the caller.
+		maxBytes := memContextMaxBytes(req.GetArguments()["max_bytes"])
+
+		// #1039 (CodeRabbit major on PR #1074): the budget applies to the
+		// COMPLETE result. The stats suffix joins every project name in the
+		// store (unbounded) and the nudge is appended after the context block,
+		// so the suffix is rendered FIRST and its bytes are reserved from the
+		// context budget; a final clamp backstops the pathological case where
+		// the suffix alone meets or exceeds the budget.
+		stats, err := loadContextStats(s)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to get context stats: " + err.Error()), nil
+		}
+		suffix := fmt.Sprintf("\n---\nMemory stats: %d sessions, %d observations across projects: %s",
+			stats.TotalSessions, stats.TotalObservations, formatContextProjects(stats.Projects))
+		suffix += activity.NudgeIfNeededForProject(sessionID, project)
+
+		contextBudget := maxBytes - len(suffix)
+		if contextBudget < 1 {
+			contextBudget = 1
+		}
+		contextResult, err := s.FormatContextWithOptions(contextProject, scope, store.ContextOptions{
+			MaxBytes: contextBudget,
+			Pinned:   memContextMaxPinned,
+			Compact:  compact,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Failed to get context: " + err.Error()), nil
+		}
+
+		if contextResult == "" {
+			// The fixed no-context message is part of the complete mem_context
+			// result, so it flows through the same clamp: an explicit tiny
+			// max_bytes must bound it exactly like a rendered context block.
+			return respondWithProject(detRes, clampMemContextResult("No previous session memories found.", maxBytes), nil), nil
+		}
+
+		result := clampMemContextResult(contextResult+suffix, maxBytes)
+
+		return respondWithProject(detRes, result, nil), nil
+	}
+}
+
+// handleStats returns a tool handler function for mem_stats.
+func handleStats(s *store.Store, cfg MCPConfig, activities ...*SessionActivity) server.ToolHandlerFunc {
+	var activity *SessionActivity
+	if len(activities) > 0 {
+		activity = activities[0]
+	}
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projectOverride, _ := req.GetArguments()["project"].(string)
+
+		detRes := projectpkg.DetectionResult{Source: projectpkg.SourceAllProjects}
+		if strings.TrimSpace(projectOverride) != "" || strings.TrimSpace(cfg.DefaultProject) != "" {
+			var err error
+			detRes, err = resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+			if err != nil {
+				return readProjectErrorResult(activity, detRes, err), nil
+			}
+		}
+
+		stats, err := loadMCPStats(s)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to get stats: " + err.Error()), nil
+		}
+
+		var projects string
+		if len(stats.Projects) > 0 {
+			projects = strings.Join(stats.Projects, ", ")
+		} else {
+			projects = "none yet"
+		}
+
+		result := fmt.Sprintf("Memory System Stats:\n- Sessions: %d\n- Observations: %d\n- Prompts: %d\n- Projects: %s",
+			stats.TotalSessions, stats.TotalObservations, stats.TotalPrompts, projects)
+
+		return respondWithProject(detRes, result, nil), nil
+	}
+}
+
+// DoctorToolHandler returns a tool handler function for mem_doctor.
+func DoctorToolHandler(s *store.Store) server.ToolHandlerFunc {
+	return handleDoctor(s, MCPConfig{})
+}
+
+func handleDoctor(s *store.Store, cfg MCPConfig, activities ...*SessionActivity) server.ToolHandlerFunc {
+	var activity *SessionActivity
+	if len(activities) > 0 {
+		activity = activities[0]
+	}
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projectOverride, _ := req.GetArguments()["project"].(string)
+		check, _ := req.GetArguments()["check"].(string)
+		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			return readProjectErrorResult(activity, detRes, err), nil
+		}
+		project := detRes.Project
+		project, _ = store.NormalizeProject(project)
+		runner := diagnostic.NewRunner()
+		scope := diagnostic.Scope{Store: s, Project: project, Now: time.Now()}
+		var report diagnostic.Report
+		if strings.TrimSpace(check) != "" {
+			report, err = runner.RunOne(ctx, scope, check)
+		} else {
+			report, err = runner.RunAll(ctx, scope)
+		}
+		if err != nil {
+			report = diagnostic.ErrorReport(project, err)
+		}
+		out, marshalErr := jsonMarshal(report)
+		if marshalErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Doctor JSON error: %s", marshalErr)), nil
+		}
+		result := mcp.NewToolResultText(string(out))
+		if report.Status == diagnostic.StatusError {
+			result.IsError = true
+		}
+		return result, nil
+	}
+}
+
+func handleTimeline(s *store.Store, cfg MCPConfig, activities ...*SessionActivity) server.ToolHandlerFunc {
+	var activity *SessionActivity
+	if len(activities) > 0 {
+		activity = activities[0]
+	}
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		observationID := int64(intArg(req, "observation_id", 0))
+		if observationID == 0 {
+			return mcp.NewToolResultError("observation_id is required"), nil
+		}
+		before := intArg(req, "before", 5)
+		after := intArg(req, "after", 5)
+		projectOverride, _ := req.GetArguments()["project"].(string)
+
+		// Resolve project: validate override or auto-detect (REQ-310, REQ-311, REQ-314)
+		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			return readProjectErrorResult(activity, detRes, err), nil
+		}
+		focus, err := s.GetObservation(observationID)
+		if err != nil {
+			return mcp.NewToolResultError("Timeline error: observation not found"), nil
+		}
+		if focus.Project == nil || !strings.EqualFold(strings.TrimSpace(*focus.Project), detRes.Project) {
+			return mcp.NewToolResultError("Timeline error: observation not found in resolved project"), nil
+		}
+
+		result, err := s.Timeline(observationID, before, after)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Timeline error: %s", err)), nil
+		}
+
+		var b strings.Builder
+
+		// Session header
+		if result.SessionInfo != nil {
+			summary := ""
+			if result.SessionInfo.Summary != nil {
+				summary = fmt.Sprintf(" — %s", truncate(*result.SessionInfo.Summary, 100))
+			}
+			fmt.Fprintf(&b, "Session: %s (%s)%s\n", result.SessionInfo.Project, result.SessionInfo.StartedAt, summary)
+			fmt.Fprintf(&b, "Total observations in session: %d\n\n", result.TotalInRange)
+		}
+
+		// Before entries
+		if len(result.Before) > 0 {
+			b.WriteString("─── Before ───\n")
+			for _, e := range result.Before {
+				fmt.Fprintf(&b, "  #%d [%s] %s — %s\n", e.ID, e.Type, e.Title, truncate(e.Content, 150))
+			}
+			b.WriteString("\n")
+		}
+
+		// Focus observation (highlighted)
+		fmt.Fprintf(&b, ">>> #%d [%s] %s <<<\n", result.Focus.ID, result.Focus.Type, result.Focus.Title)
+		fmt.Fprintf(&b, "    %s\n", truncate(result.Focus.Content, 500))
+		fmt.Fprintf(&b, "    %s\n\n", timeutil.FormatLocal(result.Focus.CreatedAt))
+
+		// After entries
+		if len(result.After) > 0 {
+			b.WriteString("─── After ───\n")
+			for _, e := range result.After {
+				fmt.Fprintf(&b, "  #%d [%s] %s — %s\n", e.ID, e.Type, e.Title, truncate(e.Content, 150))
+			}
+		}
+
+		return respondWithProject(detRes, b.String(), nil), nil
+	}
+}
+
+// handleGetObservation returns a tool handler function for mem_get_observation.
+func handleGetObservation(s *store.Store, cfg MCPConfig, activities ...*SessionActivity) server.ToolHandlerFunc {
+	activity := recoveryActivity(activities)
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := int64(intArg(req, "id", 0))
+		if id == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Observation #%d not found", id)), nil
+		}
+
+		// Resolve project from process override/cwd (REQ-310, REQ-314). No per-call
+		// override is possible for get-by-ID.
+		detRes, detErr := resolveReadProjectWithProcessOverride(s, "", cfg.DefaultProject)
+
+		obsProject := ""
+		if obs.Project != nil {
+			obsProject = fmt.Sprintf("\nProject: %s", *obs.Project)
+		}
+		scope := fmt.Sprintf("\nScope: %s", obs.Scope)
+		topic := ""
+		if obs.TopicKey != nil {
+			topic = fmt.Sprintf("\nTopic: %s", *obs.TopicKey)
+		}
+		toolName := ""
+		if obs.ToolName != nil {
+			toolName = fmt.Sprintf("\nTool: %s", *obs.ToolName)
+		}
+		duplicateMeta := fmt.Sprintf("\nDuplicates: %d", obs.DuplicateCount)
+		revisionMeta := fmt.Sprintf("\nRevisions: %d", obs.RevisionCount)
+
+		result := fmt.Sprintf("#%d [%s] %s\n%s\nSession: %s%s%s\nCreated: %s",
+			obs.ID, obs.Type, obs.Title,
+			obs.Content,
+			obs.SessionID, obsProject+scope+topic, toolName+duplicateMeta+revisionMeta,
+			timeutil.FormatLocal(obs.CreatedAt),
+		)
+
+		if detErr != nil {
+			return readProjectErrorResult(activity, detRes, detErr), nil
+		}
+		return respondWithProject(detRes, result, nil), nil
+	}
+}
+
+// handleSessionSummary returns a tool handler function that saves a comprehensive
+// end-of-session summary memory. It supports explicit project override matching
+// the precedence of mem_save.
+func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		content, _ := req.GetArguments()["content"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		projectChoice, _ := req.GetArguments()["project"].(string)
+		_, explicitProjectProvided := req.GetArguments()["project"]
+		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
+		recoveryToken, _ := req.GetArguments()["recovery_token"].(string)
+
+		// Reject empty/whitespace-only content before any project resolution (#393).
+		if strings.TrimSpace(content) == "" {
+			return mcp.NewToolResultError("content is required for mem_session_summary"), nil
+		}
+
+		recoverySessionID := sessionID
+		if strings.TrimSpace(recoverySessionID) == "" {
+			recoverySessionID = defaultSessionID("")
+		}
+		// validateRecoveryToken verifies if a recovery token matches the request.
+		validateRecoveryToken := func(res projectpkg.DetectionResult, choice string) (bool, bool) {
+			if strings.TrimSpace(recoveryToken) == "" {
+				return false, false
+			}
+			return true, activity.ValidateAmbiguousProjectRecoveryToken(recoverySessionID, recoveryToken, strings.TrimSpace(choice), res.AvailableProjects, res.Path)
+		}
+
+		// Resolve write project using the full MCP precedence: explicit request,
+		// existing session association, process override, repo config/directory detection, then cwd fallback.
+		detRes, err := resolveSaveWriteProjectWithProcessOverride(s, projectChoice, explicitProjectProvided, projectChoiceReason, sessionID, validateRecoveryToken, cfg.DefaultProject)
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
+		}
+		project := detRes.Project
+
+		project, _ = store.NormalizeProject(project)
+
+		if sessionID == "" {
+			sessionID, err = resolveFallbackSessionID(s, project)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
+			}
+		}
+
+		// Ensure the implicit MCP session exists with the current working directory.
+		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+
+		savedID, err := s.AddObservation(store.AddObservationParams{
+			SessionID: sessionID,
+			Type:      "session_summary",
+			Title:     fmt.Sprintf("Session summary: %s", project),
+			Content:   content,
+			Project:   project,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
+		}
+		activity.RecordProjectSave(project)
+
+		msg := fmt.Sprintf("Session summary saved for project %q", project)
+		if score := activity.ActivityScore(defaultSessionID(project)); score != "" {
+			msg += "\n" + score
+		}
+		detRes.Project = project
+		extra := map[string]any{"judgment_required": false}
+		if obs, obsErr := s.GetObservation(savedID); obsErr == nil {
+			extra["id"] = savedID
+			extra["sync_id"] = obs.SyncID
+			extra["state"] = obs.State()
+			if obs.ReviewAfter != nil {
+				extra["review_after"] = *obs.ReviewAfter
+			}
+		}
+		return respondWithProject(detRes, msg, extra), nil
+	}
+}
+
+func handleSessionStart(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, _ := req.GetArguments()["id"].(string)
+		directory, _ := req.GetArguments()["directory"].(string)
+		resolvedDirectory := strings.TrimSpace(directory)
+		// project field intentionally not read — auto-detect only (REQ-308)
+
+		detRes, err := resolveSessionStartProject(s, resolvedDirectory, cfg.DefaultProject)
+		if err != nil {
+			return writeProjectErrorResult(nil, "", detRes, err), nil
+		}
+		project, _ := store.NormalizeProject(detRes.Project)
+
+		activity.RecordToolCall(defaultSessionID(project))
+		resolvedDirectory = runtimeSessionDirectory(resolvedDirectory)
+
+		if err := s.StartSession(id, project, resolvedDirectory); err != nil {
+			if errors.Is(err, store.ErrSessionAlreadyEnded) {
+				result := errorWithMeta(
+					"session_already_ended",
+					fmt.Sprintf("Session %q has already ended. Choose a new session ID and retry mem_session_start.", id),
+					nil,
+				)
+				addErrorMetadata(result, map[string]any{"session_id": id})
+				return result, nil
+			}
+			return mcp.NewToolResultError("Failed to start session: " + err.Error()), nil
+		}
+
+		detRes.Project = project
+		return respondWithProject(detRes, fmt.Sprintf("Session %q started for project %q", id, project), nil), nil
+	}
+}
+
+func resolveSessionStartProject(s *store.Store, explicitDirectory, defaultProject string) (projectpkg.DetectionResult, error) {
+	if explicitDirectory == "" {
+		return resolveWriteProjectWithProcessOverride(s, defaultProject, false)
+	}
+	res := projectpkg.DetectProjectFull(explicitDirectory)
+	if res.Error != nil {
+		return res, res.Error
+	}
+	return res, nil
+}
+
+func handleSessionEnd(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, _ := req.GetArguments()["id"].(string)
+		summary, _ := req.GetArguments()["summary"].(string)
+		// project field intentionally not read — auto-detect only (REQ-308)
+
+		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, false)
+		if err != nil {
+			if errors.Is(err, projectpkg.ErrInvalidConfig) || errors.Is(err, projectpkg.ErrRepositoryBinding) {
+				return writeProjectErrorResult(nil, "", detRes, err), nil
+			}
+			// For session end, still complete the operation even if project resolution fails.
+			// Use basename fallback.
+			cwd, _ := os.Getwd()
+			detRes = projectpkg.DetectionResult{
+				Project: projectpkg.DetectProject(cwd),
+				Source:  "dir_basename",
+				Path:    cwd,
+			}
+		}
+		project, _ := store.NormalizeProject(detRes.Project)
+
+		if err := s.EndSession(id, summary); err != nil {
+			return mcp.NewToolResultError("Failed to end session: " + err.Error()), nil
+		}
+
+		activity.ClearSession(defaultSessionID(project))
+
+		detRes.Project = project
+		return respondWithProject(detRes, fmt.Sprintf("Session %q completed", id), nil), nil
+	}
+}
+
+func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		content, _ := req.GetArguments()["content"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		source, _ := req.GetArguments()["source"].(string)
+		// project field intentionally not read — auto-detect only (REQ-308)
+
+		detRes, err := resolveSaveWriteProjectWithProcessOverride(s, "", false, "", sessionID, nil, cfg.DefaultProject)
+		if err != nil {
+			return writeProjectErrorResult(activity, sessionID, detRes, err), nil
+		}
+		project, _ := store.NormalizeProject(detRes.Project)
+
+		activity.RecordToolCall(defaultSessionID(project))
+
+		if content == "" {
+			return mcp.NewToolResultError("content is required — include text with a '## Key Learnings:' section"), nil
+		}
+
+		if sessionID == "" {
+			sessionID, err = resolveFallbackSessionID(s, project)
+			if err != nil {
+				return mcp.NewToolResultError("Passive capture failed: " + err.Error()), nil
+			}
+			_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+		}
+
+		if source == "" {
+			source = "mcp-passive"
+		}
+
+		result, err := s.PassiveCapture(store.PassiveCaptureParams{
+			SessionID: sessionID,
+			Content:   content,
+			Project:   project,
+			Source:    source,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Passive capture failed: " + err.Error()), nil
+		}
+
+		detRes.Project = project
+		return respondWithProject(detRes, fmt.Sprintf(
+			"Passive capture complete: extracted=%d saved=%d duplicates=%d",
+			result.Extracted, result.Saved, result.Duplicates,
+		), nil), nil
+	}
+}
+
+// handleJudge implements mem_judge. It validates params, calls JudgeRelation,
+// and returns the updated relation row as JSON.
+//
+// Tool description contract (Design §6.1):
+// "Record a verdict on a pending memory conflict surfaced by mem_save.
+// When mem_save returns judgment_required=true, call mem_judge once per
+// candidate (judgment_id is in candidates[]). Use to mark SUPERSEDES,
+// CONFLICTS_WITH, NOT_CONFLICT, RELATED, COMPATIBLE, or SCOPED.
+// Ask the user when ambiguous."
+func handleJudge(s *store.Store, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		judgmentID, _ := req.GetArguments()["judgment_id"].(string)
+		relation, _ := req.GetArguments()["relation"].(string)
+
+		if judgmentID == "" {
+			return mcp.NewToolResultError("judgment_id is required"), nil
+		}
+		if relation == "" {
+			return mcp.NewToolResultError("relation is required"), nil
+		}
+
+		// Collect optional fields.
+		var reason *string
+		if v, ok := req.GetArguments()["reason"].(string); ok && v != "" {
+			reason = &v
+		}
+		var evidence *string
+		if v, ok := req.GetArguments()["evidence"].(string); ok && v != "" {
+			evidence = &v
+		}
+		var confidence *float64
+		if v, ok := req.GetArguments()["confidence"].(float64); ok {
+			if v < 0 || v > 1 {
+				return mcp.NewToolResultError("confidence must be between 0.0 and 1.0"), nil
+			}
+			confidence = &v
+		}
+
+		// Session context for provenance.
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		// Actor defaults to "agent" kind for MCP tool calls.
+		markedByActor := "agent"
+		markedByKind := "agent"
+		markedByModel := "" // No model ID available at MCP layer without explicit param.
+
+		result, err := s.JudgeRelation(store.JudgeRelationParams{
+			JudgmentID:    judgmentID,
+			Relation:      relation,
+			Reason:        reason,
+			Evidence:      evidence,
+			Confidence:    confidence,
+			MarkedByActor: markedByActor,
+			MarkedByKind:  markedByKind,
+			MarkedByModel: markedByModel,
+			SessionID:     sessionID,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		envelope := map[string]any{
+			"relation": result,
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+// handleCompare implements mem_compare. The agent has already judged two
+// observations externally; this handler persists the verdict via JudgeBySemantic.
+//
+// Tool description contract (REQ-011, Design §9):
+// "Persist a semantic verdict you have already judged externally into Engram.
+// Accepts int IDs for both observations, resolves them to sync_ids, then
+// calls JudgeBySemantic. Returns the persisted relation's sync_id."
+func handleCompare(s *store.Store, _ *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// --- required numeric IDs ---
+		rawA, okA := req.GetArguments()["memory_id_a"].(float64)
+		rawB, okB := req.GetArguments()["memory_id_b"].(float64)
+		if !okA {
+			return mcp.NewToolResultError("memory_id_a is required (integer observation id)"), nil
+		}
+		if !okB {
+			return mcp.NewToolResultError("memory_id_b is required (integer observation id)"), nil
+		}
+		idA := int64(rawA)
+		idB := int64(rawB)
+
+		// --- required string fields ---
+		relation, _ := req.GetArguments()["relation"].(string)
+		if relation == "" {
+			return mcp.NewToolResultError("relation is required"), nil
+		}
+		reasoning, _ := req.GetArguments()["reasoning"].(string)
+		if reasoning == "" {
+			return mcp.NewToolResultError("reasoning is required"), nil
+		}
+
+		// --- required confidence ---
+		rawConf, okConf := req.GetArguments()["confidence"].(float64)
+		if !okConf {
+			return mcp.NewToolResultError("confidence is required (float 0.0..1.0)"), nil
+		}
+		if rawConf < 0 || rawConf > 1 {
+			return mcp.NewToolResultError("confidence must be between 0.0 and 1.0"), nil
+		}
+
+		// --- optional model ---
+		model, _ := req.GetArguments()["model"].(string)
+
+		// Resolve integer IDs to sync_ids.
+		obsA, err := s.GetObservation(idA)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("observation id=%d not found: %s", idA, err)), nil
+		}
+		obsB, err := s.GetObservation(idB)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("observation id=%d not found: %s", idB, err)), nil
+		}
+
+		syncID, err := s.JudgeBySemantic(store.JudgeBySemanticParams{
+			SourceID:   obsA.SyncID,
+			TargetID:   obsB.SyncID,
+			Relation:   relation,
+			Confidence: rawConf,
+			Reasoning:  reasoning,
+			Model:      model,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		envelope := map[string]any{
+			"sync_id": syncID,
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func handleMergeProjects(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		fromStr, _ := req.GetArguments()["from"].(string)
+		to, _ := req.GetArguments()["to"].(string)
+
+		if fromStr == "" || to == "" {
+			return mcp.NewToolResultError("both 'from' and 'to' are required"), nil
+		}
+
+		var sources []string
+		for _, src := range strings.Split(fromStr, ",") {
+			src = strings.TrimSpace(src)
+			if src != "" {
+				sources = append(sources, src)
+			}
+		}
+
+		if len(sources) == 0 {
+			return mcp.NewToolResultError("at least one source project name is required in 'from'"), nil
+		}
+
+		result, err := s.MergeProjects(sources, to)
+		if err != nil {
+			return mcp.NewToolResultError("Merge failed: " + err.Error()), nil
+		}
+
+		msg := fmt.Sprintf("Merged %d source(s) into %q:\n", len(result.SourcesMerged), result.Canonical)
+		msg += fmt.Sprintf("  Observations moved: %d\n", result.ObservationsUpdated)
+		msg += fmt.Sprintf("  Sessions moved:     %d\n", result.SessionsUpdated)
+		msg += fmt.Sprintf("  Prompts moved:      %d\n", result.PromptsUpdated)
+
+		return mcp.NewToolResultText(msg), nil
+	}
+}
+
+// ─── Project Resolution Helpers ──────────────────────────────────────────────
+
+// unknownProjectError is returned when a read tool receives a project override
+// that does not exist in the store.
+type unknownProjectError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *unknownProjectError) Error() string {
+	return "unknown project: " + e.Name
+}
+
+type invalidProjectChoiceError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *invalidProjectChoiceError) Error() string {
+	return "invalid project choice: " + e.Name
+}
+
+type missingRecoveryTokenError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *missingRecoveryTokenError) Error() string {
+	return "missing ambiguous project recovery token for project choice: " + e.Name
+}
+
+type invalidRecoveryTokenError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *invalidRecoveryTokenError) Error() string {
+	return "invalid ambiguous project recovery token for project choice: " + e.Name
+}
+
+type invalidExplicitProjectError struct {
+	Name   string
+	Reason string
+}
+
+func (e *invalidExplicitProjectError) Error() string {
+	if e.Reason == "" {
+		return "invalid project: " + e.Name
+	}
+	return "invalid project: " + e.Name + " (" + e.Reason + ")"
+}
+
+type normalizedProjectCollisionError struct {
+	Name              string
+	Normalized        string
+	CollidingProjects []string
+}
+
+func (e *normalizedProjectCollisionError) Error() string {
+	return fmt.Sprintf("project %q collides after normalization to %q", e.Name, e.Normalized)
+}
+
+type unknownSessionError struct {
+	SessionID string
+}
+
+func (e *unknownSessionError) Error() string {
+	return "unknown session: " + e.SessionID
+}
+
+type sessionProjectMismatchError struct {
+	SessionID       string
+	SessionProject  string
+	ExplicitProject string
+}
+
+func (e *sessionProjectMismatchError) Error() string {
+	return fmt.Sprintf("session %q belongs to project %q, not %q", e.SessionID, e.SessionProject, e.ExplicitProject)
+}
+
+func sessionProjectResolutionError(sessionID, sessionProject, sessionMode, requestedProject string) error {
+	if sessionProject == "" || sessionProject == requestedProject || sessionMode == store.SessionOwnershipShared {
+		return nil
+	}
+	if sessionMode == store.SessionOwnershipProjectOwned {
+		return &sessionProjectMismatchError{
+			SessionID:       sessionID,
+			SessionProject:  sessionProject,
+			ExplicitProject: requestedProject,
+		}
+	}
+	return fmt.Errorf("%w: session %q has unclassified ownership for %q and cannot accept %q", store.ErrProjectOwnershipAmbiguous, sessionID, sessionProject, requestedProject)
+}
+
+// resolveWriteProject detects the current project from the process working
+// directory. Returns ErrAmbiguousProject if cwd is a parent of multiple repos.
+func resolveWriteProject() (projectpkg.DetectionResult, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	res := projectpkg.DetectProjectFull(cwd)
+	if res.Error != nil {
+		return res, res.Error
+	}
+	return res, nil
+}
+
+// processProjectResult applies the single process-level override rule
+// (projectpkg.ProcessOverride): the trusted MCPConfig.DefaultProject first, then
+// ENGRAM_PROJECT, and only then cwd detection by the caller.
+func processProjectResult(defaultProject string) (projectpkg.DetectionResult, bool, error) {
+	_, ok := projectpkg.ProcessOverride(defaultProject)
+	if !ok {
+		return projectpkg.DetectionResult{}, false, nil
+	}
+	result, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
+		Mode:            projectpkg.ResolutionCurrent,
+		ProcessOverride: defaultProject,
+	})
+	return result, true, err
+}
+
+func resolveWriteProjectWithProcessOverride(s *store.Store, defaultProject string, requireKnownProcess bool) (projectpkg.DetectionResult, error) {
+	return resolveMCPProjectWithPolicy(s, "", defaultProject, requireKnownProcess)
+}
+
+type ambiguousRecoveryTokenValidator func(projectpkg.DetectionResult, string) (provided bool, valid bool)
+
+func resolveWriteProjectWithChoiceAndProcessOverride(s *store.Store, projectChoice, reason string, validateToken ambiguousRecoveryTokenValidator, defaultProject string) (projectpkg.DetectionResult, error) {
+	if strings.TrimSpace(projectChoice) == "" {
+		return resolveWriteProjectWithProcessOverride(s, defaultProject, false)
+	}
+	return resolveWriteProjectWithChoice(projectChoice, reason, validateToken)
+}
+
+// resolveWriteProjectWithChoice preserves normal write resolution authority and
+// only uses an explicit project choice as a recovery path from ErrAmbiguousProject.
+func resolveWriteProjectWithChoice(projectChoice, reason string, validateToken ambiguousRecoveryTokenValidator) (projectpkg.DetectionResult, error) {
+	res, err := resolveWriteProject()
+	if err == nil {
+		// Non-ambiguous config/git/autodetect remains authoritative. Ignore any
+		// supplied project choice so agents cannot drift writes to arbitrary buckets.
+		return res, nil
+	}
+	if !errors.Is(err, projectpkg.ErrAmbiguousProject) {
+		return res, err
+	}
+
+	if strings.TrimSpace(reason) != projectpkg.SourceUserSelectedAfterAmbiguousProject {
+		return res, err
+	}
+
+	choice := strings.TrimSpace(projectChoice)
+	if choice == "" || !containsProjectChoice(res.AvailableProjects, choice) {
+		return res, &invalidProjectChoiceError{
+			Name:              choice,
+			AvailableProjects: res.AvailableProjects,
+		}
+	}
+	if normalized, colliding := normalizedProjectCollisions(res.AvailableProjects, choice); len(colliding) > 1 {
+		return res, &normalizedProjectCollisionError{
+			Name:              choice,
+			Normalized:        normalized,
+			CollidingProjects: colliding,
+		}
+	}
+	provided, valid := false, false
+	if validateToken != nil {
+		provided, valid = validateToken(res, choice)
+	}
+	if !provided {
+		return res, &missingRecoveryTokenError{
+			Name:              choice,
+			AvailableProjects: res.AvailableProjects,
+		}
+	}
+	if !valid {
+		return res, &invalidRecoveryTokenError{
+			Name:              choice,
+			AvailableProjects: res.AvailableProjects,
+		}
+	}
+
+	res.Project = choice
+	res.Source = projectpkg.SourceUserSelectedAfterAmbiguousProject
+	res.Path = resolveAmbiguousChoicePath(res.Path, choice)
+	res.Warning = "project selected by user after ambiguous_project recovery"
+	return res, nil
+}
+
+// resolveSaveWriteProjectWithProcessOverride resolves the write project target
+// by applying the process-level project override before falling back to full precedence resolution.
+func resolveSaveWriteProjectWithProcessOverride(s *store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator, defaultProject string) (projectpkg.DetectionResult, error) {
+	if !explicitProjectProvided && strings.TrimSpace(projectChoice) == "" && strings.TrimSpace(sessionID) == "" && strings.TrimSpace(reason) == "" {
+		if _, ok, err := processProjectResult(defaultProject); ok {
+			if err != nil {
+				return projectpkg.DetectionResult{}, err
+			}
+			return resolveMCPProjectWithPolicy(s, "", defaultProject, false)
+		}
+	}
+	return resolveSaveWriteProject(s, projectChoice, explicitProjectProvided, reason, sessionID, validateToken)
+}
+
+// resolveSaveWriteProject resolves the write project target using the full MCP precedence:
+// explicit request parameter, existing session association, or nearest configuration/directory detection.
+func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator) (projectpkg.DetectionResult, error) {
+	trimmedSessionID := strings.TrimSpace(sessionID)
+	trimmedProjectChoice := strings.TrimSpace(projectChoice)
+	trimmedReason := strings.TrimSpace(reason)
+	var sessionProject string
+	var sessionMode string
+	var sessionPath string
+	if trimmedSessionID != "" {
+		sess, err := s.GetSession(trimmedSessionID)
+		if err != nil {
+			return projectpkg.DetectionResult{}, &unknownSessionError{SessionID: trimmedSessionID}
+		}
+		sessionProject, err = normalizeExplicitWriteProject(sess.Project)
+		if err != nil {
+			return projectpkg.DetectionResult{}, err
+		}
+		sessionMode = strings.TrimSpace(sess.OwnershipMode)
+		sessionPath = strings.TrimSpace(sess.Directory)
+	}
+
+	if explicitProjectProvided && trimmedProjectChoice == "" {
+		return projectpkg.DetectionResult{}, &invalidExplicitProjectError{Name: projectChoice, Reason: "project is required"}
+	}
+
+	if trimmedProjectChoice != "" {
+		cwdRes, cwdErr := resolveWriteProject()
+		if cwdErr != nil {
+			if errors.Is(cwdErr, projectpkg.ErrInvalidConfig) {
+				return cwdRes, cwdErr
+			}
+			if errors.Is(cwdErr, projectpkg.ErrAmbiguousProject) {
+				if normalized, colliding := normalizedProjectCollisions(cwdRes.AvailableProjects, trimmedProjectChoice); len(colliding) > 1 {
+					return cwdRes, &normalizedProjectCollisionError{
+						Name:              trimmedProjectChoice,
+						Normalized:        normalized,
+						CollidingProjects: colliding,
+					}
+				}
+			} else {
+				return cwdRes, cwdErr
+			}
+		}
+
+		project, err := normalizeExplicitWriteProject(projectChoice)
+		if err != nil {
+			return projectpkg.DetectionResult{}, err
+		}
+		if collisionErr := explicitWriteProjectCollision(trimmedProjectChoice, project, sessionProject, cwdRes); collisionErr != nil {
+			return cwdRes, collisionErr
+		}
+		if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, project); err != nil {
+			return projectpkg.DetectionResult{}, err
+		}
+
+		exists, err := s.ProjectExists(project)
+		if err != nil {
+			return projectpkg.DetectionResult{}, err
+		}
+		if exists {
+			if explicitProjectHasSeparatorCollapse(trimmedProjectChoice, project) {
+				return cwdRes, &normalizedProjectCollisionError{
+					Name:              trimmedProjectChoice,
+					Normalized:        project,
+					CollidingProjects: []string{trimmedProjectChoice, project},
+				}
+			}
+			return projectpkg.DetectionResult{
+				Project: project,
+				Source:  projectpkg.SourceExplicitOverride,
+				Path:    "",
+			}, nil
+		}
+
+		if sessionProject != "" {
+			return projectpkg.DetectionResult{
+				Project: project,
+				Source:  projectpkg.SourceExplicitOverride,
+				Path:    sessionPath,
+			}, nil
+		}
+
+		if cwdErr != nil {
+			if errors.Is(cwdErr, projectpkg.ErrInvalidConfig) {
+				return cwdRes, cwdErr
+			}
+			if errors.Is(cwdErr, projectpkg.ErrAmbiguousProject) {
+				if trimmedReason == projectpkg.SourceUserSelectedAfterAmbiguousProject {
+					return resolveWriteProjectWithChoice(projectChoice, reason, validateToken)
+				}
+				return cwdRes, cwdErr
+			}
+			return cwdRes, cwdErr
+		}
+
+		if cwdRes.Source == projectpkg.SourceConfig {
+			resolvedProject, err := normalizeExplicitWriteProject(cwdRes.Project)
+			if err != nil {
+				return projectpkg.DetectionResult{}, err
+			}
+			if resolvedProject == project {
+				return projectpkg.DetectionResult{
+					Project: project,
+					Source:  projectpkg.SourceExplicitOverride,
+					Path:    cwdRes.Path,
+				}, nil
+			}
+		}
+
+		return projectpkg.DetectionResult{AvailableProjects: knownWriteProjects(s, cwdRes)}, &unknownProjectError{
+			Name:              project,
+			AvailableProjects: knownWriteProjects(s, cwdRes),
+		}
+	}
+
+	if trimmedReason == projectpkg.SourceUserSelectedAfterAmbiguousProject && trimmedProjectChoice != "" {
+		res, err := resolveWriteProjectWithChoice(projectChoice, reason, validateToken)
+		if err != nil {
+			return res, err
+		}
+		if sessionProject != "" {
+			resolvedProject, err := normalizeExplicitWriteProject(res.Project)
+			if err != nil {
+				return projectpkg.DetectionResult{}, err
+			}
+			if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, resolvedProject); err != nil {
+				return projectpkg.DetectionResult{}, err
+			}
+		}
+		return res, nil
+	}
+
+	if sessionProject != "" {
+		return projectpkg.DetectionResult{
+			Project: sessionProject,
+			Source:  projectpkg.SourceSessionProject,
+			Path:    sessionPath,
+		}, nil
+	}
+
+	return resolveWriteProject()
+}
+
+func explicitWriteProjectCollision(trimmedRawProject, normalizedProject, sessionProject string, cwdRes projectpkg.DetectionResult) *normalizedProjectCollisionError {
+	trimmedRawProject = strings.TrimSpace(trimmedRawProject)
+	if trimmedRawProject == "" || normalizedProject == "" || !explicitProjectHasSeparatorCollapse(trimmedRawProject, normalizedProject) {
+		return nil
+	}
+
+	if sessionProject != "" && sessionProject == normalizedProject {
+		return &normalizedProjectCollisionError{
+			Name:              trimmedRawProject,
+			Normalized:        normalizedProject,
+			CollidingProjects: []string{trimmedRawProject, normalizedProject},
+		}
+	}
+
+	if cwdRes.Source == projectpkg.SourceConfig {
+		canonical := strings.TrimSpace(cwdRes.Project)
+		if canonical == trimmedRawProject {
+			return nil
+		}
+		canonicalNormalized, _ := store.NormalizeProject(canonical)
+		if canonicalNormalized == normalizedProject {
+			return &normalizedProjectCollisionError{
+				Name:              trimmedRawProject,
+				Normalized:        normalizedProject,
+				CollidingProjects: uniqueTrimmedProjects(trimmedRawProject, canonical, normalizedProject),
+			}
+		}
+	}
+
+	return nil
+}
+
+func explicitProjectHasSeparatorCollapse(trimmedRawProject, normalizedProject string) bool {
+	lowerTrimmed := strings.TrimSpace(strings.ToLower(trimmedRawProject))
+	return lowerTrimmed != "" && lowerTrimmed != normalizedProject
+}
+
+func uniqueTrimmedProjects(names ...string) []string {
+	seen := make(map[string]struct{}, len(names))
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func knownWriteProjects(s *store.Store, context projectpkg.DetectionResult) []string {
+	seen := make(map[string]struct{})
+	projects := make([]string, 0)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		projects = append(projects, name)
+	}
+
+	stats, err := s.Stats()
+	if err == nil {
+		for _, project := range stats.Projects {
+			add(project)
+		}
+	}
+	add(context.Project)
+	for _, project := range context.AvailableProjects {
+		add(project)
+	}
+
+	return projects
+}
+
+func normalizeExplicitWriteProject(projectName string) (string, error) {
+	trimmed := strings.TrimSpace(projectName)
+	if trimmed == "" {
+		return "", &invalidExplicitProjectError{Name: projectName, Reason: "project is required"}
+	}
+	if strings.ContainsAny(trimmed, `/\\`) {
+		return "", &invalidExplicitProjectError{Name: projectName, Reason: "project must be a name, not a path"}
+	}
+	for _, r := range trimmed {
+		if r < 0x20 || r == 0x7f {
+			return "", &invalidExplicitProjectError{Name: projectName, Reason: "project contains control characters"}
+		}
+	}
+	project, _ := store.NormalizeProject(trimmed)
+	if project == "" {
+		return "", &invalidExplicitProjectError{Name: projectName, Reason: "project is required"}
+	}
+	return project, nil
+}
+
+func containsProjectChoice(available []string, choice string) bool {
+	choice = strings.TrimSpace(choice)
+	for _, candidate := range available {
+		if strings.TrimSpace(candidate) == choice {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedProjectCollisions(candidates []string, choice string) (string, []string) {
+	normalized, _ := store.NormalizeProject(strings.TrimSpace(choice))
+	if normalized == "" {
+		return "", nil
+	}
+
+	colliding := make([]string, 0, 2)
+	seen := make(map[string]struct{})
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" {
+			continue
+		}
+		candidateNormalized, _ := store.NormalizeProject(trimmed)
+		if candidateNormalized != normalized {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		colliding = append(colliding, trimmed)
+	}
+	if len(colliding) < 2 {
+		return normalized, nil
+	}
+	return normalized, colliding
+}
+
+func resolveAmbiguousChoicePath(ambiguousParent, choice string) string {
+	parent := strings.TrimSpace(ambiguousParent)
+	if parent == "" || strings.TrimSpace(choice) == "" {
+		return ""
+	}
+
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// Match the same name shape used by project.DetectProjectFull for
+		// available_projects: trim + lowercase only. Do not use store.NormalizeProject
+		// here because it collapses repeated '-'/'_' and can create collisions.
+		if strings.TrimSpace(strings.ToLower(entry.Name())) != choice {
+			continue
+		}
+		childPath := filepath.Join(parent, entry.Name())
+		if _, err := os.Stat(filepath.Join(childPath, ".git")); err != nil {
+			continue
+		}
+		absChild, err := filepath.Abs(childPath)
+		if err != nil {
+			return childPath
+		}
+		return absChild
+	}
+	return ""
+}
+
+// resolveReadProject validates an optional project override against the store.
+// If override is empty, falls back to auto-detection from cwd.
+// JW2: normalizes the override (lowercase+trim) before ProjectExists lookup so
+// that e.g. "MyApp" and "  myapp  " both resolve to the stored "myapp".
+func resolveReadProjectWithProcessOverride(s *store.Store, override, defaultProject string) (projectpkg.DetectionResult, error) {
+	return resolveMCPProject(s, override, defaultProject)
+}
+
+func resolveReadProject(s *store.Store, override string) (projectpkg.DetectionResult, error) {
+	return resolveMCPProject(s, override, "")
+}
+
+// resolveMCPProject is the MCP adapter around the shared mode-aware resolver.
+// Cwd detection remains allowed to identify an empty/new repository, while an
+// explicit request or process override must name an existing bucket.
+func resolveMCPProject(s *store.Store, explicit, defaultProject string) (projectpkg.DetectionResult, error) {
+	return resolveMCPProjectWithPolicy(s, explicit, defaultProject, true)
+}
+
+func resolveMCPProjectWithPolicy(s *store.Store, explicit, defaultProject string, requireKnownProcess bool) (projectpkg.DetectionResult, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	result, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
+		Mode:                 projectpkg.ResolutionCurrent,
+		Explicit:             explicit,
+		ProcessOverride:      defaultProject,
+		Directory:            cwd,
+		ProjectExists:        s.ProjectExists,
+		RequireKnownExplicit: strings.TrimSpace(explicit) != "",
+		RequireKnownProcess:  requireKnownProcess,
+	})
+	if err == nil {
+		return result, nil
+	}
+	var unknown *projectpkg.UnknownProjectError
+	if errors.As(err, &unknown) {
+		stats, err := loadMCPStats(s)
+		if err != nil {
+			return result, err
+		}
+		return result, &unknownProjectError{Name: unknown.Name, AvailableProjects: stats.Projects}
+	}
+	if errors.Is(err, projectpkg.ErrInvalidProjectName) {
+		return result, &invalidExplicitProjectError{Name: firstProjectValue(explicit, defaultProject), Reason: err.Error()}
+	}
+	return result, err
+}
+
+func firstProjectValue(explicit, defaultProject string) string {
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	if value, ok := projectpkg.ProcessOverride(defaultProject); ok {
+		return value
+	}
+	return ""
+}
+
+// respondWithProject wraps a tool result by prepending the project envelope
+// fields (project, project_source, project_path) to the text output.
+// extra is an optional map of additional fields to include.
+func respondWithProject(res projectpkg.DetectionResult, text string, extra map[string]any) *mcp.CallToolResult {
+	envelope := map[string]any{
+		"project":        res.Project,
+		"project_source": res.Source,
+		"project_path":   res.Path,
+		"result":         text,
+	}
+	if res.Warning != "" {
+		envelope["warning"] = res.Warning
+	}
+	for k, v := range extra {
+		envelope[k] = v
+	}
+	out, _ := jsonMarshal(envelope)
+	return mcp.NewToolResultText(string(out))
+}
+
+// writeProjectErrorResult formats and returns a structured error result when project
+// resolution fails. It handles ambiguous project errors and invalid configs.
+func writeProjectErrorResult(activity *SessionActivity, sessionID string, res projectpkg.DetectionResult, err error) *mcp.CallToolResult {
+	code := "ambiguous_project"
+	if errors.Is(err, store.ErrDatabaseGenerationChanged) {
+		return errorWithMeta("database_generation_changed", err.Error(), res.AvailableProjects)
+	}
+	if errors.Is(err, store.ErrProjectOwnershipAmbiguous) {
+		return errorWithMeta("session_project_ownership_ambiguous", err.Error(), res.AvailableProjects)
+	}
+	if errors.Is(err, projectpkg.ErrRepositoryBinding) {
+		return errorWithMeta(
+			"repository_binding_unavailable",
+			fmt.Sprintf("Cannot determine project: %s. Configure the repository's .engram/config.json with the intended canonical project.", err),
+			nil,
+		)
+	}
+	if errors.Is(err, projectpkg.ErrInvalidConfig) {
+		code = "invalid_project_config"
+	}
+	var choiceErr *invalidProjectChoiceError
+	if errors.As(err, &choiceErr) {
+		if choiceErr.Name == "" {
+			return errorWithMeta("invalid_project_choice",
+				"Project choice is empty; choose exactly one value from available_projects and retry with project_choice_reason=user_selected_after_ambiguous_project",
+				choiceErr.AvailableProjects,
+			)
+		}
+		return errorWithMeta("invalid_project_choice",
+			fmt.Sprintf("Project choice %q is not one of available_projects", choiceErr.Name),
+			choiceErr.AvailableProjects,
+		)
+	}
+	var missingTokenErr *missingRecoveryTokenError
+	if errors.As(err, &missingTokenErr) {
+		return errorWithMeta("missing_recovery_token",
+			fmt.Sprintf("project_choice_reason=user_selected_after_ambiguous_project for %q requires the recovery_token from the ambiguous_project error", missingTokenErr.Name),
+			missingTokenErr.AvailableProjects,
+		)
+	}
+	var invalidTokenErr *invalidRecoveryTokenError
+	if errors.As(err, &invalidTokenErr) {
+		return errorWithMeta("invalid_recovery_token",
+			fmt.Sprintf("recovery_token is invalid, stale, or not valid for selected project %q", invalidTokenErr.Name),
+			invalidTokenErr.AvailableProjects,
+		)
+	}
+	var explicitErr *invalidExplicitProjectError
+	if errors.As(err, &explicitErr) {
+		return errorWithMeta("invalid_project",
+			fmt.Sprintf("Project %q is invalid: %s", explicitErr.Name, explicitErr.Reason),
+			res.AvailableProjects,
+		)
+	}
+	var collisionErr *normalizedProjectCollisionError
+	if errors.As(err, &collisionErr) {
+		message := fmt.Sprintf(
+			"Project %q collapses to stored bucket %q, but multiple exact candidates would share that bucket: %s. Refuse write until the colliding project names are disambiguated.",
+			collisionErr.Name,
+			collisionErr.Normalized,
+			strings.Join(collisionErr.CollidingProjects, ", "),
+		)
+		return errorWithMeta("project_name_collision", message, res.AvailableProjects)
+	}
+	var unknownSessionErr *unknownSessionError
+	if errors.As(err, &unknownSessionErr) {
+		result := errorWithMeta("unknown_session",
+			fmt.Sprintf("Session %q was provided but does not exist", unknownSessionErr.SessionID),
+			res.AvailableProjects,
+		)
+		// Structured recovery fields let a caller retry deterministically
+		// instead of re-parsing the hint string: drop session_id and retry
+		// the same call unchanged (#683). Never auto-retry on the caller's
+		// behalf here — that would hide typos and fragment session history.
+		addErrorMetadata(result, map[string]any{
+			"invalid_session_id":       unknownSessionErr.SessionID,
+			"retry_without_session_id": true,
+		})
+		return result
+	}
+	var unknownProjectErr *unknownProjectError
+	if errors.As(err, &unknownProjectErr) {
+		return errorWithMeta("unknown_project",
+			fmt.Sprintf("Project %q is not backed by known context. Use an existing project, a matching session, repo .engram/config.json, or ambiguous-project recovery.", unknownProjectErr.Name),
+			unknownProjectErr.AvailableProjects,
+		)
+	}
+	var mismatchErr *sessionProjectMismatchError
+	if errors.As(err, &mismatchErr) {
+		return errorWithMeta("session_project_mismatch",
+			fmt.Sprintf("Session %q belongs to project %q, but request targeted %q", mismatchErr.SessionID, mismatchErr.SessionProject, mismatchErr.ExplicitProject),
+			res.AvailableProjects,
+		)
+	}
+	result := errorWithMeta(code, fmt.Sprintf("Cannot determine project: %s", err), res.AvailableProjects)
+	if code == "ambiguous_project" && activity != nil {
+		if strings.TrimSpace(sessionID) == "" {
+			sessionID = defaultSessionID("")
+		}
+		addErrorMetadata(result, map[string]any{
+			"recovery_token":    activity.IssueAmbiguousProjectRecoveryToken(sessionID, res.AvailableProjects, res.Path),
+			"token_ttl_seconds": int(ambiguousProjectRecoveryTTL.Seconds()),
+		})
+	}
+	return result
+}
+
+// readProjectErrorResult keeps read-tool ambiguity actionable just like writes.
+// In particular, callers need the detected candidates and short-lived recovery
+// context rather than an opaque tool error that discards the resolver result.
+func readProjectErrorResult(activity *SessionActivity, res projectpkg.DetectionResult, err error) *mcp.CallToolResult {
+	var result *mcp.CallToolResult
+	var unknownProjectErr *unknownProjectError
+	if errors.As(err, &unknownProjectErr) {
+		result = errorWithMeta("unknown_project",
+			fmt.Sprintf("Project %q not found in store", unknownProjectErr.Name),
+			unknownProjectErr.AvailableProjects,
+		)
+	} else {
+		result = writeProjectErrorResult(activity, defaultSessionID(""), res, err)
+	}
+	addErrorMetadata(result, map[string]any{
+		"project":        res.Project,
+		"project_source": res.Source,
+		"project_path":   res.Path,
+	})
+	return result
+}
+
+func recoveryActivity(activities []*SessionActivity) *SessionActivity {
+	if len(activities) > 0 && activities[0] != nil {
+		return activities[0]
+	}
+	return NewSessionActivity(10 * time.Minute)
+}
+
+func addErrorMetadata(result *mcp.CallToolResult, metadata map[string]any) {
+	if result == nil || len(result.Content) == 0 || len(metadata) == 0 {
+		return
+	}
+	text, ok := mcp.AsTextContent(result.Content[0])
+	if !ok {
+		return
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text.Text), &envelope); err != nil {
+		return
+	}
+	for k, v := range metadata {
+		envelope[k] = v
+	}
+	out, err := jsonMarshal(envelope)
+	if err != nil {
+		return
+	}
+	result.Content[0] = mcp.NewTextContent(string(out))
+}
+
+// errorWithMeta returns a structured tool error result with error_code,
+// message, available_projects, and a hint for resolution.
+func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolResult {
+	envelope := map[string]any{
+		"error_code":         code,
+		"message":            msg,
+		"available_projects": availableProjects,
+	}
+	switch code {
+	case "ambiguous_project":
+		envelope["hint"] = "Ask the user to choose one of available_projects, then retry the same write tool (mem_save, mem_save_prompt, or mem_session_summary) with project and project_choice_reason=user_selected_after_ambiguous_project; alternatively cd into the target repo or add repo .engram/config.json."
+	case "database_generation_changed":
+		envelope["hint"] = "Restart Engram and retry."
+	case "invalid_project_choice":
+		envelope["hint"] = "Use exactly one of available_projects after asking the user, or cd into the target repo, or add repo .engram/config.json."
+	case "missing_recovery_token":
+		envelope["hint"] = "Retry with the recovery_token returned by the ambiguous_project error after the user selects one available_projects value."
+	case "invalid_recovery_token":
+		envelope["hint"] = "Request a fresh ambiguous_project recovery_token and retry with the same session, cwd context, and selected available_projects value before it expires."
+	case "unknown_project":
+		envelope["hint"] = "Use one of the available_projects values, or omit project to auto-detect."
+	case "invalid_project_config":
+		envelope["hint"] = "Fix .engram/config.json so project_name is a non-empty project name."
+	case "repository_binding_unavailable":
+		envelope["hint"] = "Configure the repository's .engram/config.json with the intended canonical project."
+	case "invalid_project":
+		envelope["hint"] = "Use a non-empty project name, not a path."
+	case "unknown_session":
+		envelope["hint"] = "Start the session first, omit session_id, or retry with an existing session_id."
+	case "session_already_ended":
+		envelope["hint"] = "Choose a new session ID and retry mem_session_start; ended sessions cannot be reopened."
+	case "session_project_mismatch":
+		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
+	case "session_project_ownership_ambiguous":
+		envelope["hint"] = "Use ownership rescue to classify the historical session before writing to a different project."
+	case "project_required":
+		envelope["hint"] = "Use ownership rescue before updating this historical record, then retry the field update."
+	case "project_mismatch":
+		envelope["hint"] = "Switch to the observation's owning project, then retry the field update."
+	}
+	out, _ := jsonMarshal(envelope)
+	result := mcp.NewToolResultText(string(out))
+	result.IsError = true
+	return result
+}
+
+// jsonMarshal marshals v to JSON. Named to allow test injection if needed.
+func jsonMarshal(v any) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// defaultSessionID returns a project-scoped default session ID.
+// If project is non-empty: "manual-save-{project}"
+// If project is empty: "manual-save"
+func defaultSessionID(project string) string {
+	if project == "" {
+		return "manual-save"
+	}
+	return "manual-save-" + project
+}
+
+// resolveFallbackSessionID resolves an omitted session_id without guessing
+// between concurrent runtime sessions. The working directory only narrows
+// candidates; a persisted session ID remains the sole identity.
+func resolveFallbackSessionID(s *store.Store, project string) (string, error) {
+	if s != nil {
+		ids, err := s.ActiveRuntimeSessions(project, runtimeSessionDirectory(""))
+		if err == nil {
+			switch len(ids) {
+			case 0:
+				return defaultSessionID(project), nil
+			case 1:
+				return ids[0], nil
+			default:
+				return "", fmt.Errorf("multiple active runtime sessions match the current project and directory; provide session_id, end other active matching sessions, or save independently with engram save \"TITLE\" \"CONTENT\" --project PROJECT --type TYPE --topic TOPIC_KEY (writes to an independent project manual-save session and does not bind it to this MCP session)")
+			}
+		}
+	}
+	return defaultSessionID(project), nil
+}
+
+func intArg(req mcp.CallToolRequest, key string, defaultVal int) int {
+	v, ok := req.GetArguments()[key].(float64)
+	if !ok {
+		return defaultVal
+	}
+	return int(v)
+}
+
+func boolArg(req mcp.CallToolRequest, key string, defaultVal bool) bool {
+	v, ok := req.GetArguments()[key].(bool)
+	if !ok {
+		return defaultVal
+	}
+	return v
+}
+
+func truncate(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "..."
+}

@@ -1,0 +1,144 @@
+# Engram Doctor
+
+`engram doctor` runs read-only operational diagnostics against the local SQLite store. It detects, explains, and suggests safe next steps; the base diagnostic command does **not** repair data, apply migrations, delete rows, or mutate sync cursors.
+
+## CLI
+
+```bash
+engram doctor
+engram doctor --json
+engram doctor --project engram
+engram doctor --check sync_mutation_required_fields
+engram doctor repair --project sias-app --check session_project_directory_mismatch --plan
+engram doctor repair --project sias-app --check session_project_directory_mismatch --dry-run
+engram doctor repair --project sias-app --check session_project_directory_mismatch --apply
+```
+
+Flags:
+
+- `--json` prints the stable diagnostic envelope for agents.
+- `--project PROJECT` scopes checks to a normalized project name.
+- `--check CODE` runs one registered check and fails loudly for unknown codes.
+- `doctor repair` supports exactly `invalid_session_identity`, `manual_session_name_project_mismatch`, `session_project_directory_mismatch`, `sync_mutation_required_fields`, and `sync_target_closed_space`. It requires `--project`, `--check`, and exactly one mode: `--plan`, `--dry-run`, or `--apply`. `sync_mutation_required_fields` may omit `--project` and the mode; an omitted mode defaults to `--dry-run`. Its optional project scopes title repair, supersession, quarantine, and source-title repair. The diagnostic-only checks are `ambiguous_active_runtime_sessions`, `orphaned_observation_session`, `sqlite_lock_contention`, and `unowned_session_project`; a rejected repair names the corresponding `engram doctor --check <code>` continuation.
+
+## MCP
+
+Agents can call `mem_doctor` with the same contract as `engram doctor --json`:
+
+```json
+{
+  "project": "engram",
+  "check": "sqlite_lock_contention"
+}
+```
+
+Both fields are optional. When `project` is omitted, MCP uses the existing read-tool project detection. Unknown explicit projects return the standard structured `unknown_project` error.
+
+## JSON envelope
+
+The CLI `--json` and MCP tool return:
+
+```json
+{
+  "status": "ok|warning|blocked|error",
+  "project": "engram",
+  "summary": { "total": 4, "ok": 4, "warnings": 0, "blocked": 0, "errors": 0 },
+  "checks": [
+    {
+      "check_id": "sqlite_lock_contention",
+      "result": "ok|warning|blocked|error",
+      "severity": "info|warning|blocking|error",
+      "reason_code": "stable_reason_code",
+      "evidence": {},
+      "safe_next_step": "No action required.",
+      "requires_confirmation": false
+    }
+  ]
+}
+```
+
+## MVP check catalog
+
+- `session_project_directory_mismatch` — warns when `sessions.project` disagrees with the project inferred from trusted repository evidence for the session directory. A known exact `manual-save-{project}` target takes precedence over directory inference, so it does not produce this competing finding. Unknown manual suffixes and non-manual sessions retain normal trusted-directory behavior. The MVP trusts `git_remote` and `git_root` only; it ignores basename fallback, ambiguous workspaces, missing directories, and child-repo auto-promotion to avoid noisy false positives.
+- `manual_session_name_project_mismatch` — warns when a known `manual-save-{suffix}` session name disagrees with its persisted project. The suffix must normalize to a project already evidenced by a local session; a name alone never establishes `project_owned` ownership.
+- `ambiguous_active_runtime_sessions` — warns once per project when two or more active runtime candidates match the same directory. Evidence contains the active-candidate count, involved directories, and session IDs. It uses the same unended, non-manual, seven-day activity-window rules as omitted-session resolution; doctor only reports the ambiguity and never selects, ends, or modifies sessions. Use an explicit session ID for writes in the affected directory.
+- `sync_mutation_required_fields` — blocks when a pending `sync_mutations.payload` is missing required fields. On a device that uses cloud sync (at least one project enrolled), it also blocks when pending cloud mutations belong to a project that is not enrolled; the finding identifies the project and backlog count, so enroll intended projects with `engram cloud enroll <project>` or review enrollment before retrying. A local-only install with no enrolled project never reports that finding: any pending non-enrolled row there is legacy or otherwise pre-existing backlog, because new unenrolled local writes are not journaled.
+- `orphaned_observation_session` — warns when active or soft-deleted observations reference a missing session. Findings are grouped by the stored observation project and session ID. The canonical session cannot be reconstructed automatically, so inspect and recover the data deliberately; no supported repair exists.
+- `unowned_session_project` — warns for each session with an unclassified or invalid ownership mode, including blank persisted projects and contradictory legacy manual-save identities. Doctor never guesses a rescue. Use `engram projects rescue-ownership --project <name> --session <id>` only after review; its apply path creates a SQLite backup that can be restored for rollback. The listing is deliberately unscoped.
+- Session modes are `shared` and `project_owned`. Runtime and HTTP-created sessions default to `shared`; deterministic CLI and MCP manual-save sessions are `project_owned`. Shared sync can use old peers. Project-owned sync requires a mode-capable manifest (version 2); returning to an older manifest after project-owned sessions exist is unsupported and fails loudly.
+- `sqlite_lock_contention` — warns on conservative SQLite contention signals; returns an error if lock state cannot be evaluated.
+
+## Safety
+
+Plain `engram doctor` remains diagnostic-only. Findings that imply data movement set `requires_confirmation=true` so agents know a human must review evidence before repair.
+
+`engram doctor repair` is intentionally narrow and local-first: local SQLite remains the source of truth. Project reclassification supports:
+
+- `session_project_directory_mismatch`, using trusted `git_remote` or `git_root` evidence from doctor findings.
+- `manual_session_name_project_mismatch`, only for exact `manual-save-{known_project}` sessions. The known manual target takes precedence over trusted directory evidence; unknown suffixes remain unrepaired.
+
+Title restoration supports `sync_mutation_required_fields` only when a pending observation upsert has a blank title as its sole missing field and the matching local titleless observation has non-empty content. Run `engram doctor repair --check sync_mutation_required_fields --dry-run` first (add `--project <project>` to scope it); cloud-upgrade tooling instead requires configured cloud sync. The repair derives a sanitized, bounded title from local content and updates `observations.title` and `sync_mutations.payload` in place; all other invalid mutations remain quarantined on `--apply`.
+
+The same repair also supersedes a pending local upsert when a local session/observation delete tombstone or prompt tombstone proves the entity was deleted while its project was unenrolled. `superseded` is auditable local evidence, not a cloud acknowledgement: it is excluded from transport and allows re-enrollment backfill to reconstruct the current local delete state. Superseded evidence missing its reason, evidence, or timestamp remains blocking until manually repaired; complete terminal quarantined and superseded rows remain informational without keeping doctor in warning or blocked status.
+
+Repair never deletes or deduplicates rows, never edits sync cursors, never acknowledges undelivered mutations, and never writes cloud state. `--plan` and `--dry-run` are non-mutating. `--apply` creates a SQLite backup under `<ENGRAM_DATA_DIR>/backups/` before a project reclassification transaction updates only:
+
+- `sessions.project`
+- `sessions.ownership_mode` (`project_owned` for a session named `manual-save-{target_project}`, otherwise `shared`)
+- `observations.project`
+- `user_prompts.project`
+
+Title restoration does not create a SQLite backup.
+
+`ambiguous_active_runtime_sessions`, `orphaned_observation_session`, `sqlite_lock_contention`, and `unowned_session_project` are diagnostic-only and are not supported by `engram doctor repair`. SQLite lock contention has no repair.
+
+### Repair JSON envelope
+
+All repair modes print stable JSON to stdout:
+
+For `sync_mutation_required_fields`, `repairs` lists title-only observation upserts that can be restored in place; `actions` continues to list residual rows quarantined on `--apply`; `superseded` lists obsolete local upserts retired by durable local delete evidence.
+
+```json
+{
+  "project": "sias-app",
+  "check": "session_project_directory_mismatch",
+  "mode": "plan|dry_run|apply",
+  "status": "planned|dry_run|applied|noop",
+  "actions": [
+    {
+      "session_id": "session-id",
+      "from_project": "sias-app",
+      "to_project": "engram",
+      "reason_code": "session_project_directory_mismatch",
+      "evidence_source": "git_remote"
+    }
+  ],
+  "skipped": [],
+  "counts": {
+    "sessions_planned": 1,
+    "observations_planned": 2,
+    "prompts_planned": 1,
+    "sessions_applied": 0,
+    "observations_applied": 0,
+    "prompts_applied": 0
+  },
+  "backup_path": ""
+}
+```
+
+On `--apply`, `backup_path` contains the backup database path and `*_applied` counts report the rows updated.
+
+### Clone-safe verification workflow
+
+Never experiment on production `~/.engram/engram.db`. Use a SQLite backup clone or a temporary `ENGRAM_DATA_DIR`:
+
+```bash
+mkdir -p /tmp/engram-repair-clone
+sqlite3 ~/.engram/engram.db ".backup '/tmp/engram-repair-clone/engram.db'"
+ENGRAM_DATA_DIR=/tmp/engram-repair-clone engram doctor --json --project sias-app --check session_project_directory_mismatch
+ENGRAM_DATA_DIR=/tmp/engram-repair-clone engram doctor repair --project sias-app --check session_project_directory_mismatch --plan
+ENGRAM_DATA_DIR=/tmp/engram-repair-clone engram doctor repair --project sias-app --check session_project_directory_mismatch --dry-run
+ENGRAM_DATA_DIR=/tmp/engram-repair-clone engram doctor repair --project sias-app --check session_project_directory_mismatch --apply
+```
+
+After a project reclassification apply, verify each planned session's `project` and `ownership_mode` classification, the related observation and prompt projects, and that `backup_path` exists. If the repair is wrong, stop Engram processes and restore the `backup_path` database file manually.

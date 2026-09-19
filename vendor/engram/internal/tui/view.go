@@ -1,0 +1,966 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Gentleman-Programming/engram/v2/internal/setup"
+	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v2/internal/timeutil"
+	"github.com/Gentleman-Programming/engram/v2/internal/version"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ─── Logo ────────────────────────────────────────────────────────────────────
+
+func renderLogo(version string) string {
+	logoText := []string{
+		`███████ ███    ██  ██████  ██████   █████  ███    ███ `,
+		`██      ████   ██ ██       ██   ██ ██   ██ ████  ████ `,
+		`█████   ██ ██  ██ ██   ███ ██████  ███████ ██ ████ ██ `,
+		`██      ██  ██ ██ ██    ██ ██   ██ ██   ██ ██  ██  ██ `,
+		`███████ ██   ████  ██████  ██   ██ ██   ██ ██      ██ `,
+	}
+
+	frameStyle := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorOverlay).
+		Padding(0, 1).
+		MarginBottom(1)
+
+	// Gradient colors for the rows
+	colors := []lipgloss.Color{
+		colorMauve,    // Top (Pinkish)
+		colorLavender, // Middle-top
+		colorBlue,     // Middle
+		colorTeal,     // Middle-bottom
+		colorGreen,    // Bottom (Cyan/Greenish)
+	}
+
+	accentStyle := lipgloss.NewStyle().Foreground(colorLavender).Bold(true)
+	taglineStyle := lipgloss.NewStyle().Foreground(colorSubtext).Italic(true)
+
+	var b strings.Builder
+
+	// Header line inside box (Cyber-Elephant Terminal)
+	b.WriteString(accentStyle.Render(" 🐘 SYSTEM ONLINE ") + strings.Repeat(" ", 32) + accentStyle.Render(" MEM: OK 100% ") + "\n\n")
+
+	// Logo body with gradient (logoText and colors are always the same length)
+	for i, line := range logoText {
+		b.WriteString(" " + lipgloss.NewStyle().Foreground(colors[i]).Bold(true).Render(line) + "\n")
+	}
+	b.WriteString("\n")
+
+	// Footer inside box
+	b.WriteString(taglineStyle.Render(" > engram " + version + " — An elephant never forgets"))
+
+	return frameStyle.Render(b.String()) + "\n"
+}
+
+// ─── View (main router) ─────────────────────────────────────────────────────
+
+func (m Model) View() string {
+	var content string
+
+	switch m.Screen {
+	case ScreenDashboard:
+		content = m.viewDashboard()
+	case ScreenSearch:
+		content = m.viewSearch()
+	case ScreenSearchResults:
+		content = m.viewSearchResults()
+	case ScreenRecent:
+		content = m.viewRecent()
+	case ScreenObservationDetail:
+		content = m.viewObservationDetail()
+	case ScreenTimeline:
+		content = m.viewTimeline()
+	case ScreenSessions:
+		content = m.viewSessions()
+	case ScreenSessionDetail:
+		content = m.viewSessionDetail()
+	case ScreenSetup:
+		content = m.viewSetup()
+	case ScreenCloudSettings:
+		content = m.viewCloudSettings()
+	case ScreenCloudConfig:
+		content = m.viewCloudConfig()
+	case ScreenCloudStatus:
+		content = m.viewCloudStatus()
+	case ScreenCloudEnrollment:
+		content = m.viewCloudEnrollment()
+	default:
+		content = "Unknown screen"
+	}
+
+	// Show error if present
+	if m.ErrorMsg != "" {
+		content += "\n" + errorStyle.Render("Error: "+m.ErrorMsg)
+	}
+
+	// Show clipboard copy feedback if present
+	if m.CopyFeedback != "" {
+		content += "\n" + copyFeedbackStyle.Render(m.CopyFeedback)
+	}
+
+	return appStyle.Render(content)
+}
+
+// ─── Dashboard ───────────────────────────────────────────────────────────────
+
+func (m Model) viewDashboard() string {
+	var b strings.Builder
+
+	// Logo header
+	b.WriteString(renderLogo(m.Version))
+	b.WriteString("\n")
+
+	// Update notification
+	if m.UpdateMsg != "" {
+		bannerStyle := updateBannerStyle
+		if m.UpdateStatus == version.StatusCheckFailed {
+			bannerStyle = errorStyle
+		}
+		b.WriteString(bannerStyle.Render(m.UpdateMsg))
+		b.WriteString("\n\n")
+	}
+
+	// Stats card
+	if m.Stats != nil {
+		statsContent := fmt.Sprintf(
+			"%s %s\n%s %s\n%s %s\n%s %s",
+			statNumberStyle.Render(fmt.Sprintf("%d", m.Stats.TotalSessions)),
+			statLabelStyle.Render("sessions"),
+			statNumberStyle.Render(fmt.Sprintf("%d", m.Stats.TotalObservations)),
+			statLabelStyle.Render("observations"),
+			statNumberStyle.Render(fmt.Sprintf("%d", m.Stats.TotalPrompts)),
+			statLabelStyle.Render("prompts"),
+			statNumberStyle.Render(fmt.Sprintf("%d", len(m.Stats.Projects))),
+			statLabelStyle.Render("projects"),
+		)
+		b.WriteString(statCardStyle.Render(statsContent))
+		b.WriteString("\n")
+
+		if len(m.Stats.Projects) > 0 {
+			b.WriteString(titleStyle.Render("  Projects"))
+			b.WriteString("\n")
+
+			limit := 5
+			for i, p := range m.Stats.Projects {
+				if i >= limit {
+					break
+				}
+				b.WriteString(listItemStyle.Render("• " + p))
+				b.WriteString("\n")
+			}
+
+			if len(m.Stats.Projects) > limit {
+				remaining := len(m.Stats.Projects) - limit
+				b.WriteString(fmt.Sprintf("    %s\n", timestampStyle.Render(fmt.Sprintf("...and %d more projects", remaining))))
+			}
+			b.WriteString("\n")
+		}
+	} else {
+		b.WriteString(statCardStyle.Render("Loading stats..."))
+		b.WriteString("\n")
+	}
+
+	// Menu
+	b.WriteString(titleStyle.Render("  Actions"))
+	b.WriteString("\n")
+	b.WriteString(renderMenu(dashboardMenuItems, m.Cursor))
+
+	// Help
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter select • s search • q quit"))
+
+	return b.String()
+}
+
+func (m Model) viewCloudSettings() string {
+	var b strings.Builder
+
+	b.WriteString(headerStyle.Render("  Cloud sync settings"))
+	b.WriteString("\n\n")
+	b.WriteString(renderMenu(cloudSettingsMenuItems, m.Cursor))
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter select • esc/q back"))
+
+	return b.String()
+}
+
+func (m Model) viewCloudConfig() string {
+	var b strings.Builder
+	configLabelStyle := detailLabelStyle.Width(18)
+	b.WriteString(headerStyle.Render("  Configure cloud server"))
+	b.WriteString("\n\n")
+	b.WriteString(configLabelStyle.Render("  Server URL: "))
+	b.WriteString(searchInputStyle.Render(m.CloudConfigInput.View()))
+	b.WriteString("\n")
+	b.WriteString(configLabelStyle.Render("  Token source: ") + detailValueStyle.Render(emptyCloudValue(m.CloudConfigTokenSource, TokenSourceNone)))
+	b.WriteString("\n")
+	if m.CloudConfigTokenSource != TokenSourceEnv {
+		b.WriteString(timestampStyle.Render("  Set ENGRAM_CLOUD_TOKEN to override cloud.json.token"))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n\n")
+	items := []string{"Test connection", "Save server", "Cancel"}
+	for i, item := range items {
+		focus := i + 1
+		if m.CloudConfigFocus == focus {
+			b.WriteString(menuSelectedStyle.Render("▸ " + item))
+		} else {
+			b.WriteString(menuItemStyle.Render("  " + item))
+		}
+		b.WriteString("\n")
+	}
+	if m.CloudConfigSaving {
+		b.WriteString(timestampStyle.Render("  Checking server..."))
+		b.WriteString("\n")
+	}
+	if m.CloudConfigPingStatus != "" {
+		b.WriteString(detailLabelStyle.Render("  Connection: ") + detailValueStyle.Render(m.CloudConfigPingStatus) + "\n")
+	}
+	if m.CloudConfigError != "" {
+		b.WriteString(errorStyle.Render("  Error: "+m.CloudConfigError) + "\n")
+	}
+	b.WriteString(helpStyle.Render("\n  j/k navigate • i edit URL • enter select • esc/q back"))
+	return b.String()
+}
+
+func (m Model) viewCloudStatus() string {
+	var b strings.Builder
+	statusLabelStyle := detailLabelStyle.Width(20)
+	b.WriteString(headerStyle.Render("  Cloud status"))
+	b.WriteString("\n\n")
+	if m.CloudStatusLoading {
+		b.WriteString(timestampStyle.Render("  Loading cloud status...\n"))
+	}
+	lines := [][2]string{
+		{"Server URL", emptyCloudValue(m.CloudStatusServerURL, "not configured")},
+		{"Connection health", emptyCloudValue(m.CloudStatusHealth, "not checked")},
+		{"Last successful sync", emptyCloudValue(m.CloudStatusLastSync, "never")},
+		{"Pending mutations", fmt.Sprintf("%d", m.CloudStatusPendingCount)},
+		{"Last error", emptyCloudValue(cloudStatusLastError(m), "none")},
+	}
+	for _, line := range lines {
+		b.WriteString(statusLabelStyle.Render("  "+line[0]+": ") + detailValueStyle.Render(line[1]) + "\n")
+	}
+	b.WriteString(helpStyle.Render("\n  r refresh • esc/q back"))
+	return b.String()
+}
+
+func (m Model) viewCloudEnrollment() string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("  Enroll projects for cloud sync"))
+	b.WriteString("\n\n")
+	if m.CloudEnrollmentLoading {
+		b.WriteString(timestampStyle.Render("  Loading projects...\n"))
+	}
+	if len(m.CloudEnrollmentItems) == 0 && !m.CloudEnrollmentLoading {
+		b.WriteString(timestampStyle.Render("  No local projects found.\n"))
+	}
+	for i, item := range m.CloudEnrollmentItems {
+		check := "[ ]"
+		if item.enrolled {
+			check = "[x]"
+		}
+		line := fmt.Sprintf("%s %s", check, item.project)
+		if i == m.Cursor {
+			b.WriteString(menuSelectedStyle.Render("▸ " + line))
+		} else {
+			b.WriteString(menuItemStyle.Render("  " + line))
+		}
+		b.WriteString("\n")
+	}
+	if m.CloudEnrollmentError != "" {
+		b.WriteString(errorStyle.Render("  Error: "+m.CloudEnrollmentError) + "\n")
+	}
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter toggle • r refresh • esc/q back"))
+	return b.String()
+}
+
+func emptyCloudValue(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func cloudStatusLastError(m Model) string {
+	if m.CloudStatusHealthError != "" {
+		return m.CloudStatusHealthError
+	}
+	return m.CloudStatusLastError
+}
+
+// renderMenu renders a vertical list of selectable menu items with a cursor.
+func renderMenu(items []string, cursor int) string {
+	var b strings.Builder
+	for i, item := range items {
+		if i == cursor {
+			b.WriteString(menuSelectedStyle.Render("▸ " + item))
+		} else {
+			b.WriteString(menuItemStyle.Render("  " + item))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// ─── Search ──────────────────────────────────────────────────────────────────
+
+func (m Model) viewSearch() string {
+	var b strings.Builder
+
+	b.WriteString(headerStyle.Render("  Search Memories"))
+	b.WriteString("\n\n")
+
+	b.WriteString(searchInputStyle.Render(m.SearchInput.View()))
+	b.WriteString("\n\n")
+
+	b.WriteString(helpStyle.Render("  Type a query and press enter • esc go back"))
+
+	return b.String()
+}
+
+// ─── Search Results ──────────────────────────────────────────────────────────
+
+func (m Model) viewSearchResults() string {
+	var b strings.Builder
+
+	resultCount := len(m.SearchResults)
+	header := fmt.Sprintf("  Search: %q — %d result", m.SearchQuery, resultCount)
+	if resultCount != 1 {
+		header += "s"
+	}
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	if resultCount == 0 {
+		b.WriteString(noResultsStyle.Render("No memories found. Try a different query."))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("  / new search • esc back"))
+		return b.String()
+	}
+
+	visibleItems := (m.Height - 10) / 2 // 2 lines per observation item
+	if visibleItems < 3 {
+		visibleItems = 3
+	}
+
+	end := m.Scroll + visibleItems
+	if end > resultCount {
+		end = resultCount
+	}
+
+	for i := m.Scroll; i < end; i++ {
+		r := m.SearchResults[i]
+		b.WriteString(m.renderObservationListItem(i, r.ID, r.Type, r.Title, r.Content, r.CreatedAt, r.Project, r.State(), r.ReviewAfter, r.Pinned))
+	}
+
+	// Scroll indicator
+	if resultCount > visibleItems {
+		b.WriteString(fmt.Sprintf("\n  %s",
+			timestampStyle.Render(fmt.Sprintf("showing %d-%d of %d", m.Scroll+1, end, resultCount))))
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter detail • c copy • t timeline • / search • esc back"))
+
+	return b.String()
+}
+
+// ─── Recent Observations ─────────────────────────────────────────────────────
+
+func (m Model) viewRecent() string {
+	var b strings.Builder
+
+	count := len(m.RecentObservations)
+	header := fmt.Sprintf("  Recent Observations — %d total", count)
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	if count == 0 {
+		b.WriteString(noResultsStyle.Render("No observations yet."))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("  esc back"))
+		return b.String()
+	}
+
+	visibleItems := (m.Height - 8) / 2 // 2 lines per observation item
+	if visibleItems < 3 {
+		visibleItems = 3
+	}
+
+	end := m.Scroll + visibleItems
+	if end > count {
+		end = count
+	}
+
+	for i := m.Scroll; i < end; i++ {
+		o := m.RecentObservations[i]
+		b.WriteString(m.renderObservationListItem(i, o.ID, o.Type, o.Title, o.Content, o.CreatedAt, o.Project, o.State(), o.ReviewAfter, o.Pinned))
+	}
+
+	if count > visibleItems {
+		b.WriteString(fmt.Sprintf("\n  %s",
+			timestampStyle.Render(fmt.Sprintf("showing %d-%d of %d", m.Scroll+1, end, count))))
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter detail • c copy • t timeline • esc back"))
+
+	return b.String()
+}
+
+// ─── Observation Detail ──────────────────────────────────────────────────────
+
+func (m Model) viewObservationDetail() string {
+	if m.SelectedObservation == nil {
+		var b strings.Builder
+		b.WriteString(headerStyle.Render("  Observation Detail"))
+		b.WriteString("\n")
+		b.WriteString(noResultsStyle.Render("Loading..."))
+		return b.String()
+	}
+
+	contentLines := m.observationDetailContentLines()
+	maxLines := m.observationDetailViewport()
+	m.DetailScroll = m.clampDetailScroll()
+
+	var b strings.Builder
+	b.WriteString(m.observationDetailChrome())
+	end := m.DetailScroll + maxLines
+	if end > len(contentLines) {
+		end = len(contentLines)
+	}
+
+	for i := m.DetailScroll; i < end; i++ {
+		b.WriteString(contentLines[i])
+		b.WriteString("\n")
+	}
+
+	if maxLines > 0 && len(contentLines) > maxLines {
+		b.WriteString(fmt.Sprintf("\n  %s",
+			timestampStyle.Render(fmt.Sprintf("line %d-%d of %d", m.DetailScroll+1, end, len(contentLines)))))
+	}
+
+	b.WriteString(observationDetailHelp())
+
+	return b.String()
+}
+
+// ─── Timeline ────────────────────────────────────────────────────────────────
+
+func (m Model) viewTimeline() string {
+	var b strings.Builder
+
+	if m.Timeline == nil {
+		b.WriteString(headerStyle.Render("  Timeline"))
+		b.WriteString("\n")
+		b.WriteString(noResultsStyle.Render("Loading..."))
+		return b.String()
+	}
+
+	tl := m.Timeline
+	header := fmt.Sprintf("  Timeline — Observation #%d (%d total in session)", tl.Focus.ID, tl.TotalInRange)
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	// Session info
+	if tl.SessionInfo != nil {
+		b.WriteString(fmt.Sprintf("  %s %s  %s %s\n\n",
+			detailLabelStyle.Render("Session:"),
+			idStyle.Render(tl.SessionInfo.ID),
+			detailLabelStyle.Render("Project:"),
+			projectStyle.Render(tl.SessionInfo.Project)))
+	}
+
+	// Before entries
+	if len(tl.Before) > 0 {
+		b.WriteString(sectionHeadingStyle.Render("  Before"))
+		b.WriteString("\n")
+		for _, e := range tl.Before {
+			b.WriteString(fmt.Sprintf("  %s %s %s  %s\n",
+				timelineConnectorStyle.Render("│"),
+				idStyle.Render(fmt.Sprintf("#%-4d", e.ID)),
+				typeBadgeStyle.Render(fmt.Sprintf("[%-12s]", e.Type)),
+				timelineItemStyle.Render(truncateStr(e.Title, 60))))
+		}
+		b.WriteString(fmt.Sprintf("  %s\n", timelineConnectorStyle.Render("│")))
+	}
+
+	// Focus (highlighted)
+	focusContent := fmt.Sprintf("  %s %s  %s\n  %s",
+		idStyle.Render(fmt.Sprintf("#%d", tl.Focus.ID)),
+		typeBadgeStyle.Render("["+tl.Focus.Type+"]"),
+		lipgloss.NewStyle().Bold(true).Foreground(colorLavender).Render(tl.Focus.Title),
+		detailContentStyle.Render(truncateStr(tl.Focus.Content, 120)))
+	b.WriteString(timelineFocusStyle.Render(focusContent))
+	b.WriteString("\n")
+
+	// After entries
+	if len(tl.After) > 0 {
+		b.WriteString(fmt.Sprintf("  %s\n", timelineConnectorStyle.Render("│")))
+		b.WriteString(sectionHeadingStyle.Render("  After"))
+		b.WriteString("\n")
+		for _, e := range tl.After {
+			b.WriteString(fmt.Sprintf("  %s %s %s  %s\n",
+				timelineConnectorStyle.Render("│"),
+				idStyle.Render(fmt.Sprintf("#%-4d", e.ID)),
+				typeBadgeStyle.Render(fmt.Sprintf("[%-12s]", e.Type)),
+				timelineItemStyle.Render(truncateStr(e.Title, 60))))
+		}
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k scroll • esc back"))
+
+	return b.String()
+}
+
+// ─── Sessions ────────────────────────────────────────────────────────────────
+
+func (m Model) viewSessions() string {
+	var b strings.Builder
+
+	count := len(m.Sessions)
+	header := fmt.Sprintf("  Sessions — %d total", count)
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	switch m.SessionDeleteState {
+	case SessionDeleteStateDeleting:
+		b.WriteString("\n")
+		b.WriteString(sectionHeadingStyle.Render("  Deleting Session"))
+		b.WriteString("\n\n")
+		b.WriteString(detailContentStyle.Render(fmt.Sprintf("  Deleting session %q...", m.SessionDeleteID)))
+		b.WriteString("\n")
+		return b.String()
+	case SessionDeleteStatePrompt:
+		b.WriteString("\n")
+		b.WriteString(sectionHeadingStyle.Render("  Confirm Session Delete"))
+		b.WriteString("\n\n")
+		b.WriteString(detailContentStyle.Render(fmt.Sprintf("  Delete session %q from project %q?", m.SessionDeleteID, m.SessionDeleteProject)))
+		b.WriteString("\n")
+		b.WriteString(timestampStyle.Render("  Sessions with observations cannot be deleted; Engram will refuse unsafe deletes."))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("  [y] Delete  [n] Cancel  [esc] Cancel"))
+		return b.String()
+	}
+
+	if count == 0 {
+		b.WriteString(noResultsStyle.Render("No sessions yet."))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("  esc back"))
+		return b.String()
+	}
+
+	visibleItems := m.Height - 8
+	if visibleItems < 5 {
+		visibleItems = 5
+	}
+
+	end := m.Scroll + visibleItems
+	if end > count {
+		end = count
+	}
+
+	for i := m.Scroll; i < end; i++ {
+		s := m.Sessions[i]
+		cursor := "  "
+		style := listItemStyle
+		if i == m.Cursor {
+			cursor = "▸ "
+			style = listSelectedStyle
+		}
+
+		summary := ""
+		if s.Summary != nil {
+			summary = truncateStr(*s.Summary, 50)
+		}
+
+		line := fmt.Sprintf("%s%s  %s  %s obs  %s",
+			cursor,
+			projectStyle.Render(fmt.Sprintf("%-20s", s.Project)),
+			timestampStyle.Render(localTime(s.StartedAt)),
+			statNumberStyle.Render(fmt.Sprintf("%d", s.ObservationCount)),
+			style.Render(summary))
+
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	if count > visibleItems {
+		b.WriteString(fmt.Sprintf("\n  %s",
+			timestampStyle.Render(fmt.Sprintf("showing %d-%d of %d", m.Scroll+1, end, count))))
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter view session • d delete • esc back"))
+
+	return b.String()
+}
+
+// ─── Session Detail ──────────────────────────────────────────────────────────
+
+func (m Model) viewSessionDetail() string {
+	var b strings.Builder
+
+	if m.SelectedSessionIdx >= len(m.Sessions) {
+		b.WriteString(headerStyle.Render("  Session Detail"))
+		b.WriteString("\n")
+		b.WriteString(noResultsStyle.Render("Session not found."))
+		return b.String()
+	}
+
+	sess := m.Sessions[m.SelectedSessionIdx]
+	header := fmt.Sprintf("  Session: %s — %s", sess.Project, localTime(sess.StartedAt))
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	// Session metadata
+	if sess.Summary != nil {
+		b.WriteString(fmt.Sprintf("  %s %s\n\n",
+			detailLabelStyle.Render("Summary:"),
+			detailValueStyle.Render(*sess.Summary)))
+	}
+
+	count := len(m.SessionObservations)
+	b.WriteString(sectionHeadingStyle.Render(fmt.Sprintf("  Observations (%d)", count)))
+	b.WriteString("\n")
+
+	if count == 0 {
+		b.WriteString(noResultsStyle.Render("No observations in this session."))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("  esc back"))
+		return b.String()
+	}
+
+	visibleItems := (m.Height - 12) / 2 // 2 lines per observation item
+	if visibleItems < 3 {
+		visibleItems = 3
+	}
+
+	end := m.SessionDetailScroll + visibleItems
+	if end > count {
+		end = count
+	}
+
+	for i := m.SessionDetailScroll; i < end; i++ {
+		o := m.SessionObservations[i]
+		b.WriteString(m.renderObservationListItem(i, o.ID, o.Type, o.Title, o.Content, o.CreatedAt, o.Project, o.State(), o.ReviewAfter, o.Pinned))
+	}
+
+	if count > visibleItems {
+		b.WriteString(fmt.Sprintf("\n  %s",
+			timestampStyle.Render(fmt.Sprintf("showing %d-%d of %d", m.SessionDetailScroll+1, end, count))))
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter detail • c copy • t timeline • esc back"))
+
+	return b.String()
+}
+
+// ─── Setup ───────────────────────────────────────────────────────────────────
+
+// viewSetup renders the agent-plugin install screen, including progress,
+// the permissions allowlist prompt, and post-install next steps.
+func (m Model) viewSetup() string {
+	var b strings.Builder
+
+	b.WriteString(headerStyle.Render("  Setup — Install Agent Plugin"))
+	b.WriteString("\n")
+
+	// Show spinner while installing
+	if m.SetupInstalling {
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  %s Installing %s plugin...\n",
+			m.SetupSpinner.View(),
+			lipgloss.NewStyle().Bold(true).Foreground(colorLavender).Render(m.SetupInstallingName)))
+		b.WriteString("\n")
+
+		switch m.SetupInstallingName {
+		case "opencode":
+			b.WriteString(timestampStyle.Render("  Copying plugin file to plugins directory"))
+		case "claude-code":
+			b.WriteString(timestampStyle.Render("  Running claude plugin marketplace add + install"))
+		}
+
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	// Show allowlist prompt after successful claude-code install
+	if m.SetupAllowlistPrompt && m.SetupResult != nil {
+		successMsg := fmt.Sprintf("Installed %s plugin", m.SetupResult.Agent)
+		b.WriteString(fmt.Sprintf("\n  %s %s\n\n",
+			lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Render("✓"),
+			lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Render(successMsg)))
+
+		b.WriteString(sectionHeadingStyle.Render("  Permissions Allowlist"))
+		b.WriteString("\n\n")
+		b.WriteString(detailContentStyle.Render("  Add engram tools to " + setup.ClaudeCodeSettingsPath() + " allowlist?"))
+		b.WriteString("\n")
+		b.WriteString(timestampStyle.Render("  This prevents Claude Code from asking permission on every tool call."))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("  [y] Yes  [n] No"))
+		return b.String()
+	}
+
+	// Show result after install
+	if m.SetupDone {
+		if m.SetupError != "" {
+			b.WriteString(errorStyle.Render("  ✗ Installation failed: " + m.SetupError))
+			b.WriteString("\n\n")
+		} else if m.SetupResult != nil {
+			successMsg := fmt.Sprintf("Installed %s plugin", m.SetupResult.Agent)
+			if m.SetupResult.Files > 0 {
+				successMsg += fmt.Sprintf(" (%d files)", m.SetupResult.Files)
+			}
+			b.WriteString(fmt.Sprintf("  %s %s\n",
+				lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Render("✓"),
+				lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Render(successMsg)))
+			b.WriteString(fmt.Sprintf("  %s %s\n\n",
+				detailLabelStyle.Render("Location:"),
+				projectStyle.Render(m.SetupResult.Destination)))
+
+			// Post-install instructions
+			switch m.SetupResult.Agent {
+			case "opencode":
+				b.WriteString(sectionHeadingStyle.Render("  Next Steps"))
+				b.WriteString("\n")
+				b.WriteString(detailContentStyle.Render("1. Restart OpenCode"))
+				b.WriteString("\n")
+				b.WriteString(detailContentStyle.Render("2. Plugin is auto-loaded from ~/.config/opencode/plugins/"))
+				b.WriteString("\n")
+				b.WriteString(detailContentStyle.Render("3. Make sure 'engram' is in your MCP config (opencode.json)"))
+				b.WriteString("\n")
+			case "claude-code":
+				b.WriteString(sectionHeadingStyle.Render("  Next Steps"))
+				b.WriteString("\n")
+				if m.SetupAllowlistApplied {
+					b.WriteString(fmt.Sprintf("  %s %s\n",
+						lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Render("✓"),
+						detailContentStyle.Render("Engram tools added to allowlist")))
+				} else if m.SetupAllowlistError != "" {
+					b.WriteString(fmt.Sprintf("  %s %s\n",
+						lipgloss.NewStyle().Bold(true).Foreground(colorRed).Render("✗"),
+						detailContentStyle.Render("Allowlist update failed: "+m.SetupAllowlistError)))
+					b.WriteString(detailContentStyle.Render("  Add manually to permissions.allow in " + setup.ClaudeCodeSettingsPath()))
+					b.WriteString("\n")
+				}
+				b.WriteString(detailContentStyle.Render("1. Restart Claude Code — the plugin is active immediately"))
+				b.WriteString("\n")
+				b.WriteString(detailContentStyle.Render("2. Verify with: claude plugin list"))
+				b.WriteString("\n")
+			}
+		}
+
+		b.WriteString(helpStyle.Render("\n  enter/esc back to dashboard"))
+		return b.String()
+	}
+
+	// Agent selection
+	b.WriteString("\n")
+	b.WriteString(titleStyle.Render("  Select an agent to set up"))
+	b.WriteString("\n\n")
+
+	for i, agent := range m.SetupAgents {
+		if i == m.Cursor {
+			b.WriteString(menuSelectedStyle.Render("▸ " + agent.Description))
+		} else {
+			b.WriteString(menuItemStyle.Render("  " + agent.Description))
+		}
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("      %s %s\n\n",
+			detailLabelStyle.Render("Install to:"),
+			timestampStyle.Render(agent.InstallDir)))
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k navigate • enter install • esc back"))
+
+	return b.String()
+}
+
+// ─── Shared Renderers ────────────────────────────────────────────────────────
+
+func (m Model) renderObservationListItem(index int, id int64, obsType, title, content, createdAt string, project *string, state string, reviewAfter *string, pinned bool) string {
+	cursor := "  "
+	style := listItemStyle
+	if index == m.Cursor {
+		cursor = "▸ "
+		style = listSelectedStyle
+	}
+
+	proj := ""
+	if project != nil {
+		proj = "  " + projectStyle.Render(*project)
+	}
+
+	stateBadge := ""
+	if state == "needs_review" {
+		stateBadge = " " + stateWarningBadgeStyle.Render("[needs_review]")
+	}
+	pinBadge := ""
+	if pinned {
+		pinBadge = " " + detailValueStyle.Render("[pinned]")
+	}
+
+	line := fmt.Sprintf("%s%s %s%s%s %s%s  %s\n",
+		cursor,
+		idStyle.Render(fmt.Sprintf("#%-5d", id)),
+		typeBadgeStyle.Render(fmt.Sprintf("[%-12s]", obsType)),
+		stateBadge,
+		pinBadge,
+		style.Render(truncateStr(title, 50)),
+		proj,
+		timestampStyle.Render(localTime(createdAt)))
+
+	// Content preview on second line
+	preview := truncateStr(content, 80)
+	if preview != "" {
+		line += contentPreviewStyle.Render(preview) + "\n"
+	}
+
+	return line
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+func (m Model) viewportHeight(chrome string) int {
+	available := m.Height - lipgloss.Height(appStyle.Render(chrome))
+	if available < 0 {
+		return 0
+	}
+	return available
+}
+
+func (m Model) observationDetailChrome() string {
+	obs := m.SelectedObservation
+	if obs == nil {
+		return ""
+	}
+	metadata := []string{
+		fmt.Sprintf("%s %s", detailLabelStyle.Render("Type:"), typeBadgeStyle.Render(obs.Type)),
+		fmt.Sprintf("%s %s", detailLabelStyle.Render("Title:"), detailValueStyle.Bold(true).Render(obs.Title)),
+		fmt.Sprintf("%s %s", detailLabelStyle.Render("Session:"), idStyle.Render(obs.SessionID)),
+		fmt.Sprintf("%s %s", detailLabelStyle.Render("Created:"), timestampStyle.Render(localTime(obs.CreatedAt))),
+		fmt.Sprintf("%s %s", detailLabelStyle.Render("State:"), renderObservationState(obs.State())),
+		fmt.Sprintf("%s %s", detailLabelStyle.Render("Pinned:"), detailValueStyle.Render(fmt.Sprintf("%t", obs.Pinned))),
+	}
+	if obs.ReviewAfter != nil {
+		metadata = append(metadata, fmt.Sprintf("%s %s", detailLabelStyle.Render("Review:"), timestampStyle.Render(formatReviewDate(*obs.ReviewAfter))))
+	}
+	if obs.ToolName != nil {
+		metadata = append(metadata, fmt.Sprintf("%s %s", detailLabelStyle.Render("Tool:"), detailValueStyle.Render(*obs.ToolName)))
+	}
+	if obs.Project != nil {
+		metadata = append(metadata, fmt.Sprintf("%s %s", detailLabelStyle.Render("Project:"), projectStyle.Render(*obs.Project)))
+	}
+
+	// On short terminals, remove trailing metadata until chrome leaves one content row.
+	for {
+		chrome := renderObservationDetailChrome(obs, metadata)
+		footer := fmt.Sprintf("\n  %s", timestampStyle.Render("line 1-1 of 1")) + observationDetailHelp()
+		if m.Height <= 0 || m.viewportHeight(chrome+footer) > 0 || len(metadata) == 0 {
+			return chrome
+		}
+		metadata = metadata[:len(metadata)-1]
+	}
+}
+
+func renderObservationDetailChrome(obs *store.Observation, metadata []string) string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render(fmt.Sprintf("  Observation #%d", obs.ID)))
+	b.WriteString("\n")
+	for _, line := range metadata {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(sectionHeadingStyle.Render("  Content"))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func observationDetailHelp() string {
+	return helpStyle.Render("\n  j/k scroll • c copy • t timeline • esc back")
+}
+
+func (m Model) observationDetailContentLines() []string {
+	if m.SelectedObservation == nil {
+		return nil
+	}
+	wrapWidth := m.Width - 6
+	if m.Width <= 0 {
+		wrapWidth = 20
+	} else if wrapWidth < 1 {
+		wrapWidth = 1
+	}
+	return strings.Split(detailContentStyle.Width(wrapWidth).Render(m.SelectedObservation.Content), "\n")
+}
+
+func (m Model) observationDetailViewport() int {
+	if m.Height <= 0 {
+		return 5
+	}
+	chrome := m.observationDetailChrome() +
+		fmt.Sprintf("\n  %s", timestampStyle.Render("line 1-1 of 1")) +
+		helpStyle.Render("\n  j/k scroll • c copy • t timeline • esc back")
+	return m.viewportHeight(chrome)
+}
+
+func (m Model) observationDetailMaxScroll() int {
+	visibleLines := m.observationDetailViewport()
+	if visibleLines == 0 {
+		return 0
+	}
+	maxScroll := len(m.observationDetailContentLines()) - visibleLines
+	if maxScroll < 0 {
+		return 0
+	}
+	return maxScroll
+}
+
+func (m Model) clampDetailScroll() int {
+	if m.DetailScroll < 0 {
+		return 0
+	}
+	if maxScroll := m.observationDetailMaxScroll(); m.DetailScroll > maxScroll {
+		return maxScroll
+	}
+	return m.DetailScroll
+}
+
+// localTime converts a UTC timestamp string from SQLite to local time for display.
+func localTime(utc string) string {
+	return timeutil.FormatLocal(utc)
+}
+
+func renderObservationState(state string) string {
+	if state == "needs_review" {
+		return stateWarningBadgeStyle.Render(state)
+	}
+	return detailValueStyle.Render(state)
+}
+
+func formatReviewDate(value string) string {
+	trimmed := strings.TrimSpace(value)
+	formats := []string{"2006-01-02 15:04:05", time.RFC3339, time.RFC3339Nano, "2006-01-02"}
+	for _, layout := range formats {
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed.Format("2006-01-02")
+		}
+	}
+	if len(trimmed) >= len("2006-01-02") {
+		return trimmed[:len("2006-01-02")]
+	}
+	return trimmed
+}
+
+func truncateStr(s string, max int) string {
+	// Remove newlines for single-line display
+	s = strings.ReplaceAll(s, "\n", " ")
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "..."
+}

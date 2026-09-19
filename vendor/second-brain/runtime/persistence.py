@@ -1,0 +1,796 @@
+"""Conversation persistence and lifecycle helpers.
+
+The runtime never reads the DB directly. Everything that creates a
+conversation row, hydrates a session from past messages, writes a state
+marker, or appends a chat message routes through this module.
+
+The functions are arranged in lifecycle order:
+1. ``open_session``: the unified create/load/rebind entry point.
+2. ``load_conversation`` / ``load_history``: hydrate from DB.
+3. ``reset_conversation`` / ``new_conversation``: start fresh.
+4. ``inject_user_message`` / ``iterate_agent_turn``: drive a turn.
+5. Marker helpers (``persist_marker``, etc.) used everywhere else.
+"""
+
+from __future__ import annotations
+
+
+import logging
+import threading
+import uuid
+from contextlib import contextmanager
+from typing import Any
+
+from events.event_bus import bus
+from events.event_channels import (
+    SESSION_CLOSED,
+    SESSION_CONVERSATION_CHANGED,
+    SESSION_CONVERSATION_ENDED,
+    SESSION_CREATED,
+    SESSION_MESSAGE,
+)
+from state_machine.approval import StateMachineApprovalRequest
+from state_machine.conversation_phases import BASE_PHASE, PHASE_APPROVING_REQUEST
+from state_machine.serialization import latest_compaction, latest_state, messages_to_history, save_history_message, save_state_marker
+from runtime.runtime_config import new_state
+from runtime.session import RuntimeSession, SessionConflict
+from pipeline.database import DEFAULT_USER_ID
+from runtime.notifications import (
+    DEFAULT_NOTIFICATION_MODE,
+    emit_fallback_push,
+    notification_mode as normalize_notification_mode,
+)
+
+logger = logging.getLogger("Runtime.persistence")
+
+
+class SessionBusy(RuntimeError):
+    """A lifecycle mutation would detach work that still owns the session."""
+
+
+@contextmanager
+def idle_bindings(runtime, *, session_key=None, conversation_id=None):
+    """Hold bindings and idle state atomically for destructive lifecycle edits.
+
+    Never wait for a session lock while holding the registry lock: dispatch
+    takes these in the opposite order when a command switches conversations.
+    A concurrent mutation is refused so its caller can retry.
+    """
+    locked = []
+    with runtime._sessions_lock:
+        try:
+            holders = [s for s in runtime.sessions.values()
+                       if (s.key == session_key if session_key is not None
+                           else getattr(s, "conversation_id", None) == conversation_id)]
+            for session in holders:
+                if not session.lock.acquire(blocking=False):
+                    raise SessionBusy("Cancel the running turn before changing the conversation.")
+                locked.append(session)
+                if (session.in_flight or session.dispatch_thread not in (None, threading.get_ident())):
+                    raise SessionBusy("Cancel the running turn before changing the conversation.")
+            yield holders
+        finally:
+            for session in reversed(locked):
+                session.lock.release()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Session lookup + the unified create/load entry point
+# ──────────────────────────────────────────────────────────────────────
+
+def get_or_create_session(runtime, key: str) -> RuntimeSession:
+    """Return the existing session for ``key`` or create an empty one."""
+    with runtime._sessions_lock:
+        if key not in runtime.sessions:
+            session = RuntimeSession(key, new_state(runtime))
+            session.cs = new_state(runtime, session=session)
+            runtime.sessions[key] = session
+            _sync_notification_mode(session)
+            bus.emit(SESSION_CREATED, {
+                "session_key": key,
+                "agent_profile": session.active_agent_profile,
+            })
+        return runtime.sessions[key]
+
+
+def _sync_notification_mode(session: RuntimeSession) -> None:
+    """Normalize notification mode and drop stale notification extras."""
+    session.extra_tool_instances = [
+        t for t in session.extra_tool_instances
+        if getattr(t, "name", None) != "notify"
+    ]
+    session.notification_mode = normalize_notification_mode(session.notification_mode)
+
+
+def open_session(
+    runtime,
+    session_key: str,
+    *,
+    conversation_id: int | None = None,
+    kind: str = "user",
+    category: str | None = None,
+    title: str = "New Conversation",
+    agent_profile: str | None = None,
+    notification_mode: str | None = None,
+    system_prompt_extras: dict[str, Any] | None = None,
+) -> RuntimeSession:
+    """Single entry point for "address this conversation".
+
+    - If a session exists for ``session_key`` and (a) ``conversation_id`` is
+      None or matches the existing one, returns it.
+    - If the session exists but its ``conversation_id`` differs from the
+      requested one, raises :class:`SessionConflict`.
+    - If no session exists and ``conversation_id`` is given, loads it.
+    - If no session exists and ``conversation_id`` is None, creates a new
+      conversation row first, then loads it.
+
+    This is the API plugins, tasks, and tools should reach for instead of
+    juggling ``create_conversation`` + ``load_conversation`` themselves.
+    """
+    with runtime._sessions_lock:
+        existing = runtime.sessions.get(session_key)
+        if existing is not None:
+            if conversation_id is None or existing.conversation_id == conversation_id:
+                return existing
+            # A session that exists but holds no conversation (identity bound
+            # up-front via set_session_user) is free to bind — only a session
+            # already on a *different* conversation conflicts.
+            if existing.conversation_id is not None:
+                raise SessionConflict(session_key, existing.conversation_id, conversation_id)
+
+    if conversation_id is None:
+        if runtime.db is None:
+            raise RuntimeError("Cannot create a conversation without a database.")
+        conversation_id = runtime.db.create_conversation(
+            title, kind=kind, category=category,
+            user_id=runtime.session_user_id(session_key))
+
+    return load_conversation(
+        runtime, session_key, conversation_id,
+        agent_profile=agent_profile,
+        notification_mode=notification_mode,
+        system_prompt_extras=system_prompt_extras,
+    )
+
+
+def create_conversation(
+    runtime,
+    title: str = "New Conversation",
+    *,
+    kind: str = "user",
+    category: str | None = None,
+    user_id: int = DEFAULT_USER_ID,
+) -> int | None:
+    """Create a conversation row only — does not load it into a session.
+
+    Use ``open_session`` instead unless you really want a detached row.
+    """
+    return runtime.db.create_conversation(title, kind=kind, category=category, user_id=user_id) if runtime.db else None
+
+
+def load_conversation(
+    runtime, session_key: str, conversation_id: int, *,
+    agent_profile: str | None = None,
+    notification_mode: str | None = None,
+    system_prompt_extras: dict[str, Any] | None = None,
+) -> RuntimeSession:
+    """Bind atomically, retaining live state instead of recovering it as a crash."""
+    with runtime._sessions_lock:
+        existing = runtime.sessions.get(session_key)
+        if existing is not None and existing.conversation_id == conversation_id:
+            return existing
+        if existing is not None and existing.conversation_id is not None:
+            # Direct callers must switch through load_history so their current
+            # binding is closed cleanly. Do not evict the target's holder only
+            # to discover this conflict during hydration.
+            raise SessionConflict(
+                session_key, existing.conversation_id, conversation_id)
+        displaced = _release_conversation_binding(
+            runtime, session_key, conversation_id)
+        with idle_bindings(runtime, session_key=session_key):
+            session = _load_conversation(
+                runtime, session_key, conversation_id, agent_profile=agent_profile,
+                notification_mode=notification_mode,
+                system_prompt_extras=system_prompt_extras)
+        if displaced:
+            runtime.notify(
+                title="Conversation transferred",
+                body="This conversation was released from another session and opened here.",
+                source="runtime", session_key=session_key,
+                conversation_id=conversation_id, persist=False)
+        return session
+
+
+class ConversationInUse(RuntimeError):
+    """A different live session already owns this conversation's mutable state."""
+
+
+def _release_conversation_binding(runtime, session_key, conversation_id):
+    """Reset an idle prior holder so ``session_key`` can claim the conversation."""
+    for key, session in runtime.sessions.items():
+        if key != session_key and session.conversation_id == conversation_id:
+            try:
+                reset_conversation(runtime, key)
+            except SessionBusy as exc:
+                raise ConversationInUse(
+                    "This conversation is active in another session. "
+                    "Cancel the running turn there before opening it here.") from exc
+            return True
+    return False
+
+
+def _load_conversation(
+    runtime,
+    session_key: str,
+    conversation_id: int,
+    *,
+    agent_profile: str | None = None,
+    notification_mode: str | None = None,
+    system_prompt_extras: dict[str, Any] | None = None,
+) -> RuntimeSession:
+    """Hydrate a session from a stored conversation.
+
+    Refuses to bind ``session_key`` if it is already pointing at a
+    different ``conversation_id`` — see :class:`SessionConflict` for why.
+    """
+    existing = runtime.sessions.get(session_key)
+    if existing is not None and existing.conversation_id not in (None, conversation_id):
+        raise SessionConflict(session_key, existing.conversation_id, conversation_id)
+
+    rows = runtime.db.get_conversation_messages(conversation_id) if runtime.db else []
+    marker, restore_notices, marker_changed = recover_marker(latest_state(rows) or {})
+    saved_profile = agent_profile or marker.get("profile_override") or marker.get("active_agent_profile")
+    profile = saved_profile or runtime.user_setting(session_key, "active_agent_profile", "default") or "default"
+    saved_mode = normalize_notification_mode(
+        notification_mode or marker.get("notification_mode") or DEFAULT_NOTIFICATION_MODE
+    )
+    session = RuntimeSession(
+        session_key,
+        new_state(runtime, marker),
+        messages_to_history(rows),
+        conversation_id,
+        False,
+        profile,
+        profile_override=saved_profile,
+        system_prompt_extras={**dict(marker.get("system_prompt_extras") or {}), **dict(system_prompt_extras or {})},
+        plugin_state=dict(marker.get("plugin_state") or {}),
+        compaction_state_namespaces=set(
+            marker.get("compaction_state_namespaces") or []),
+        notification_mode=saved_mode,
+        has_compaction_checkpoint=latest_compaction(rows) is not None,
+        restore_notices=restore_notices,
+    )
+    # Identity is a live frontend binding, not conversation state — carry it from
+    # the prior in-memory session so loading never silently drops (or, worse,
+    # changes) who the session acts for. Ownership comes from the conversation
+    # row + access guard, never from the marker.
+    #
+    # ``frontend_name`` is the same kind of fact and needs the same treatment.
+    # The marker records which frontend last had this conversation *open*, which
+    # says nothing about who is asking for it now: letting it win hands the
+    # session to somebody else. Loading a conversation last used from the REPL
+    # would stamp ``frontend_name = "repl"`` onto an ``http:`` session, and from
+    # then on every ``frontend.act`` against it is refused as another frontend's
+    # — permanently, since nothing puts the name back. So the marker is only a
+    # fallback, for restoring a session that has no live binding at all.
+    if existing is not None:
+        session.user_id = existing.user_id
+        session.frontend_name = existing.frontend_name
+    else:
+        session.frontend_name = marker.get("frontend_name")
+    # Re-seed cs with session-aware specs.
+    session.cs = new_state(runtime, marker, session=session)
+    _sync_notification_mode(session)
+    with runtime._sessions_lock:
+        runtime.sessions[session_key] = session
+    if marker_changed:
+        persist_marker(runtime, session)
+    # Raised here rather than carried into the load reply, and *after* the
+    # marker is written back — the write is what makes this once-per-incident
+    # rather than once-per-load, since it clears the ``busy`` flag the notice
+    # was derived from.
+    #
+    # Persisted, unlike the other two ephemeral notifications. The test is
+    # whether anything else records the thing: a queued message lands in the
+    # transcript seconds later and a compaction leaves a checkpoint, so both
+    # can be forgotten. A turn that never finished writes no ledger row
+    # precisely because nothing completed, so this row is the only durable
+    # trace that it happened at all.
+    for notice in restore_notices:
+        runtime.notify(title=notice["title"], body=notice["body"],
+                       source="runtime", level="warning",
+                       source_session_key=session_key,
+                       conversation_id=conversation_id)
+    bus.emit(SESSION_CREATED, {
+        "session_key": session_key,
+        "agent_profile": profile,
+        "notification_mode": saved_mode,
+    })
+    announce_session_conversation(runtime, session)
+    restore_pending_requests(runtime, session)
+    restore_pending_form(runtime, session)
+    return session
+
+
+def load_history(runtime, session_key: str, conversation_id: int):
+    # Release an idle holder before closing the current session, and keep the
+    # claim atomic with hydration. A refused switch leaves the caller intact.
+    from runtime.session import RuntimeResult
+
+    with runtime._sessions_lock:
+        try:
+            # ``load_conversation`` performs the handoff after the caller's old
+            # session has been closed. Probe busy ownership now so a refusal
+            # cannot strand the caller on New Conversation.
+            holder = next((s for key, s in runtime.sessions.items()
+                           if key != session_key
+                           and s.conversation_id == conversation_id), None)
+            if holder is not None:
+                with idle_bindings(runtime, session_key=holder.key):
+                    pass
+        except ConversationInUse as exc:
+            return RuntimeResult(False, error={"code": "conversation_in_use", "message": str(exc)})
+        except SessionBusy:
+            return RuntimeResult(False, error={
+                "code": "conversation_in_use",
+                "message": "This conversation is active in another session. "
+                           "Cancel the running turn there before opening it here."})
+        return _load_history(runtime, session_key, conversation_id)
+
+
+def _load_history(runtime, session_key: str, conversation_id: int):
+    """Switch a session into a previous conversation.
+
+    Returns a :class:`RuntimeResult` with a short status line. The recent-
+    message preview is intentionally omitted: callers (notably the
+    /conversations picker) already show those messages on the
+    Load/Delete confirmation step, so re-printing them here would just
+    be a duplicate.
+    """
+    from runtime.session import RuntimeResult
+
+    old = runtime.sessions.get(session_key)
+    old_profile = (old.profile_override or old.active_agent_profile) if old else runtime.user_setting(session_key, "active_agent_profile", "default") or "default"
+    if old and old.conversation_id != conversation_id:
+        # Identity is a live frontend binding; closing the session must not
+        # reset it to the default user before the reload carries it over. The
+        # owning frontend is the other half of that binding and travels the same
+        # way — ``set_session_user`` makes a bare session, so without this the
+        # reload below would find no live owner and fall back to the marker,
+        # which is exactly the hand-off this is here to prevent.
+        user_id = old.user_id
+        frontend_name = old.frontend_name
+        if not close_session(runtime, session_key):
+            return RuntimeResult(False, error={
+                "code": "busy", "message": "Cancel the running turn before switching conversations."})
+        runtime.set_session_user(session_key, user_id)
+        get_or_create_session(runtime, session_key).frontend_name = frontend_name
+    session = load_conversation(runtime, session_key, conversation_id)
+    new_profile = session.profile_override or session.active_agent_profile
+
+    title = conversation_title(runtime, conversation_id)
+    # Blank lines between parts: this travels as markdown, where a single
+    # newline is a soft break that rich renderers collapse into a space.
+    msg = f"Loaded conversation: {title}\n\nAgent: {new_profile}"
+    if old_profile != new_profile:
+        msg += f"\n\nSwitched agent: {old_profile} -> {new_profile}"
+
+    # ``callable_output``: this confirms something the person asked for, which is
+    # not the conversation. It reaches them as ``/conversations``' own output —
+    # and ``load_history`` is a dispatchable action, so a client wiring a load
+    # button straight to it would otherwise get a line of chat nobody said.
+    return RuntimeResult(
+        callable_output=[msg],
+        data={"conversation_id": conversation_id, "history": session.history, "agent_profile": new_profile},
+    )
+
+
+def reset_conversation(runtime, session_key: str) -> RuntimeSession:
+    """Handle reset conversation."""
+    with idle_bindings(runtime, session_key=session_key):
+        prior = runtime.sessions.get(session_key)
+        existed = prior is not None
+        session = RuntimeSession(session_key, new_state(runtime))
+        session.cs = new_state(runtime, session=session)
+        # Identity is a live frontend binding, not conversation state — carry it
+        # across the reset so /new keeps acting for the same user (the new
+        # conversation will be stamped with this owner).
+        if prior is not None:
+            session.user_id = prior.user_id
+            session.frontend_name = prior.frontend_name
+        _sync_notification_mode(session)
+        runtime.sessions[session_key] = session
+    if existed:
+        # Before SESSION_CLOSED, because the conversation is the more specific
+        # fact: a subscriber that only cares about work finishing should not
+        # have to reconstruct which conversation a closed session was in.
+        announce_conversation_ended(
+            runtime, session_key,
+            getattr(prior, "conversation_id", None), "switched")
+        bus.emit(SESSION_CLOSED, {"session_key": session_key})
+        bus.emit(SESSION_CONVERSATION_CHANGED, {
+            "session_key": session_key,
+            "conversation_id": None,
+            "title": "New Conversation",
+        })
+    bus.emit(SESSION_CREATED, {
+        "session_key": session_key,
+        "agent_profile": session.active_agent_profile,
+    })
+    return session
+
+
+def new_conversation(runtime, session_key: str):
+    """Start a fresh conversation and announce it.
+
+    The announcement is a notification rather than a chat message: a new
+    conversation beginning is the system reporting a state change, and putting
+    it in the transcript made the first line of every conversation something
+    nobody said. Frontends without a notification surface still see it, flattened
+    into chat exactly as before.
+    """
+    from runtime.session import RuntimeResult
+
+    reset_conversation(runtime, session_key)
+    profile = runtime.user_setting(session_key, "active_agent_profile", "default") or "default"
+    runtime.notify(title="New conversation started", body=f"Agent: {profile}.",
+                   source="runtime", session_key=session_key, persist=False)
+    return RuntimeResult()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Driving turns
+# ──────────────────────────────────────────────────────────────────────
+
+def iterate_agent_turn(
+    runtime,
+    session_key: str,
+    prompt: str,
+    *,
+    attachments=None,
+    actor_id: str = "user",
+):
+    """Drive one user prompt → agent reply round-trip.
+
+    Used by anything that pushes a turn from outside a frontend. After the
+    turn completes the full provider history is replaced atomically and a
+    fresh state marker is saved.
+
+    ``attachments`` accepts an iterable of :class:`attachments.Attachment`
+    dataclasses (or dicts produced by ``Attachment.to_dict``). They are
+    queued onto the session's pending bundle and consumed on the next
+    LLM call.
+    """
+    payload = {"text": prompt, "actor_id": actor_id}
+    if attachments:
+        payload["attachments"] = list(attachments)
+    session = runtime.get_session(session_key)
+    out = runtime.handle_action(session_key, "send_text", payload, user_driven=False)
+    if out.ok and not out.data.get("queued") and runtime.db and session.conversation_id:
+        # Hold the session lock so the post-turn full-history write is
+        # atomic with respect to any concurrent action targeting the
+        # same session_key.
+        with session.lock:
+            if runtime.sessions.get(session_key) is session and not session.in_flight:
+                if not session.has_compaction_checkpoint:
+                    runtime.db.replace_conversation_messages(session.conversation_id, list(session.history))
+                persist_marker(runtime, session)
+    final_text = "\n".join(m for m in out.messages if m).strip()
+    # SESSION_TURN_COMPLETED is emitted per drive by _drive_agent_turn (the
+    # single site both foreground and background turns flow through); this
+    # helper only enriches the result for its callers.
+    out.data.update({
+        "session_key": session_key,
+        "conversation_id": session.conversation_id if session else None,
+        "final_text": final_text,
+        "new_messages": list(out.data.get("new_messages") or []),
+        "attachments": list(out.attachments),
+    })
+
+    # Background notification: replay the final answer when notifications
+    # are on. Foreground turns are skipped because the reply is already
+    # visible in the active session.
+    if (out.ok and session is not None
+            and session.notification_mode == "on"
+            and not runtime.is_attended(session_key)
+            and final_text):
+        emit_fallback_push(
+            session_key=session_key,
+            conversation_id=session.conversation_id,
+            title=conversation_title(runtime, session.conversation_id) if session.conversation_id else "",
+            final_text=final_text,
+            db=runtime.db,
+            user_id=session.user_id,
+        )
+    return out
+
+
+def inject_user_message(
+    runtime,
+    session_key: str,
+    text: str,
+    *,
+    conversation_id: int | None = None,
+    actor_id: str = "user",
+):
+    """Append a user-authored message without driving the agent turn."""
+    from runtime.session import RuntimeResult
+
+    if conversation_id is not None:
+        session = runtime.sessions.get(session_key)
+        if session is None or session.conversation_id != conversation_id:
+            session = load_conversation(runtime, session_key, conversation_id)
+    else:
+        session = get_or_create_session(runtime, session_key)
+        ensure_conversation(runtime, session)
+    msg = {"role": "user", "content": text}
+    with session.lock:
+        session.history.append(msg)
+        if runtime.db and session.conversation_id:
+            save_history_message(runtime.db, session.conversation_id, msg)
+        bus.emit(SESSION_MESSAGE, {
+            "session_key": session.key,
+            "role": "user",
+            "content": text,
+            "actor_id": actor_id,
+        })
+        persist_marker(runtime, session)
+    return RuntimeResult(data={"conversation_id": session.conversation_id})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Session disposal + restart recovery
+# ──────────────────────────────────────────────────────────────────────
+
+def close_session(runtime, session_key: str) -> bool:
+    """Close an idle session; return False if absent or still owned by work."""
+    try:
+        with idle_bindings(runtime, session_key=session_key):
+            return _close_session(runtime, session_key)
+    except SessionBusy:
+        return False
+
+
+def _close_session(runtime, session_key: str) -> bool:
+    """Remove a session after idle_bindings has secured its state and binding."""
+    with runtime._sessions_lock:
+        closed = runtime.sessions.pop(session_key, None)
+        existed = closed is not None
+    # Don't leave active_session_key dangling at a closed session: is_attended()
+    # compares against it, so a stale pointer would mark every *other* live
+    # session unattended (replies become notifications, interactive tools
+    # refused) until some action happens to reset it.
+    if runtime.active_session_key == session_key:
+        runtime.active_session_key = None
+    if existed:
+        announce_conversation_ended(
+            runtime, session_key,
+            getattr(closed, "conversation_id", None), "closed")
+        bus.emit(SESSION_CLOSED, {"session_key": session_key})
+    return existed
+
+
+def restore_pending_requests(runtime, session: RuntimeSession) -> None:
+    """Re-emit ``approval_requested`` events for any phase frames that were
+    mid-flight when the session was last persisted, so frontend adapters
+    can re-register them in their pending-request tables and re-prompt
+    the user.
+    """
+    if not runtime.emit_event:
+        return
+    frames = session.cs.cache.get("phases", []) if isinstance(session.cs.cache, dict) else []
+    for frame in frames:
+        if getattr(frame, "phase", None) != PHASE_APPROVING_REQUEST:
+            continue
+        data = getattr(frame, "data", {}) or {}
+        if not data.get("request_id"):
+            data["request_id"] = f"approve_{uuid.uuid4().hex}"
+        req = StateMachineApprovalRequest(
+            title=data.get("title") or frame.name or "Input required",
+            body=data.get("prompt") or "",
+            pending_action=data.get("pending"),
+            id=data["request_id"],
+            type=data.get("type", "boolean"),
+            enum=data.get("enum"),
+            enum_labels=data.get("enum_labels"),
+            default=data.get("default"),
+        )
+        req.metadata.update({"session_key": session.key, "conversation_id": session.conversation_id})
+        if detail := data.get("detail"):
+            req.metadata["detail"] = detail
+        runtime._approval_requests.setdefault(req.id, req)
+        runtime.emit_event("approval_requested", req)
+
+
+def restore_pending_form(runtime, session: RuntimeSession) -> None:
+    """Re-emit a ``form_requested`` event if the restored session is sitting on
+    a suspended command/tool form, so the frontend can re-prompt the current
+    field. The return-value render path only fires on a live submit(); after a
+    restart there is none, so this mirrors ``restore_pending_requests``."""
+    if not runtime.emit_event:
+        return
+    from runtime.dispatch import decorate_form
+    from runtime.session import RuntimeResult
+
+    out = RuntimeResult()
+    decorate_form(session, out)
+    if out.form:
+        runtime.emit_event("form_requested", {"session_key": session.key, "form": dict(out.form)})
+
+
+def recover_marker(marker: dict[str, Any]) -> tuple[dict[str, Any], list[dict], bool]:
+    """Normalize stale persisted runtime state before rebuilding a session.
+
+    Notices come back as ``{title, body}`` rather than sentences, because they
+    are raised as notifications: what they report is the *system* recovering
+    from a crash, not an answer to anything the reader just did. They used to
+    be strings glued onto the end of "Loaded conversation: X" with ``+=``,
+    which put a confirmation and a crash report in one blob and made the second
+    one look like a footnote to the first.
+    """
+    marker = dict(marker or {})
+    cache = dict(marker.get("cache") or {})
+    phases = list(cache.get("phases") or [])
+    notices: list[dict] = []
+    changed = False
+
+    if marker.get("busy") or (marker.get("turn_priority") == "agent"
+                              and marker.get("phase", BASE_PHASE) == BASE_PHASE
+                              and not phases):
+        notices.append({
+            "title": "Turn interrupted",
+            "body": "An earlier agent turn in this conversation was interrupted "
+                    "before it finished. Send a message to continue.",
+        })
+        marker.update({"busy": False, "turn_priority": "user", "phase": BASE_PHASE})
+        cache["phases"] = []
+        changed = True
+    else:
+        kept = []
+        expired = 0
+        for frame in phases:
+            if _frame_phase(frame) == PHASE_APPROVING_REQUEST and not _replayable_pending(_frame_data(frame).get("pending")):
+                expired += 1
+                continue
+            kept.append(frame)
+        if expired:
+            notices.append({
+                "title": "Turn lost",
+                "body": "An earlier agent turn in this conversation was lost. "
+                        "Send a message to continue.",
+            })
+            cache["phases"] = kept
+            marker["phase"] = _frame_phase(kept[-1]) if kept else BASE_PHASE
+            marker["turn_priority"] = _frame_actor(kept[-1]) if kept else "user"
+            changed = True
+
+    marker["cache"] = cache
+    return marker, notices, changed
+
+
+def _frame_phase(frame) -> str | None:
+    return frame.get("phase") if isinstance(frame, dict) else getattr(frame, "phase", None)
+
+
+def _frame_actor(frame) -> str:
+    return (frame.get("actor_id") if isinstance(frame, dict) else getattr(frame, "actor_id", None)) or "user"
+
+
+def _frame_data(frame) -> dict[str, Any]:
+    return (frame.get("data") if isinstance(frame, dict) else getattr(frame, "data", None)) or {}
+
+
+def _replayable_pending(pending) -> bool:
+    return isinstance(pending, dict) and pending.get("type") and pending.get("actor_id") and isinstance(pending.get("content"), dict)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Marker + conversation-row helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def persist_marker(runtime, session: RuntimeSession) -> None:
+    """Snapshot the session's state machine into a system message row.
+
+    Two-marker turns (``busy=True`` before, ``busy=False`` after) are how
+    we recover from crashes mid-turn — see ``runtime_dispatch``.
+    """
+    if (runtime.db and session.conversation_id
+            and runtime.sessions.get(session.key) is session):
+        save_state_marker(runtime.db, session.conversation_id, session.to_marker())
+
+
+def conversation_title(runtime, conversation_id: int) -> str:
+    """Handle conversation title."""
+    row = runtime.db.get_conversation(conversation_id) if runtime.db else None
+    return ((row or {}).get("title") or "").strip() or "New Conversation"
+
+
+def ensure_conversation(runtime, session: RuntimeSession) -> None:
+    """Give this session a conversation if it has none, and adopt what it said.
+
+    **This is how conversations come into being.** A session holds none until
+    somebody sends a message, which is what keeps a conversation nobody used
+    from existing at all — there is no blank row to reclaim, because none was
+    made. Everything else about a session already works without one: commands
+    run, the security mode binds late, and every writer keyed on
+    ``conversation_id`` guards.
+
+    The title is the placeholder, deliberately, and briefly was not. Naming the
+    row after the first message reads better for the few seconds before
+    anything else happens, and it costs the only real titler its trigger: the
+    ``update_titles`` package replaces a title that still looks
+    kernel-generated and leaves anything else alone, which is what protects a
+    rename you made yourself. A first-message title is not distinguishable from
+    one you chose, so the sweep skipped every conversation forever and every
+    title stayed the opening sentence, truncated at eighty characters.
+
+    Two things it must do that a bare ``db.create_conversation`` does not.
+
+    It goes through ``runtime.create_conversation``, which is the only site
+    that writes the ``conversation_create`` ledger row and emits
+    ``CONVERSATION_CHANGED``. Reaching past it was survivable while this was a
+    rare path; as *the* path it would mean the flight recorder never recording
+    a conversation starting, and a client's list never learning of one.
+
+    And it writes back ``session.history``, because a session can have said
+    things before it had anywhere to put them — a ``command_note`` from
+    ``reveal_user_commands``, text that did not drive a turn. Those rows live
+    in memory only, and the writer that would have persisted them
+    (``absorb_user_action``) has already run and skipped them. Left alone they
+    reach the model but not the table, so the stored transcript begins partway
+    through a conversation the agent remembers all of.
+    """
+    if session.conversation_id is not None or not runtime.db:
+        return
+    session.conversation_id = runtime.create_conversation(
+        user_id=runtime.session_user_id(session.key),
+    )
+    if session.conversation_id is None:
+        return
+    if session.history:
+        runtime.db.replace_conversation_messages(
+            session.conversation_id, list(session.history))
+    announce_session_conversation(runtime, session)
+
+
+def announce_conversation_ended(runtime, session_key: str,
+                                conversation_id: int | None,
+                                reason: str) -> None:
+    """Emit SESSION_CONVERSATION_ENDED for the conversation being left.
+
+    The counterpart to ``announce_session_conversation``, which names the
+    conversation being switched *to* — right for a frontend redrawing "where am
+    I?", useless to anything treating a conversation as a unit of work, since
+    the id it needs is the one that just went quiet.
+
+    Called from every path where a session lets go of a conversation. Best
+    effort on purpose: a subscriber that raises must not take the switch, the
+    close, or the delete down with it.
+    """
+    if not conversation_id:
+        return
+    try:
+        bus.emit(SESSION_CONVERSATION_ENDED, {
+            "session_key": session_key,
+            "conversation_id": int(conversation_id),
+            "user_id": runtime.session_user_id(session_key),
+            "reason": reason,
+        })
+    except Exception:
+        logger.exception("SESSION_CONVERSATION_ENDED subscriber raised for %s",
+                         session_key)
+
+
+def announce_session_conversation(runtime, session: RuntimeSession) -> None:
+    """Emit SESSION_CONVERSATION_CHANGED for a session's current conversation.
+
+    Frontends with a persistent surface (Telegram's pinned banner, a window
+    title) mirror this instead of polling.
+    """
+    if session.conversation_id is None:
+        return
+    bus.emit(SESSION_CONVERSATION_CHANGED, {
+        "session_key": session.key,
+        "conversation_id": session.conversation_id,
+        "title": conversation_title(runtime, session.conversation_id),
+    })

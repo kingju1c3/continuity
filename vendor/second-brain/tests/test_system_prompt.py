@@ -1,0 +1,793 @@
+"""Memory prompt section: kernel-owned index only.
+
+Topic paths, validation and enumeration belong to the store memory tool.
+"""
+
+import pytest
+
+from agent.system_prompt import MEMORY_INDEX_CAP, _agent_memory
+
+
+@pytest.fixture
+def data_dir(tmp_path, monkeypatch):
+    import paths
+    monkeypatch.setattr(paths, "DATA_DIR", tmp_path)
+    return tmp_path
+
+
+def test_empty_install_shows_empty_index(data_dir):
+    text = _agent_memory()
+    assert "## Your memory" in text
+    assert "(empty)" in text
+
+
+def test_index_inlined_without_reading_topic_files(data_dir):
+    root = data_dir / "workspace" / "memory"
+    root.mkdir(parents=True)
+    (root / "MEMORY.md").write_text("- [proj](proj.md) - the project", encoding="utf-8")
+    (root / "proj.md").write_text("SECRET TOPIC BODY", encoding="utf-8")
+    text = _agent_memory()
+    assert "- [proj](proj.md) - the project" in text
+    assert "SECRET TOPIC BODY" not in text
+    assert "Topic files:" not in text
+
+
+def test_a_runaway_index_cannot_grow_the_prompt_without_bound(data_dir):
+    """What the index says is the agent's business; what it costs is not.
+
+    This text is inlined on every call, so an index nobody prunes would push
+    the prompt over on its own. Truncation is visible so the agent can see
+    that its own index has outgrown the window.
+    """
+    from agent.system_prompt import MEMORY_INDEX_CAP
+
+    root = data_dir / "workspace" / "memory"
+    root.mkdir(parents=True)
+    (root / "MEMORY.md").write_text("- [x](x.md) - filler\n" * 2000,
+                                    encoding="utf-8")
+
+    text = _agent_memory()
+
+    assert len(text) < MEMORY_INDEX_CAP + 500
+    assert "prune MEMORY.md" in text
+
+
+def test_the_cap_is_a_setting_so_a_curator_can_learn_it(data_dir):
+    """The budget has two readers and neither may hold its own copy.
+
+    Whatever curates ``MEMORY.md`` has to prune it to the same figure the
+    kernel truncates at, and a sandboxed plugin cannot import this module to
+    find out — so the number lives in config, where both sides can read it.
+    A constant on each side is the drift this arrangement exists to prevent.
+    """
+    from config.config_data import SETTINGS_DATA
+
+    declared = {entry[1]: entry[3] for entry in SETTINGS_DATA}
+    assert declared["memory_index_cap"] == MEMORY_INDEX_CAP, (
+        "the fallback constant and the declared default must agree")
+
+    root = data_dir / "workspace" / "memory"
+    root.mkdir(parents=True)
+    (root / "MEMORY.md").write_text("- fact\n" * 500, encoding="utf-8")
+
+    tight = _agent_memory({"memory_index_cap": 200})
+    loose = _agent_memory({"memory_index_cap": 3000})
+
+    assert "truncated at 200 characters" in tight
+    assert "truncated at 3000 characters" in loose
+    assert len(tight) < len(loose)
+
+
+def test_an_index_under_the_cap_is_untouched(data_dir):
+    root = data_dir / "workspace" / "memory"
+    root.mkdir(parents=True)
+    (root / "MEMORY.md").write_text("- [proj](proj.md) - the project",
+                                    encoding="utf-8")
+
+    text = _agent_memory()
+
+    assert "- [proj](proj.md) - the project" in text
+    assert "truncated" not in text
+
+
+def test_no_plugin_guidance_in_kernel_section(data_dir):
+    (data_dir / "workspace" / "memory").mkdir(parents=True)
+    assert "`memory` tool" not in _agent_memory()
+
+
+# ────────────────────────────────────────────────────────────────────
+# Capability gating (was test_system_prompt_capabilities.py)
+# ────────────────────────────────────────────────────────────────────
+
+from types import SimpleNamespace
+from agent.system_prompt import _model_status
+
+
+def test_filesystem_access_distinguishes_the_two_write_grants(monkeypatch, tmp_path):
+    """Both are grants, and neither is stated as a restriction.
+
+    The workspace is the agent's own and the configured folders are shared —
+    the user opened them, which *is* the permission. Only what is outside both
+    is described as costing anything.
+    """
+    from agent.system_prompt import _filesystem_access
+    import paths
+
+    monkeypatch.setattr(paths, "DATA_DIR", tmp_path / "data")
+    user_project = tmp_path / "user-project"
+    text = _filesystem_access({"fs_writable_dirs": [str(user_project)]})
+
+    assert f"Your workspace, written freely and without asking: {tmp_path / 'data' / 'workspace'}" in text
+    assert "Shared folders the user has opened to you" in text
+    assert "You may write in these too" in text
+    assert str(user_project) in text
+    assert "remain protected" in text
+
+
+def test_filesystem_access_names_an_empty_grant(monkeypatch, tmp_path):
+    from agent.system_prompt import _filesystem_access
+    import paths
+
+    monkeypatch.setattr(paths, "DATA_DIR", tmp_path / "data")
+    assert "- None configured." in _filesystem_access({})
+
+
+# ────────────────────────────────────────────────────────────────────
+# The kernel's own live readouts, and which block each lands in
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_every_mode_is_named_including_the_default(data_dir):
+    """An agent told about three modes and never which one it is in has been
+    given half of something.
+
+    ``prompt_note`` is still empty for ``ask`` — the default needs no
+    *explaining*. Naming it is this section's job, and the two must not be
+    confused: the failure they prevent is different in each direction. An
+    unnamed default leaves the agent guessing; an explained one is tokens
+    spent restating the obvious on every turn.
+    """
+    from agent.system_prompt import _permission_mode
+
+    # Neutral wording on purpose — the mode belongs to the conversation, not
+    # to the agent, so this is the one readout that is not "Your ...".
+    assert "Mode for this conversation: `ask`." in _permission_mode("ask")
+    assert "Mode for this conversation: `lockdown`." in _permission_mode("lockdown")
+    assert "Mode for this conversation: `yolo`." in _permission_mode("yolo")
+    # The extra guidance rides inside the section, not as a heading of its own.
+    assert _permission_mode("lockdown").count("## ") == 1
+
+
+def test_the_profile_speaks_under_one_heading(data_dir):
+    """The name, the tool limit and the profile's own instructions together.
+
+    These were three items in two halves of the block, and the ``prompt_suffix``
+    was last of all with nothing above it — so the model read the profile's
+    instructions as an unattributed paragraph and could not tell whose they
+    were. That is exactly the kind of line nobody can explain the presence of.
+    """
+    from agent.system_prompt import _agent_profile
+    from runtime.agent_scope import AgentScope
+
+    scope = AgentScope(profile_name="research",
+                       prompt_suffix="Cite every claim.",
+                       tools_allow={"read_file"})
+    text = _agent_profile("research", scope)
+
+    assert text.count("## ") == 1
+    assert "Profile name: research." in text
+    assert "Specific instructions from this profile:" in text
+    assert "Cite every claim." in text
+    assert "limited to the tools exposed in this prompt" in text
+
+
+def test_an_unscoped_profile_says_only_its_name(data_dir):
+    from agent.system_prompt import _agent_profile
+
+    text = _agent_profile("default", None)
+    assert text == "## Your agent profile\nProfile name: default."
+
+
+def test_no_count_means_no_line(data_dir):
+    """``None`` means *the provider did not say*, which is not zero.
+
+    With no count there is nothing measured, so there is nothing to report —
+    and a fabricated zero is worse than silence, because it is the number an
+    agent would decide it had room on.
+    """
+    from agent.system_prompt import _context_usage
+
+    assert _context_usage(None, 200000) == ""
+    assert _context_usage(0, 200000) == ""
+
+
+def test_an_unknown_window_drops_the_comparison_not_the_count(data_dir):
+    """A missing denominator is not a missing measurement.
+
+    ``llm_context_size`` is 0 on any profile nobody set it on, which is the
+    common case — ``/setup`` defaults it to 0. The count is still true, so the
+    line renders without the fraction rather than being thrown away for the
+    sake of the half that is absent. "of 0 tokens" would be a window nobody
+    has.
+    """
+    from agent.system_prompt import _context_usage
+
+    text = _context_usage(312, 0)
+
+    assert text == "Context: about 312 tokens at the start of this turn."
+    assert "0" not in text.replace("312", "")
+
+
+def test_a_known_window_is_reported_as_a_fraction(data_dir):
+    from agent.system_prompt import _context_usage
+
+    assert "71,204 of 200,000 tokens (36%)" in _context_usage(71204, 200000)
+
+
+def test_the_context_line_says_when_it_was_measured(data_dir):
+    """It is the *previous* call's count, frozen at the turn's start.
+
+    An agent reading a number that lags the transcript it can see will distrust
+    the block it came in. Saying so costs six words.
+    """
+    from agent.system_prompt import _context_usage
+
+    assert "at the start of this turn" in _context_usage(10, 100)
+
+
+def test_the_session_section_names_the_frontend(data_dir):
+    from agent.system_prompt import PromptContext, _session_facts
+
+    text = _session_facts(PromptContext(frontend_name="telegram"))
+
+    assert "## This session" in text
+    assert "Frontend: telegram" in text
+
+
+def test_a_session_with_no_frontend_says_so(data_dir):
+    """A drive with no surface is a background or subagent conversation, and
+    that is worth stating rather than leaving as a missing line — a section
+    that silently omits its first fact reads as a section with nothing to
+    say."""
+    from agent.system_prompt import PromptContext, _session_facts
+
+    text = _session_facts(PromptContext(frontend_name=None))
+
+    assert "Frontend: none" in text
+    assert "background or subagent" in text
+
+
+def test_the_session_section_reports_what_the_surface_can_show(data_dir):
+    """Only the capabilities with an agent-side decision behind them.
+
+    Whether a file it produces can be displayed changes what the agent should
+    *do*; whether the transport streams does not.
+    """
+    from agent.system_prompt import PromptContext, _session_facts
+
+    frontend = SimpleNamespace(
+        user_binding="per_user",
+        capabilities=SimpleNamespace(
+            supports_attachments_in=True, supports_attachments_out=False,
+            supports_rich_text=True, supports_buttons=False,
+            supports_inline_forms=True, supports_streaming=True))
+
+    text = _session_facts(PromptContext(frontend_name="web"), frontend)
+
+    assert "Can send you files: yes." in text
+    assert "Can display files you produce: no." in text
+    assert "Renders markdown: yes." in text
+    # Either half of the pair is enough to answer the question.
+    assert "Buttons and inline forms: yes." in text
+    assert "each identity its own account" in text
+    assert "streaming" not in text.lower()
+
+
+def test_first_met_is_scoped_to_this_user(tmp_path):
+    """The fact is about the relationship, not about the disk.
+
+    A global minimum would frequently be somebody else's first conversation on
+    a ``per_user`` frontend, which is the same words measuring a different
+    thing — the worst kind of wrong line, because nothing about it looks wrong.
+    """
+    import agent.system_prompt as sp
+    from pipeline.database import Database
+
+    db = Database(str(tmp_path / "met.db"))
+    older = db.create_conversation("theirs")
+    db.conn.execute("UPDATE conversations SET user_id = 2, created_at = ? "
+                    "WHERE id = ?", (1_600_000_000.0, older))
+    mine = db.create_conversation("mine")
+    db.conn.execute("UPDATE conversations SET user_id = 1, created_at = ? "
+                    "WHERE id = ?", (1_700_000_000.0, mine))
+    db.conn.commit()
+    sp._first_met_memo.clear()
+
+    assert "2023" in sp._first_met(db, 1)
+    assert "2020" in sp._first_met(db, 2)
+
+
+def test_first_met_is_absent_rather_than_guessed(tmp_path):
+    """No user and no conversations are both "" — never a fallback figure.
+
+    The bootstrap prompt and ``dev/dump_agent_text.py`` both build without a
+    session, and a line that quietly widened its scope to cover that case would
+    be measuring the installation while claiming to measure the user.
+    """
+    import agent.system_prompt as sp
+    from pipeline.database import Database
+
+    db = Database(str(tmp_path / "empty.db"))
+    sp._first_met_memo.clear()
+
+    assert sp._first_met(db, None) == ""
+    assert sp._first_met(None, 1) == ""
+    assert sp._first_met(db, 1) == ""
+
+
+def test_an_empty_first_met_is_not_memoized(tmp_path):
+    """A brand new user must not be silent for the life of the process.
+
+    Caching the real answer is free — it moves only when retention prunes that
+    user's oldest conversation. Caching the *absence* means the first
+    conversation somebody ever has is the one the prompt never mentions.
+    """
+    import agent.system_prompt as sp
+    from pipeline.database import Database
+
+    db = Database(str(tmp_path / "late.db"))
+    sp._first_met_memo.clear()
+    assert sp._first_met(db, 1) == ""
+
+    first = db.create_conversation("first")
+    db.conn.execute("UPDATE conversations SET user_id = 1, created_at = ? "
+                    "WHERE id = ?", (1_700_000_000.0, first))
+    db.conn.commit()
+
+    assert "2023" in sp._first_met(db, 1)
+
+
+def test_the_kernel_readouts_land_in_the_block_that_matches_them(data_dir):
+    """The split is by what moves, and every kernel section has to obey it too.
+
+    The machine and the session are settled before the conversation starts, so
+    they ride in the cacheable position-0 message. The mode, the model, the
+    profile and the conversation move within one, so they ride in the block
+    that is rebuilt each turn. This is the same rule ``prompt_cues`` enforces
+    for plugins, applied to the sections the kernel writes itself.
+    """
+    system, dynamic = _sections_with([])
+    prefix, volatile = system["content"], dynamic["content"]
+
+    for heading in ("## This computer", "## Where you can write",
+                    "## The user's sync directories", "## This session"):
+        assert heading in prefix, heading
+        assert heading not in volatile, heading
+
+    for heading in ("## Permission mode", "## Your LLM model",
+                    "## Your agent profile", "## Your memory",
+                    "## Right now"):
+        assert heading in volatile, heading
+        assert heading not in prefix, heading
+
+
+def test_the_context_figure_is_frozen_for_the_turn(tmp_path):
+    """The same fix the clock got, for the same cost.
+
+    The dynamic block is merged into the latest user message, which in an
+    agentic run is the *first* one — so it sits ahead of the whole tool-call
+    transcript and a figure that climbed with each model call would re-bill
+    every row behind it. ``last_prompt_tokens`` therefore moves on every call
+    and the prompt reads ``turn_prompt_tokens``, which only
+    ``HookRegistry.start_turn`` writes.
+
+    Driven through a real session rather than by calling the renderer, because
+    the freeze is a property of *where the copy happens* and a unit test of
+    ``_context_usage`` cannot see it.
+    """
+    import state_machine  # noqa: F401 — break the runtime<->state_machine cycle
+    from runtime.hooks import HookRegistry
+    from runtime.runtime_config import session_system_prompt
+    from tests.support import make_runtime
+
+    runtime, session, llm = make_runtime(
+        tmp_path, config={"llm_profiles": {}, "default_llm_profile": ""})
+    llm.context_size = 200_000
+    runtime.services["llm"] = llm
+
+    def context_line():
+        sections = session_system_prompt(runtime, session)()
+        body = "\n".join(m.get("content") or "" for m in sections)
+        return next((line for line in body.splitlines()
+                     if line.startswith("Context: ")), "")
+
+    hooks = HookRegistry()
+    session.last_prompt_tokens = 20_000
+    hooks.start_turn(session, runtime)
+    first = context_line()
+
+    # Mid-turn growth: what the last call billed moves, what the prompt shows
+    # does not.
+    session.last_prompt_tokens = 90_000
+    assert context_line() == first
+    assert "20,000" in first
+
+    hooks.start_turn(session, runtime)
+    assert "90,000" in context_line()
+
+
+def test_model_status_reports_effective_native_attachment_capabilities():
+    # A modality counts only when both halves agree: the model ingests it
+    # (capabilities) and the backend can put it on the wire (native_modalities).
+    brain = SimpleNamespace(
+        model_name="MiniMax-M3",
+        capabilities={"image": True, "audio": True, "video": False},
+        native_modalities={"image", "video"},
+    )
+
+    status = _model_status(brain)
+
+    assert "Model name: MiniMax-M3." in status
+    assert "images: yes" in status
+    assert "audio: no" in status      # model reads it, backend cannot send it
+    assert "video: no" in status      # backend sends it, model cannot read it
+
+
+def test_model_status_reports_unavailable_without_llm():
+    assert _model_status(None) == "## Your LLM model\nModel name: unavailable."
+
+
+def test_model_status_reads_the_attributes_brain_actually_publishes():
+    """The names in the prompt must be the names routing uses.
+
+    This asked a ``Brain`` for ``native_attachment_modalities``, which no Brain
+    has ever had. ``getattr`` answered its default, so every model was told it
+    was blind while ``_route_attachments`` sent it images perfectly well. No
+    ``SimpleNamespace`` fake can catch that — a fake has whatever attribute the
+    test gives it — so pin the real class instead.
+    """
+    from llm.registry import Brain
+
+    for attr in ("model_name", "capabilities", "native_modalities"):
+        assert isinstance(getattr(Brain, attr, None), property), attr
+
+
+def test_session_prompt_names_the_profile_pinned_llm(tmp_path):
+    # End to end: a session whose profile pins a non-default LLM gets that
+    # model in its prompt's model-status line, not the router default.
+    import state_machine  # noqa: F401 — break the runtime<->state_machine import cycle
+    from runtime.conversation_runtime import ConversationRuntime
+    from runtime.runtime_config import session_system_prompt
+
+    pinned = SimpleNamespace(model_name="minimax/MiniMax-M3", loaded=True,
+                             capabilities={}, native_modalities=set())
+    router = SimpleNamespace(model_name="deepseek/deepseek-chat", loaded=True,
+                             capabilities={}, native_modalities=set())
+    from pipeline.database import Database
+    db = Database(str(tmp_path / "prompt.db"))
+    rt = ConversationRuntime(
+        db=db,
+        services={"llm": router, "minimax/MiniMax-M3": pinned},
+        config={"agent_profiles": {"research": {"llm": "minimax/MiniMax-M3"}},
+                "llm_profiles": {"minimax/MiniMax-M3": {}},
+                "default_llm_profile": "deepseek/deepseek-chat"},
+    )
+    session = rt.load_conversation("s", db.create_conversation("x"))
+    session.profile_override = "research"
+    prompt = session_system_prompt(rt, session)()
+    dynamic = prompt[1]["content"]
+    assert "minimax/MiniMax-M3" in dynamic.split("Model name:")[1].splitlines()[0]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Which block a plugin's guidance lands in
+# ────────────────────────────────────────────────────────────────────
+
+
+def _prompting_tools():
+    """Two tools contributing the same guidance in the two allowed shapes."""
+    fixed = SimpleNamespace(name="fixed", description="", parameters={},
+                            agent_prompt="GUIDANCE-FROM-A-STRING")
+    live = SimpleNamespace(name="live", description="", parameters={},
+                           agent_prompt=lambda ctx: "GUIDANCE-FROM-A-METHOD")
+    return fixed, live
+
+
+def _sections_with(tools):
+    """Build a prompt whose only in-scope plugins are these tools."""
+    from agent.system_prompt import build_prompt_sections
+
+    registry = SimpleNamespace(_visible_tools=lambda: list(tools), tools={})
+    return build_prompt_sections(None, None, registry, {})
+
+
+def test_a_fixed_contribution_stays_in_the_cacheable_prefix(data_dir):
+    """A string is settled at load, so it belongs in the position-0 message.
+
+    That message is the one providers cache across a conversation; text that
+    cannot change has no reason to leave it.
+    """
+    fixed, _ = _prompting_tools()
+    system, dynamic = _sections_with([fixed])
+
+    assert "GUIDANCE-FROM-A-STRING" in system["content"]
+    assert "GUIDANCE-FROM-A-STRING" not in dynamic["content"]
+
+
+def test_a_live_contribution_rides_in_the_dynamic_block(data_dir):
+    """A method exists because its answer moves — so it must not sit in the prefix.
+
+    Left in the position-0 message, every refresh would rewrite the one thing
+    the provider caches, and the fix for staleness would cost a cache miss on
+    every subsequent call of the conversation. This is the same argument
+    ``_mode_suffix`` makes for itself in ``runtime/runtime_config.py``.
+    """
+    _, live = _prompting_tools()
+    system, dynamic = _sections_with([live])
+
+    assert "GUIDANCE-FROM-A-METHOD" in dynamic["content"]
+    assert "GUIDANCE-FROM-A-METHOD" not in system["content"]
+
+
+def test_live_native_prompt_context_includes_session_and_mode(data_dir):
+    from agent.system_prompt import build_prompt_sections
+
+    live = SimpleNamespace(
+        name="live", description="", parameters={},
+        agent_prompt=lambda ctx: f"SESSION={ctx.session_key} MODE={ctx.security_mode}",
+    )
+    registry = SimpleNamespace(_visible_tools=lambda: [live], tools={})
+    _, dynamic = build_prompt_sections(
+        None, None, registry, {}, session_key="chat", security_mode="lockdown")
+
+    assert "SESSION=chat MODE=lockdown" in dynamic["content"]
+
+
+def _cued_tool(name, cue, text):
+    """A live-shaped tool declaring which rung its text follows."""
+    return SimpleNamespace(name=name, description="", parameters={},
+                           agent_prompt=lambda ctx: text,
+                           agent_prompt_refresh=cue)
+
+
+def test_a_config_cued_contribution_rides_in_the_cacheable_prefix(data_dir):
+    """The rung that actually moves text, and the point of the whole ladder.
+
+    A method whose answer follows configuration cannot change within a
+    conversation, so there is nothing for it to gain from the volatile end of
+    the prompt — and a great deal to lose, since the dynamic block is rebuilt
+    and re-read on every call of the turn.
+    """
+    tool = _cued_tool("stable", "config", "GUIDANCE-FROM-A-CONFIG-CUE")
+    system, dynamic = _sections_with([tool])
+
+    assert "GUIDANCE-FROM-A-CONFIG-CUE" in system["content"]
+    assert "GUIDANCE-FROM-A-CONFIG-CUE" not in dynamic["content"]
+
+
+def test_a_session_cued_contribution_stays_in_the_dynamic_block(data_dir):
+    """The threshold's other side: a mode can change mid-conversation."""
+    tool = _cued_tool("live", "session", "GUIDANCE-FROM-A-SESSION-CUE")
+    system, dynamic = _sections_with([tool])
+
+    assert "GUIDANCE-FROM-A-SESSION-CUE" in dynamic["content"]
+    assert "GUIDANCE-FROM-A-SESSION-CUE" not in system["content"]
+
+
+def test_contributions_are_ordered_rarest_first(data_dir):
+    """Within a block, the stable end comes first.
+
+    That is what a prefix-caching provider reads from: everything before the
+    first byte that changed is reused, so text that moves belongs after text
+    that does not.
+    """
+    tools = [_cued_tool("c", "write", "RUNG-WRITE"),
+             _cued_tool("a", "turn", "RUNG-TURN"),
+             _cued_tool("b", "session", "RUNG-SESSION")]
+    _, dynamic = _sections_with(tools)
+    body = dynamic["content"]
+
+    assert (body.index("RUNG-SESSION") < body.index("RUNG-TURN")
+            < body.index("RUNG-WRITE"))
+
+
+def test_contributions_on_one_rung_keep_their_reading_order(data_dir):
+    """The sort is stable, and that property is invisible without a test.
+
+    ``_in_scope`` orders the populations deliberately — tools, then services,
+    tasks, commands, the frontend — and a sort that reshuffled ties would
+    scramble it for the rung most plugins are on.
+    """
+    tools = [_cued_tool("first", "write", "TIE-FIRST"),
+             _cued_tool("second", "write", "TIE-SECOND"),
+             _cued_tool("third", "write", "TIE-THIRD")]
+    _, dynamic = _sections_with(tools)
+    body = dynamic["content"]
+
+    assert body.index("TIE-FIRST") < body.index("TIE-SECOND") < body.index("TIE-THIRD")
+
+
+def test_a_string_shape_ignores_a_cue_it_declares(data_dir):
+    """The shape decides first, so a fixed string cannot be talked out of the prefix."""
+    tool = SimpleNamespace(name="confused", description="", parameters={},
+                           agent_prompt="GUIDANCE-FROM-A-CONFUSED-PLUGIN",
+                           agent_prompt_refresh="write")
+    system, dynamic = _sections_with([tool])
+
+    assert "GUIDANCE-FROM-A-CONFUSED-PLUGIN" in system["content"]
+    assert "GUIDANCE-FROM-A-CONFUSED-PLUGIN" not in dynamic["content"]
+
+
+# The static prompt's wording is deliberately unpinned: it is authored prose,
+# and a test asserting phrases in it argues with whoever wrote it. What is
+# pinned is everything around it — which block each section lands in, what the
+# kernel contributes, and that the file is read at all.
+
+
+def test_both_shapes_are_collected_when_both_are_present(data_dir):
+    """The partition splits the populations; it must not drop half of them.
+
+    Enumerating in-scope plugins once and collecting twice is the kind of
+    refactor where one shape silently stops arriving — the exact failure mode
+    ``_collect``'s tolerance of two shapes exists to prevent.
+    """
+    fixed, live = _prompting_tools()
+    system, dynamic = _sections_with([fixed, live])
+
+    assert "GUIDANCE-FROM-A-STRING" in system["content"]
+    assert "GUIDANCE-FROM-A-METHOD" in dynamic["content"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The turn-stable clock
+#
+# The dynamic block is merged into the latest user-led turn, which in an
+# agentic run is the *first* message — so it sits ahead of the whole tool-call
+# transcript and anything volatile in it re-bills every row behind it. The
+# clock was the one contributor moving on a schedule unrelated to anything the
+# agent did, and ``%I:%M %p`` is fixed width, so a rollover changed the prefix
+# and not the length. These pin that it is now rendered once per turn, and —
+# more importantly — that freezing it did not freeze anything else.
+# ──────────────────────────────────────────────────────────────────────────
+
+class _FakeClock:
+    """Stands in for ``datetime`` with a hand-advanced wall clock."""
+
+    def __init__(self, start):
+        self._now = start
+
+    def advance(self, **kwargs):
+        from datetime import timedelta
+        self._now = self._now + timedelta(**kwargs)
+
+    def now(self):
+        return self._now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A fake wall clock and monotonic, with the memo reset around the test."""
+    from datetime import datetime as real_datetime
+
+    import agent.system_prompt as sp
+
+    sp._reset_turn_clock()
+    fake = _FakeClock(real_datetime(2026, 4, 20, 9, 59, 30))
+    elapsed = {"seconds": 0.0}
+    monkeypatch.setattr(sp, "datetime", fake)
+    monkeypatch.setattr(sp, "_monotonic", lambda: elapsed["seconds"])
+    fake.elapsed = elapsed
+    yield fake
+    sp._reset_turn_clock()
+
+
+def test_the_clock_is_byte_identical_across_two_calls_inside_one_turn(clock, data_dir):
+    """The whole point. The fake guarantees the rollover rather than waiting
+    for one, so this fails deterministically on the old code."""
+    _, first = _sections_with([])
+    clock.advance(minutes=1)
+    _, second = _sections_with([])
+
+    assert "09:59 AM" in first["content"]
+    assert first["content"] == second["content"]
+
+
+def test_a_new_turn_moves_the_clock(clock, data_dir):
+    """Turn-stable, not permanently frozen."""
+    import prompt_cues
+
+    _, first = _sections_with([])
+    clock.advance(minutes=1)
+    prompt_cues.fire(prompt_cues.TURN)
+    _, second = _sections_with([])
+
+    assert "09:59 AM" in first["content"]
+    assert "10:00 AM" in second["content"]
+
+
+def test_the_clock_cannot_go_stale_past_the_ceiling(clock, data_dir):
+    """A turn blocked on a person is unbounded. The ceiling converts that into
+    bounded staleness at the cost of one prefix reset per quarter hour."""
+    from agent.system_prompt import _CLOCK_CEILING_SECONDS
+
+    _, first = _sections_with([])
+    clock.advance(minutes=20)
+    clock.elapsed["seconds"] = _CLOCK_CEILING_SECONDS + 1
+    _, second = _sections_with([])
+
+    assert "09:59 AM" in first["content"]
+    assert "10:19 AM" in second["content"]
+
+
+def test_freezing_the_clock_did_not_freeze_the_block(clock, data_dir):
+    """The guard on the cue ladder, and the test that matters most here.
+
+    ``call`` never caches by construction. A tool declaring it must still see
+    its text rebuilt on every call — that is the ladder's contract, and a memo
+    that reached past its one line would silently override a plugin's own
+    declaration.
+    """
+    counter = {"n": 0}
+
+    def counting(ctx):
+        counter["n"] += 1
+        return f"LIVE-{counter['n']}"
+
+    tool = SimpleNamespace(name="live", description="", parameters={},
+                           agent_prompt=counting, agent_prompt_refresh="call")
+
+    _, first = _sections_with([tool])
+    _, second = _sections_with([tool])
+
+    assert "LIVE-1" in first["content"]
+    assert "LIVE-2" in second["content"]
+    assert first["content"] != second["content"]
+
+
+def test_only_the_clock_is_frozen_within_a_turn(clock, data_dir):
+    """Bounds the change. The agent must still see its own memory write inside
+    the turn that made it."""
+    memory = data_dir / "workspace" / "memory"
+    memory.mkdir(parents=True, exist_ok=True)
+    (memory / "MEMORY.md").write_text("- [Before](before.md)", encoding="utf-8")
+    _, first = _sections_with([])
+
+    clock.advance(minutes=1)
+    (memory / "MEMORY.md").write_text("- [After](after.md)", encoding="utf-8")
+    _, second = _sections_with([])
+
+    assert "Before" in first["content"]
+    assert "After" in second["content"]
+    assert "09:59 AM" in first["content"]
+    assert "09:59 AM" in second["content"]
+
+
+def test_the_static_prompt_is_re_read_when_the_file_moves(tmp_path, monkeypatch):
+    """The memo is behind a stat, so an edit is still picked up."""
+    import agent.system_prompt as sp
+
+    path = tmp_path / "system_prompt_static.md"
+    path.write_text("FIRST", encoding="utf-8")
+    monkeypatch.setattr(sp, "_STATIC_PROMPT_PATH", path)
+    monkeypatch.setattr(sp, "_static_memo", None)
+
+    assert sp._static_prompt() == "FIRST"
+    path.write_text("SECOND EDITION", encoding="utf-8")
+    assert sp._static_prompt() == "SECOND EDITION"
+
+
+def test_a_missing_static_prompt_still_raises_rather_than_serving_a_stale_one(
+        tmp_path, monkeypatch):
+    """Failing to stat must not quietly hand back the last good copy — a
+    missing prompt is a broken install and should say so."""
+    import agent.system_prompt as sp
+
+    path = tmp_path / "system_prompt_static.md"
+    path.write_text("PRESENT", encoding="utf-8")
+    monkeypatch.setattr(sp, "_STATIC_PROMPT_PATH", path)
+    monkeypatch.setattr(sp, "_static_memo", None)
+
+    assert sp._static_prompt() == "PRESENT"
+    path.unlink()
+    with pytest.raises(OSError):
+        sp._static_prompt()

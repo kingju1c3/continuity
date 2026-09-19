@@ -1,0 +1,842 @@
+"""Concrete state-machine actions.
+
+Every action follows the Poker Monster contract (see PokerMonsterRefactor.py):
+`is_legal()` checks the current actor/phase, `execute()` mutates state, and
+`enact()` combines both into a standardized ActionResult.
+
+The set of actions plays the role of PokerMonster's `Card`/`Action` subclasses:
+each one is a typed unit of behavior that the dispatch table in
+`action_map.py` routes to based on the current phase. Multi-step flows live
+on the phase stack (`cs.cache["phases"]`) — equivalent to PokerMonster's
+`gs.cache` — and resolve when the original action is replayed with its
+collected inputs.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Tuple, Optional
+import logging
+
+from state_machine.conversation import CallableSpec, FormStep, PhaseFrame
+from state_machine.conversation_phases import (
+    PHASE_APPROVING_REQUEST,
+    PHASE_CALLING_COMMAND,
+    PHASE_CALLING_TOOL,
+    PHASE_FILLING_COMMAND_FORM,
+    PHASE_FILLING_TOOL_FORM,
+    PHASE_PARSING_ATTACHMENT,
+)
+from state_machine.errors import (
+    ERROR_ATTACHMENT_NOT_ALLOWED,
+    ERROR_EXECUTION_FAILED,
+    ERROR_INVALID_ACTION,
+    ERROR_INVALID_INPUT,
+    ERROR_MISSING_INPUT,
+    ERROR_UNKNOWN_COMMAND,
+    ERROR_UNKNOWN_TOOL,
+    ERROR_WRONG_ACTOR_TYPE,
+    ERROR_WRONG_TURN,
+    FORM_NAVIGATION,
+    ActionError,
+    ActionResult,
+)
+
+logger = logging.getLogger("actionClass")
+
+
+def _steps(spec: CallableSpec, args: dict[str, Any], cs=None) -> list[FormStep]:
+    """Build the current form steps for a callable spec."""
+    if not spec.form_factory:
+        return spec.form
+    return spec.form_factory(args, cs)
+
+
+def _missing(spec: CallableSpec, args: dict[str, Any], cs=None) -> list[FormStep]:
+    """Return the required form steps that are still missing."""
+    return [s for s in _steps(spec, args, cs) if s.name not in args and (s.required or s.prompt_when_missing)]
+
+
+def _emit_command_event(channel: str, cs, payload: dict[str, Any]) -> None:
+    """Emit a slash-command lifecycle event when the event bus is available."""
+    try:
+        from events.event_bus import bus
+        bus.emit(channel, {"session_key": cs.cache.get("session_key"), **payload})
+    except Exception:
+        pass
+
+
+def _emit_command_progress(cs, frame) -> None:
+    """Emit progress updates for an in-flight slash-command form."""
+    call_id = (frame.data or {}).get("call_id")
+    if frame.action_type == "call_command" and call_id:
+        from events.event_channels import COMMAND_CALL_PROGRESSED
+        _emit_command_event(COMMAND_CALL_PROGRESSED, cs, {"call_id": call_id, "command_name": frame.name, "args": dict((frame.data or {}).get("args") or {})})
+
+
+def _record_form_field(frame) -> None:
+    """Record the fields that have already been visited in a form."""
+    frame.data.setdefault("form_history", []).append(frame.step.name)
+
+
+def _rewind_form(cs, frame):
+    """Move a form back one field and return the new active step."""
+    history = frame.data.setdefault("form_history", [])
+    if not history:
+        return None
+    args = frame.data.setdefault("args", {})
+    args.pop(history.pop(), None)
+    spec = cs.spec(frame.actor_id, frame.action_type, frame.name)
+    missing = _missing(spec, args, cs) if spec else []
+    frame.steps, frame.step_index = missing, 0
+    _emit_command_progress(cs, frame)
+    return missing[0] if missing else None
+
+
+class Action(object):
+    """Base action with shared legality/error handling."""
+
+    action_type = "action"
+
+    def __init__(self, cs, actor_id: str | None = None, content: Any = None):
+        """Initialize the action."""
+        self.cs = cs  # Conversation State
+        self.actor_id = actor_id or cs.turn_priority
+        self.content = content
+        self.illegal_code = ERROR_INVALID_ACTION
+
+    def is_legal(self) -> Tuple[bool, Optional[str]]:
+        """Return whether this action is legal for the current actor and turn."""
+        if self.actor_id not in self.cs.participants:
+            return False, f"Unknown participant: {self.actor_id}."
+        if self.actor_id != self.cs.turn_priority:
+            self.illegal_code = ERROR_WRONG_TURN
+            return False, "It is not this participant's turn."
+        return True, None
+
+    def execute(self) -> ActionResult:
+        """Apply the action to the conversation state."""
+        raise NotImplementedError("Subclass must implement execute()")
+
+    def error(self, code: str, message: str, **details: Any) -> ActionError:
+        """Build an ActionError anchored to the current phase."""
+        return ActionError(code, message, details, self.cs.phase)
+
+    def failure_details(self) -> dict[str, Any]:
+        """What every failure from this action should carry beyond the message.
+
+        Empty for most actions, because most of them *are* the whole subject —
+        a ``send_text`` that failed needs nothing said about which send_text.
+        A callable is the exception: it acts on behalf of a named command or
+        tool, and a client routing a failure back to the panel that asked for
+        it needs the name. See ``_CallableAction``.
+        """
+        return {}
+
+    def enact(self) -> ActionResult:
+        """Run legality checks, execute the action, and normalize failures."""
+        legal, reason = self.is_legal()
+        if not legal:
+            err = self.error(self.illegal_code, reason or self.illegal_code,
+                             **self.failure_details())
+            self.cs.last_error = err
+            event = self.cs.event("error", self.actor_id, error=err.to_dict())
+            result = ActionResult.fail(self.action_type, err)
+            result.events.append(event)
+            return result
+        try:
+            result = self.execute()
+        except ActionError as err:
+            # ``setdefault``, because a raise from inside ``execute`` that named
+            # itself (``spec()``, ``_validate``) is the more specific answer.
+            for key, value in self.failure_details().items():
+                err.details.setdefault(key, value)
+            self.cs.last_error = err
+            event = self.cs.event("error", self.actor_id, error=err.to_dict())
+            result = ActionResult.fail(self.action_type, err)
+            result.events.append(event)
+        except Exception as exc:
+            logger.debug("Error executing %s for %s: %r", type(self).__name__, self.actor_id, self.content, exc_info=True)
+            # Built here rather than where it was raised, so ``retry_phase`` is
+            # the phase the action left behind — ``_CallableAction._run``'s
+            # ``finally`` has reset it by now, and one built inside that body
+            # would name the calling phase nobody can retry from.
+            err = self.error(ERROR_EXECUTION_FAILED, str(exc) or type(exc).__name__,
+                             **self.failure_details())
+            self.cs.last_error = err
+            event = self.cs.event("error", self.actor_id, error=err.to_dict())
+            result = ActionResult.fail(self.action_type, err)
+            result.events.append(event)
+        return result
+
+class InvalidAction(Action):
+    """Invalid action."""
+    action_type = "invalid"
+
+    def is_legal(self):
+        """Always reject this placeholder action."""
+        return False, ERROR_INVALID_ACTION
+    
+    def execute(self):
+        """Raise the standardized invalid-action error."""
+        raise self.error(ERROR_INVALID_ACTION, "That action is not legal in this phase.", phase=self.cs.phase)
+
+
+class SendText(Action):
+    """Send text."""
+    action_type = "send_text"
+
+    def execute(self):
+        """Append a text message event and hand turn priority to the other side when needed."""
+        text = self.content if isinstance(self.content, str) else (self.content or {}).get("text", "")
+        event = self.cs.event("message", self.actor_id, text=text)
+        # Self-contained priority hand-off: when a user finishes their turn by
+        # sending text in the base phase, the other participant takes priority.
+        # Mirrors PokerMonster's pattern of an action managing its own
+        # turn_priority transitions instead of pushing that into a runner.
+        actor = self.cs.participants.get(self.actor_id)
+        if actor and actor.kind == "user":
+            from state_machine.conversation_phases import BASE_PHASE
+            if self.cs.phase == BASE_PHASE:
+                self.cs.switch_priority(self.actor_id)
+        return ActionResult(True, self.action_type, events=[event])
+
+
+class EndTurn(Action):
+    """End turn."""
+    action_type = "end_turn"
+
+    def execute(self):
+        """Reset phase state and hand turn priority to the other participant."""
+        old = self.cs.turn_priority
+        self.cs.reset_phase()
+        self.cs.switch_priority(old)
+        event = self.cs.event("turn_changed", old, from_actor=old, to_actor=self.cs.turn_priority)
+        return ActionResult(True, self.action_type, events=[event])
+
+
+class Cancel(Action):
+    """Cancel."""
+    action_type = "cancel"
+
+    def execute(self):
+        """Pop the active frame, restore priority, and emit cancellation events."""
+        frame = self.cs.pop_phase()
+        if frame is not None and frame.phase == PHASE_APPROVING_REQUEST:
+            data = frame.data or {}
+            pending = data.get("pending") or {}
+            self.cs.set_priority(pending.get("actor_id") or data.get("previous_priority") or self.cs.other_id(self.actor_id) or self.actor_id)
+        # If we were mid-form for a slash command, emit FINISHED so any UI
+        # showing a pending hourglass can resolve it as cancelled.
+        if frame is not None and frame.action_type == "call_command":
+            call_id = (frame.data or {}).get("call_id")
+            if call_id:
+                try:
+                    from events.event_bus import bus
+                    from events.event_channels import COMMAND_CALL_FINISHED
+                    bus.emit(COMMAND_CALL_FINISHED, {
+                        "session_key": self.cs.cache.get("session_key"),
+                        "call_id": call_id,
+                        "command_name": frame.name,
+                        "ok": False,
+                        "error": "cancelled",
+                    })
+                except Exception:
+                    pass
+        event = self.cs.event("cancelled", self.actor_id, cancelled=frame.action_type if frame else None)
+        # Marked like "Back." and "Skipped.", because this reaches the person in
+        # exactly the same situation. ``handle_action`` short-circuits every
+        # base-phase and busy cancel before dispatch, so an action that arrives
+        # here always has a frame to pop: a form or an approval acknowledging
+        # its own navigation, not the conversation being ended.
+        return ActionResult(True, self.action_type, "Cancelled.", events=[event],
+                            data={FORM_NAVIGATION: True})
+
+
+class _CallableAction(Action):
+    """Shared flow for commands and direct tool calls.
+
+    A callable can execute immediately, start a form, or suspend into an
+    approval phase before being resumed.
+    """
+
+    registry = "commands"
+    missing_code = ERROR_UNKNOWN_COMMAND
+    calling_phase = PHASE_CALLING_COMMAND
+    form_phase = PHASE_FILLING_COMMAND_FORM
+
+    def payload(self) -> dict[str, Any]:
+        """Normalize command/tool input into a name-plus-args payload."""
+        if isinstance(self.content, str):
+            return {"name": self.content, "args": {}}
+        payload = dict(self.content or {})
+        payload.setdefault("args", {})
+        return payload
+
+    def failure_details(self) -> dict[str, Any]:
+        """Name the callable, so a client can route the failure to its panel.
+
+        Read off the payload rather than off the resolved spec, because the
+        failure worth naming most is the one where there is no spec — an
+        unrecognised command still came from something the person typed.
+        """
+        try:
+            name = self.payload().get("name")
+        except Exception:
+            return {}
+        return {"name": name} if name else {}
+
+    def is_legal(self):
+        """Return whether the current participant is allowed to call this callable."""
+        legal, reason = super().is_legal()
+        if not legal:
+            return legal, reason
+        if not self.cs.participants[self.actor_id].allows(self.action_type):
+            self.illegal_code = ERROR_WRONG_ACTOR_TYPE
+            return False, f"{self.cs.participants[self.actor_id].kind} cannot {self.action_type}."
+        return True, None
+
+    def spec(self, payload: dict[str, Any]) -> CallableSpec:
+        """Resolve the callable spec for the requested command or tool."""
+        name = payload.get("name")
+        spec = self.cs.spec(self.actor_id, self.action_type, name)
+        if not name or not spec:
+            if self.action_type == "call_tool" and name in set(self.cs.cache.get("agent_scoped_tool_names") or []):
+                raise self.error(self.missing_code, f"Tool not in agent scope: {name!r}.", name=name)
+            raise self.error(self.missing_code, f"Unknown {self.action_type.removeprefix('call_')}: {name!r}.", name=name)
+        return spec
+
+    def execute(self):
+        """Run the callable immediately or suspend into form/approval flow first."""
+        payload, actor = self.payload(), self.actor_id
+        spec = self.spec(payload)
+        supplied_token = payload.pop("_approval_token", None)
+        expected_token = self.cs.cache.pop("_approved_callable_token", None)
+        args = dict(payload.get("args") or {})
+        needs_approval = bool(
+            spec.require_approval
+            or (
+                spec.approval_predicate is not None
+                and spec.approval_predicate(args)
+            )
+        )
+        approved = bool(
+            needs_approval
+            and (
+                (supplied_token and supplied_token == expected_token)
+                # Or the person answered this class of question in advance —
+                # a conversation in YOLO mode. Routed through ``approved``
+                # rather than around ``needs_approval`` on purpose: it lands in
+                # ``_run(approved=True)`` and becomes the same ``chain.approved``
+                # grant a typed "yes" produces, so the command is authorized to
+                # exactly what it declared instead of running ungranted and
+                # meeting the gate again on every Request inside it.
+                or self._pre_approved()
+            )
+        )
+        raw_arg = "arg" in args
+        resumed_call_id = payload.get("_call_id")
+        if not resumed_call_id:
+            self._supersede_pending_form()
+        # Missing args turn into a PhaseFrame; subsequent text/callback input
+        # fills the frame until the original callable can resume.
+        missing = [] if raw_arg else _missing(spec, args, self.cs)
+        if missing and self.cs.participants[actor].kind == "agent":
+            # Forms are a human-input surface. An agent that omits required
+            # arguments gets an immediate, informative failure it can read
+            # and correct — never a phase frame it cannot see (which would
+            # otherwise sit on the stack until superseded or reset, while
+            # the model receives no signal that the call didn't run).
+            names = ", ".join(s.name for s in missing)
+            raise self.error(ERROR_MISSING_INPUT,
+                             f"Missing required argument(s) for {spec.name}: {names}.",
+                             name=spec.name, fields=[s.name for s in missing])
+        if missing:
+            # First invocation: emit STARTED so the UI can show a pending
+            # indicator while the user fills the form. The call_id is pinned
+            # to the phase frame so the matching FINISHED fires from the
+            # eventual _run with the same id.
+            call_id = resumed_call_id or self._emit_invocation_started(spec, args)
+            frame_data = {"args": args}
+            if call_id:
+                frame_data["call_id"] = call_id
+            self.cs.push_phase(PhaseFrame(self.form_phase, self.action_type, actor, spec.name, frame_data, missing))
+            event = self.cs.event("form_started", actor, name=spec.name, step=missing[0].name, prompt=missing[0].prompt)
+            return ActionResult(True, self.action_type, events=[event], data={"step": missing[0].name, "call_id": call_id})
+        self._validate(spec, args)
+        if needs_approval and not approved:
+            return self._approval(payload, spec)
+        return self._run(
+            spec,
+            args,
+            call_id=resumed_call_id,
+            approved=approved,
+        )
+
+    def _pre_approved(self) -> bool:
+        """Whether the user has already said yes to what is about to run.
+
+        Only the *loosening* direction is honoured here. A conversation in
+        lockdown deliberately reaches this as False rather than as a refusal:
+        the dialog this skips is about a command the person just typed, with
+        them sitting right there, and auto-refusing it would make lockdown
+        mean "you may not use your own machine" — including, fatally, the
+        ``/mode`` that leaves lockdown. Lockdown is enforced against
+        *sandboxed* work, one layer down, in ``sandbox/approval.py``.
+
+        A raising predicate asks, because the safe direction here is the
+        dialog.
+        """
+        try:
+            return bool(self.cs.auto_approve())
+        except Exception:
+            return False
+
+    def _validate(self, spec: CallableSpec, args: dict[str, Any]) -> None:
+        """Internal helper to validate collected args against the callable form."""
+        if "arg" in args:
+            return
+        for step in _steps(spec, args, self.cs):
+            ok, reason = step.validate(args.get(step.name))
+            if not ok:
+                raise self.error(ERROR_INVALID_INPUT, reason or "Invalid input.", field=step.name)
+        if spec.validator:
+            ok, reason = spec.validator(args)
+            if not ok:
+                raise self.error(ERROR_INVALID_INPUT, reason or "Invalid input.")
+
+    def _approval(self, payload: dict[str, Any], spec: CallableSpec):
+        # Approval temporarily gives priority to the approver; approving later
+        # reconstructs this payload with a one-shot host-issued token.
+        """Internal helper to suspend a callable behind an approval frame."""
+        approver = spec.approval_actor_id or self.cs.other_id(self.actor_id)
+        import uuid
+
+        self.cs.push_phase(PhaseFrame(PHASE_APPROVING_REQUEST, "answer_approval", approver, spec.name, {
+            "type": "boolean",
+            "title": spec.name,
+            "prompt": spec.approval_prompt or f"Approve {spec.name}?",
+            "required": True,
+            "approval_token": uuid.uuid4().hex,
+            "pending": {"type": self.action_type, "actor_id": self.actor_id, "content": payload},
+        }))
+        self.cs.set_priority(approver)
+        event = self.cs.event("approval_requested", self.actor_id, name=spec.name, approver=approver, payload=payload)
+        # **No message.** The approval itself is the notification: every frontend
+        # is handed the request through ``render_approval_request``, which is the
+        # primitive. A sentence here would ride the ``messages`` kind — the same
+        # one the agent's own words use — so a frontend with a dialog could not
+        # tell the two apart and printed "Approval required." into the chat
+        # beside the dialog that already said so. What happened is in ``data``;
+        # how to say it is the frontend's to decide.
+        return ActionResult(True, self.action_type, events=[event],
+                            data={"approval_required": True, "name": spec.name})
+
+    def _run(
+        self,
+        spec: CallableSpec,
+        args: dict[str, Any],
+        *,
+        call_id: str | None = None,
+        approved: bool = False,
+    ):
+        """Internal helper to invoke the callable and translate its result into events."""
+        old_phase = self.cs.phase
+        self.cs.phase = self.calling_phase
+        started = call_id or self._emit_invocation_started(spec, args)
+        prior_approval = self.cs.cache.get("_approved_command_execution")
+        prior_running = self.cs.cache.get("_running_command")
+        if self.action_type == "call_command":
+            self.cs.cache["_approved_command_execution"] = approved
+            # Who to address progress to while the body runs. A command that
+            # takes long enough to be worth narrating — a package install —
+            # reports from deep inside a kernel handler, which knows the
+            # session and nothing else; without this it had no call to name and
+            # its only route to the person was ``push_message``, i.e. the chat.
+            # Saved and restored rather than cleared, because a command may
+            # call another one.
+            if started:
+                self.cs.cache["_running_command"] = {"call_id": started,
+                                                     "name": spec.name}
+        try:
+            # The plugin body runs outside whatever lock the driver holds, and
+            # everything around it stays inside. A command that asks the user
+            # mid-run blocks here; the answer arrives through a second action
+            # on another thread, which needs the lock this one would otherwise
+            # still be sitting on. `calling_phase` is in BUSY_PHASES, so the
+            # driver's own busy guard — not the lock — is what keeps a second
+            # action out while this one runs.
+            with self.cs.unlocked():
+                value = (
+                    spec.handler(self.cs, self.actor_id, dict(args))
+                    if spec.handler else None
+                )
+            if isinstance(value, ActionResult) and not value.ok:
+                raise value.error or self.error(ERROR_EXECUTION_FAILED, value.message or "Action failed.")
+        except Exception as e:
+            self._emit_command_finished(started, spec, False, str(e))
+            raise
+        finally:
+            if self.action_type == "call_command":
+                if prior_approval is None:
+                    self.cs.cache.pop("_approved_command_execution", None)
+                else:
+                    self.cs.cache["_approved_command_execution"] = prior_approval
+                if prior_running is None:
+                    self.cs.cache.pop("_running_command", None)
+                else:
+                    self.cs.cache["_running_command"] = prior_running
+            self.cs.reset_phase()
+        self._emit_command_finished(started, spec, True, None)
+        event = self.cs.event(self.action_type, self.actor_id, name=spec.name, args=args, previous_phase=old_phase)
+        return ActionResult(True, self.action_type, events=[event], data={"result": value, "call_id": started})
+
+    def _emit_invocation_started(self, spec: CallableSpec, args: dict[str, Any]):
+        """Internal helper to announce the start of a slash-command invocation."""
+        if self.action_type != "call_command":
+            return None
+        try:
+            import uuid
+            from events.event_bus import bus
+            from events.event_channels import COMMAND_CALL_STARTED
+            call_id = f"cmd:{spec.name}:{uuid.uuid4().hex[:8]}"
+            bus.emit(COMMAND_CALL_STARTED, {"session_key": self.cs.cache.get("session_key"), "call_id": call_id, "command_name": spec.name, "args": args})
+            return call_id
+        except Exception:
+            return None
+
+    def _supersede_pending_form(self):
+        """Internal helper to cancel any older pending form before starting a new one."""
+        frame = self.cs.peek_phase() if hasattr(self.cs, "peek_phase") else self.cs.frame
+        if not frame or frame.phase not in {PHASE_FILLING_COMMAND_FORM, PHASE_FILLING_TOOL_FORM}:
+            return
+        call_id = (frame.data or {}).get("call_id")
+        if call_id:
+            from events.event_channels import COMMAND_CALL_FINISHED
+            _emit_command_event(COMMAND_CALL_FINISHED, self.cs, {"call_id": call_id, "command_name": frame.name, "ok": False, "error": "superseded"})
+        self.cs.pop_phase()
+
+    def _emit_command_finished(self, call_id, spec: CallableSpec, ok: bool, error: str | None):
+        """Internal helper to announce the final status of a slash-command invocation."""
+        if not call_id or self.action_type != "call_command":
+            return
+        try:
+            from events.event_bus import bus
+            from events.event_channels import COMMAND_CALL_FINISHED
+            bus.emit(COMMAND_CALL_FINISHED, {"session_key": self.cs.cache.get("session_key"), "call_id": call_id, "command_name": spec.name, "ok": ok, "error": error})
+        except Exception:
+            pass
+
+
+class CallCommand(_CallableAction):
+    """Call command."""
+    action_type = "call_command"
+    registry = "commands"
+    missing_code = ERROR_UNKNOWN_COMMAND
+    calling_phase = PHASE_CALLING_COMMAND
+    form_phase = PHASE_FILLING_COMMAND_FORM
+
+
+class CallTool(_CallableAction):
+    """Call tool."""
+    action_type = "call_tool"
+    registry = "tools"
+    missing_code = ERROR_UNKNOWN_TOOL
+    calling_phase = PHASE_CALLING_TOOL
+    form_phase = PHASE_FILLING_TOOL_FORM
+
+
+class SubmitFormText(Action):
+    """Submit form text."""
+    action_type = "submit_form_text"
+
+    def execute(self):
+        """Record one piece of form input and either advance or resume the callable."""
+        frame = self.cs.frame
+        if not frame or not frame.step:
+            raise self.error(ERROR_INVALID_ACTION, "No form is awaiting input.")
+        text = self.content if isinstance(self.content, str) else (self.content or {}).get("text")
+        # validate() runs coercion, the field validator, and type-specific checks
+        # (e.g. path existence) so a bad value is rejected here, on entry.
+        ok, reason = frame.step.validate(text)
+        if not ok:
+            raise self.error(ERROR_INVALID_INPUT, reason or f"Invalid {frame.step.name}.", field=frame.step.name)
+        try:
+            value = frame.step.coerce(text)
+        except Exception as e:
+            raise self.error(ERROR_INVALID_INPUT, f"{frame.step.name} must be {frame.step.type}: {e}", field=frame.step.name)
+        frame.data.setdefault("args", {})[frame.step.name] = value
+        _record_form_field(frame)
+        _emit_command_progress(self.cs, frame)
+        frame.step_index += 1
+        spec = self.cs.spec(frame.actor_id, frame.action_type, frame.name)
+        missing = _missing(spec, frame.data["args"], self.cs) if spec else []
+        if missing:
+            frame.steps, frame.step_index = missing, 0
+            event = self.cs.event("form_step", self.actor_id, name=frame.name, step=missing[0].name, prompt=missing[0].prompt)
+            return ActionResult(True, self.action_type, events=[event], data={"step": frame.step.name})
+        pending = {"name": frame.name, "args": frame.data["args"]}
+        if frame.data.get("call_id"):
+            pending["_call_id"] = frame.data["call_id"]
+        actor, action_type = frame.actor_id, frame.action_type
+        self.cs.pop_phase()
+        from state_machine.action_map import create_action
+
+        # Last form value received: pop the form phase and replay the original
+        # command/tool action with its completed args.
+        result = create_action(self.cs, action_type, pending, actor).enact()
+        if not result.ok and action_type == "call_command":
+            frame.step_index = max(0, len(frame.steps) - 1)
+            self.cs.push_phase(frame)
+            if result.error:
+                result.error.retry_phase = self.cs.phase
+        return result
+
+
+class AnswerApproval(Action):
+    """Resolve a pending typed-input request.
+
+    Despite the historical name, this carries any typed value (string,
+    integer, number, boolean, array, object, enum). For a frame whose
+    `data["type"]` is "boolean" with a `pending` action, a truthy value
+    re-enacts the gated action with a one-shot approval token. For other types, the
+    value is simply returned in the result data for the caller to consume.
+    """
+
+    action_type = "answer_approval"
+
+    def execute(self):
+        """Resolve the active approval frame and resume the pending callable when allowed."""
+        frame = self.cs.frame
+        if not frame or frame.phase != PHASE_APPROVING_REQUEST:
+            raise self.error(ERROR_INVALID_ACTION, "No request is pending.")
+        if isinstance(self.content, dict):
+            got, expected = self.content.get("request_id"), (frame.data or {}).get("request_id")
+            if got and expected and got != expected:
+                raise self.error(ERROR_INVALID_INPUT, "That request is no longer active.", request_id=got)
+        value = self._coerce(frame)
+        pending = frame.data.get("pending")
+        # Restore whoever held priority before the frame was pushed. Only an
+        # *action*-initiated approval (``_CallableAction._approval``) can name
+        # the original actor via ``pending``; a programmatic one
+        # (``runtime.request_input`` — every sandbox Request dialog) has no
+        # pending action and records ``previous_priority`` instead. Falling
+        # straight through to ``other_id`` handed priority to the *agent*
+        # after a user answered a mid-command Request, and the session then
+        # refused every subsequent user action with "agent cannot …".
+        original_actor = (
+            (pending or {}).get("actor_id")
+            or (frame.data or {}).get("previous_priority")
+            or self.cs.other_id(self.actor_id)
+            or self.actor_id
+        )
+        self.cs.pop_phase()
+        self.cs.set_priority(original_actor)
+        event = self.cs.event("approval_answered", self.actor_id, value=value, approved=bool(value), pending=pending)
+
+        if pending and frame.data.get("type", "boolean") == "boolean":
+            if not value:
+                self.cs.reset_phase()
+                # No message, for the reason given in ``_CallableAction._approval``:
+                # the outcome is in ``data`` and in the ``approval_answered``
+                # event, and how to acknowledge a refusal — closing a dialog,
+                # editing a chat bubble, printing a line — is the frontend's call.
+                return ActionResult(True, self.action_type, events=[event], data={"approved": False, "value": False})
+            content = dict(pending["content"])
+            token = frame.data.get("approval_token")
+            self.cs.cache["_approved_callable_token"] = token
+            content["_approval_token"] = token
+            from state_machine.action_map import create_action
+
+            result = create_action(self.cs, pending["type"], content, pending["actor_id"]).enact()
+            result.events.insert(0, event)
+            return result
+
+        # Free-form typed input: just return the value. No message, for the
+        # reason given in ``_CallableAction._approval``.
+        self.cs.reset_phase()
+        return ActionResult(True, self.action_type, events=[event], data={"value": value, "approved": bool(value)})
+
+    def _coerce(self, frame) -> Any:
+        """Coerce raw content into the requested type using FormStep semantics."""
+        type_ = frame.data.get("type", "boolean")
+        enum = frame.data.get("enum")
+        enum_labels = frame.data.get("enum_labels")
+        default = frame.data.get("default")
+        required = frame.data.get("required", True)
+        raw = self.content
+        if isinstance(raw, dict):
+            if "value" in raw:
+                raw = raw["value"]
+            elif "text" in raw:
+                raw = raw["text"]
+
+        # Booleans carry the historical lenient text parser ("yes", "y", etc.).
+        if type_ == "boolean":
+            if isinstance(raw, bool):
+                return raw
+            text = str(raw).strip().lower()
+            if text in {"y", "yes", "approve", "approved", "true", "1"}:
+                return True
+            if text in {"n", "no", "deny", "denied", "false", "0", "cancel"}:
+                return False
+            raise self.error(ERROR_INVALID_INPUT, "Approval needs yes or no.")
+
+        # ``enum_labels`` is what lets a person answer with the words they were
+        # shown: ``match_enum`` resolves an exact value, then a label, then a
+        # case-folded value. Without it a multi-choice approval can only be
+        # answered by typing its internal value, which nothing renders.
+        step = FormStep(name=frame.name or "input", required=required, type=type_,
+                        enum=enum, enum_labels=enum_labels, default=default)
+        ok, reason = step.validate(raw)
+        if not ok:
+            raise self.error(ERROR_INVALID_INPUT, reason or "Invalid input.")
+        return step.coerce(raw)
+
+
+class SkipForm(Action):
+    """Skip an optional form field by accepting its default and advancing.
+
+    Mirrors `SubmitFormText`'s replay path: pop the form when complete and
+    re-enact the original command/tool action with collected args.
+    """
+
+    action_type = "skip_form"
+
+    def execute(self):
+        """Skip the current optional form field and continue the callable flow."""
+        frame = self.cs.frame
+        if not frame or not frame.step:
+            raise self.error(ERROR_INVALID_ACTION, "No form is awaiting input.")
+        if frame.step.required:
+            raise self.error(ERROR_INVALID_INPUT, "Cannot skip a required field.", field=frame.step.name)
+        frame.data.setdefault("args", {})[frame.step.name] = frame.step.default
+        _record_form_field(frame)
+        _emit_command_progress(self.cs, frame)
+        frame.step_index += 1
+        spec = self.cs.spec(frame.actor_id, frame.action_type, frame.name)
+        missing = _missing(spec, frame.data["args"], self.cs) if spec else []
+        if missing:
+            frame.steps, frame.step_index = missing, 0
+            event = self.cs.event("form_step", self.actor_id, name=frame.name, step=missing[0].name, prompt=missing[0].prompt)
+            return ActionResult(True, self.action_type, "Skipped.", events=[event], data={"step": frame.step.name, FORM_NAVIGATION: True})
+        pending = {"name": frame.name, "args": frame.data["args"]}
+        if frame.data.get("call_id"):
+            pending["_call_id"] = frame.data["call_id"]
+        actor, action_type = frame.actor_id, frame.action_type
+        self.cs.pop_phase()
+        from state_machine.action_map import create_action
+
+        result = create_action(self.cs, action_type, pending, actor).enact()
+        if not result.ok and action_type == "call_command":
+            frame.step_index = max(0, len(frame.steps) - 1)
+            self.cs.push_phase(frame)
+            if result.error:
+                result.error.retry_phase = self.cs.phase
+        if result.ok and not result.message:
+            # Skipping the *last* field runs the command, and this returns that
+            # run's own result. A message it supplied is real output; this one
+            # is ours, and is the same acknowledgement the branch above sends.
+            result.message = "Skipped."
+            result.data = {**(result.data or {}), FORM_NAVIGATION: True}
+        return result
+
+
+class BackForm(Action):
+    """Back form."""
+    action_type = "back_form"
+
+    def execute(self):
+        """Move the active form back one collected field."""
+        frame = self.cs.frame
+        if not frame or not frame.step:
+            raise self.error(ERROR_INVALID_ACTION, "No form is awaiting input.")
+        step = _rewind_form(self.cs, frame)
+        if step is None:
+            raise self.error(ERROR_INVALID_ACTION, "Nothing to go back to.")
+        event = self.cs.event("form_step", self.actor_id, name=frame.name, step=step.name, prompt=step.prompt)
+        return ActionResult(True, self.action_type, "Back.", events=[event], data={"step": step.name, FORM_NAVIGATION: True})
+
+
+def prepare_attachment(cs, content):
+    """Validate and parse one attachment message without changing turn state.
+
+    This pure preparation step is shared by the ordinary state-machine action
+    and the runtime's mid-turn queue. Parsing before enqueueing means a bad
+    extension is rejected while the submitting frontend is still present,
+    while the prepared objects can safely wait for the loop boundary.
+    """
+    content = dict(content or {})
+    items = [dict(f) for f in content.get("files") or []] or [content]
+    for item in items:
+        ext = cs.attachment_extension(item)
+        if cs.allowed_attachment_extensions and ext not in cs.allowed_attachment_extensions:
+            raise ValueError(f".{ext} attachments are not allowed for this model.")
+    parsed_items = [cs.attachment_parser(item) if cs.attachment_parser else item
+                    for item in items]
+    attachments, records = [], []
+    for one in parsed_items:
+        if not isinstance(one, dict):
+            continue
+        if one.get("attachment") is not None:
+            attachments.append(one["attachment"])
+        if one.get("record"):
+            records.append(one["record"])
+    parsed = parsed_items[0] if len(parsed_items) == 1 else {
+        "files": parsed_items,
+        "text": "\n".join(str((one or {}).get("text") or "")
+                          for one in parsed_items if isinstance(one, dict)).strip(),
+    }
+    text = str((parsed or {}).get("text") or "") if isinstance(parsed, dict) else ""
+    return {"content": content, "parsed": parsed, "text": text,
+            "records": records, "attachments": attachments}
+
+
+class SendAttachment(Action):
+    """Send attachment."""
+    action_type = "send_attachment"
+
+    def is_legal(self):
+        """Return whether the current actor may submit an attachment in this phase."""
+        legal, reason = super().is_legal()
+        if not legal:
+            return legal, reason
+        if not self.cs.participants[self.actor_id].allows(self.action_type):
+            self.illegal_code = ERROR_WRONG_ACTOR_TYPE
+            return False, f"{self.cs.participants[self.actor_id].kind} cannot send attachments."
+        return True, None
+
+    def execute(self):
+        """Queue this message's attachments and hand the turn to the agent.
+
+        One action, however many files. A person who attaches three and types a
+        line has sent one message, and the loop already bundles the whole of
+        ``pending_attachments`` into the first model call of the turn — so the
+        only thing that had to be true here is that three files can arrive
+        together. A file per action could not: the first hands priority to the
+        agent, and the next one meets a busy session.
+
+        ``files`` is the many-file spelling; without it the content *is* the
+        one file, exactly as it always was.
+
+        Extensions are checked for every file before any of them is parsed, so
+        a refused one leaves nothing queued. Half a message is worse than
+        none — the agent would answer about whichever files happened to pass.
+        """
+        self.cs.phase = PHASE_PARSING_ATTACHMENT
+        try:
+            prepared = prepare_attachment(self.cs, self.content)
+        except ValueError as exc:
+            raise self.error(ERROR_ATTACHMENT_NOT_ALLOWED, str(exc))
+        finally:
+            self.cs.reset_phase()
+        self.cs.pending_attachments.extend(prepared["attachments"])
+        content, parsed, records = (prepared["content"], prepared["parsed"],
+                                    prepared["records"])
+        actor = self.cs.participants.get(self.actor_id)
+        if actor and actor.kind == "user":
+            self.cs.switch_priority(self.actor_id)
+        event = self.cs.event("attachment", self.actor_id, attachment=content, parsed=parsed)
+        # ``records`` is what the transcript row keeps in its own column;
+        # ``parsed`` stays the whole parse for anything reading the event.
+        return ActionResult(True, self.action_type, events=[event],
+                            data={"parsed": parsed, "records": records})

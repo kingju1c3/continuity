@@ -1,0 +1,1516 @@
+"""The subagent registry: the guards, the deadline, and the barrier.
+
+Subagents are the part of the kernel where a mistake is quiet. A dropped
+report reads as an agent that had nothing to say; a double-delivered one reads
+as a model repeating itself; a stale success after a timeout reads as findings
+nobody produced. None of those raise, so they are pinned here instead.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from runtime.subagents import (BARRIER_POLL_SECONDS, BarrierOutcome, CANCELLED,
+                               DONE, FAILED, RUNNING, SESSION_PREFIX,
+                               SubagentRegistry)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# A runtime just real enough to spawn against.
+# ──────────────────────────────────────────────────────────────────────
+
+class FakeSession:
+    """What the barrier and the cancel path actually touch on a session."""
+
+    def __init__(self, key: str, conversation_id: int | None = None):
+        self.key = key
+        self.conversation_id = conversation_id
+        self.busy = False
+        self.lock = threading.RLock()
+        self.cancel_event = threading.Event()
+        self.pending_user_inputs: list[dict] = []
+
+
+class FakeDB:
+    def __init__(self):
+        self.conversations: dict[int, dict] = {}
+        self.messages: list[tuple] = []
+
+    def get_conversation(self, cid):
+        return self.conversations.get(int(cid))
+
+    def save_message(self, cid, role, content, **kwargs):
+        self.messages.append((cid, role, content))
+
+    def clear_conversation_messages(self, cid):
+        self.messages = [row for row in self.messages if row[0] != cid]
+
+
+class FakeRuntime:
+    """Drives whatever ``turn`` returns, and records what was asked of it."""
+
+    def __init__(self, turn=None, config=None):
+        self.db = FakeDB()
+        self.config = config or {"max_concurrent_subagents": 4,
+                                 "subagent_timeout_seconds": 300}
+        self.services = {}
+        self.sessions: dict[str, FakeSession] = {}
+        self.active_conversation_id = None
+        self.active_session_key = "repl"
+        self._next_cid = 100
+        self._turn = turn or (lambda key, prompt, **kw: SimpleNamespace(
+            ok=True, messages=[f"did: {prompt}"], error=None))
+        self.pushed: list[str] = []
+        self.opened: list[str] = []
+        self.closed: list[str] = []
+        self.cleared: list[int] = []
+
+    def create_conversation(self, title, *, kind="user", category=None,
+                            user_id=1):
+        self._next_cid += 1
+        cid = self._next_cid
+        self.db.conversations[cid] = {"id": cid, "title": title,
+                                      "category": category}
+        return cid
+
+    def open_session(self, key, *, conversation_id=None, **kw):
+        self.opened.append(key)
+        session = self.sessions.setdefault(key, FakeSession(key))
+        session.conversation_id = conversation_id
+        return session
+
+    def iterate_agent_turn(self, key, prompt, *, attachments=None, **kw):
+        return self._turn(key, prompt, attachments=attachments)
+
+    def close_session(self, key):
+        self.closed.append(key)
+        return True
+
+    def clear_conversation(self, key, cid, *, mark_title=True):
+        if cid not in self.db.conversations:
+            return False
+        session = self.sessions.get(key)
+        if session is not None and session.busy:
+            return False
+        self.db.clear_conversation_messages(cid)
+        self.cleared.append(cid)
+        return True
+
+    def push_message(self, key, text, **kw):
+        self.pushed.append(text)
+
+    def notify(self, *, title="", body="", **kw):
+        # A subagent notice is a notification, not conversation: nobody asked
+        # for it and it arrives while they are doing something else. Recorded
+        # into the same list because what these tests check is that it was
+        # surfaced at all — a scheduled failure nobody collects and nobody is
+        # told about is one nobody ever learns happened.
+        self.pushed.append(f"{title}\n\n{body}" if body else title)
+        return 1
+
+
+def registry_for(turn=None, config=None):
+    """A registry over a fake runtime, ready to spawn."""
+    runtime = FakeRuntime(turn=turn, config=config)
+    return SubagentRegistry(runtime, runtime.config), runtime
+
+
+def settle(registry, handle, timeout=5.0):
+    """Block until a child reaches a terminal state, or fail the test."""
+    assert handle._done.wait(timeout), f"subagent {handle.id} never finished"
+    return registry.get(handle.id)
+
+
+def eventually(predicate, timeout=5.0):
+    """Wait for something that happens just after a handle settles.
+
+    ``_done`` is set *before* the notice for an uncollectable failure goes
+    out, so a waiter is released while that push is still in flight on the
+    worker thread. Asserting straight after ``settle`` therefore passes when
+    the suite is idle and loses the race under load — which is what made this
+    look like an order-dependent test rather than a racing one.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The guards. Each one is a way a spawn can go badly wrong quietly.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_a_subagent_cannot_spawn_a_subagent_at_the_default_depth():
+    """max_subagent_depth is 1: a turn may spawn, a child may not."""
+    registry, _ = registry_for()
+    with pytest.raises(PermissionError, match="nest more than 1"):
+        registry.spawn("go", owner=f"{SESSION_PREFIX}42")
+
+
+def test_an_unidentifiable_spawner_is_treated_as_a_child_not_a_turn():
+    """Fail closed. A subagent session whose handle the registry no longer
+    holds — collected, or a restart under it — must not read as depth 0,
+    which would buy unlimited nesting for the price of being forgotten."""
+    registry, _ = registry_for(config={"max_subagent_depth": 2})
+    # No handle exists for conversation 999, but the key says it is a child.
+    child = registry.spawn("go", owner=f"{SESSION_PREFIX}999")
+    settle(registry, child)
+    assert registry.get(child.id).depth == 1
+
+    registry2, _ = registry_for(config={"max_subagent_depth": 1})
+    with pytest.raises(PermissionError):
+        registry2.spawn("go", owner=f"{SESSION_PREFIX}999")
+
+
+def test_depth_is_counted_down_the_lineage_when_nesting_is_allowed():
+    registry, runtime = registry_for(config={"max_subagent_depth": 3,
+                                             "max_concurrent_subagents": 4})
+    parent = registry.spawn("parent work", owner="repl")
+    # A grandchild spawned from inside the parent's own session.
+    child = registry.spawn("child work",
+                           owner=f"{SESSION_PREFIX}{parent.conversation_id}")
+    assert (parent.depth, child.depth) == (0, 1)
+    assert child.parent == parent.id
+
+
+def test_cancelling_a_parent_takes_its_children_with_it():
+    """A child of a stopped agent is work for a parent that is gone."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["late"], error=None)
+
+    registry, _ = registry_for(turn=turn, config={"max_subagent_depth": 3})
+    parent = registry.spawn("parent", owner="repl")
+    child = registry.spawn("child",
+                           owner=f"{SESSION_PREFIX}{parent.conversation_id}")
+    try:
+        assert registry.cancel(parent.id) is True
+        assert registry.get(child.id).state == CANCELLED
+    finally:
+        release.set()
+
+
+def test_cancel_for_stops_everything_one_session_started():
+    """What /cancel reaches for."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["late"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    mine = [registry.spawn(f"job {i}", owner="repl") for i in range(3)]
+    theirs = registry.spawn("other", owner="telegram")
+    try:
+        assert registry.cancel_for("repl") == 3
+        assert all(registry.get(h.id).state == CANCELLED for h in mine)
+        assert registry.get(theirs.id).state == RUNNING
+    finally:
+        release.set()
+
+
+def test_a_queued_child_does_not_burn_its_deadline_while_it_waits():
+    """A fan-out wider than the pool queues, and a deadline running in the
+    queue cancels the tail before it has said a word."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        started.set()
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["done"], error=None)
+
+    # One worker: the second spawn cannot start until the first finishes.
+    registry, _ = registry_for(turn=turn,
+                               config={"max_concurrent_subagents": 1,
+                                       "subagent_timeout_seconds": 2})
+    first = registry.spawn("first", owner="repl")
+    queued = registry.spawn("queued", owner="repl")
+    try:
+        assert started.wait(5)
+        # Its deadline has not started, so it cannot be overdue however long
+        # the queue is.
+        assert queued.deadline == float("inf")
+        time.sleep(0.5)
+        assert registry.get(queued.id).state == RUNNING
+    finally:
+        release.set()
+    settle(registry, first)
+    settle(registry, queued)
+    assert registry.get(queued.id).state == DONE
+
+
+def test_a_subagent_refuses_the_conversation_the_user_is_looking_at():
+    """Two drivers on one conversation is a scrambled transcript."""
+    registry, runtime = registry_for()
+    cid = runtime.create_conversation("existing")
+    runtime.active_conversation_id = cid
+    with pytest.raises(PermissionError, match="active conversation"):
+        registry.spawn("go", conversation_id=cid)
+
+
+def test_one_conversation_runs_one_child_at_a_time():
+    registry, runtime = registry_for()
+    cid = runtime.create_conversation("busy one")
+    session = FakeSession(f"{SESSION_PREFIX}{cid}", cid)
+    session.busy = True
+    runtime.sessions[session.key] = session
+    with pytest.raises(PermissionError, match="already running"):
+        registry.spawn("go", conversation_id=cid)
+
+
+def test_an_empty_prompt_is_refused_before_a_conversation_is_opened():
+    registry, runtime = registry_for()
+    with pytest.raises(ValueError):
+        registry.spawn("   ")
+    assert not runtime.db.conversations
+
+
+def test_a_missing_attachment_is_refused_while_there_is_a_caller_to_tell():
+    registry, _ = registry_for()
+    with pytest.raises(FileNotFoundError):
+        registry.spawn("go", attachments=["nowhere/at/all.txt"])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Running one.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_a_child_runs_its_turn_and_reports_back():
+    registry, runtime = registry_for()
+    handle = registry.spawn("summarise the docs", title="Docs")
+    settle(registry, handle)
+
+    report = registry.collect([handle.id])[0]
+    assert report["state"] == DONE and report["ok"]
+    assert "summarise the docs" in report["text"]
+    assert report["title"] == "Docs"
+    # The session is opened and closed around the turn, in that order — a
+    # child that leaks its session blocks the next spawn into that
+    # conversation forever.
+    key = f"{SESSION_PREFIX}{handle.conversation_id}"
+    assert runtime.opened == [key] and runtime.closed == [key]
+
+
+def test_a_reporting_child_is_told_its_final_message_is_the_deliverable():
+    """Without the framing a background agent writes as if someone will reply."""
+    seen = {}
+
+    def turn(key, prompt, **kw):
+        seen["prompt"] = prompt
+        return SimpleNamespace(ok=True, messages=["done"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    settle(registry, registry.spawn("find the bug", owner="repl"))
+    # Asserted against what the note *promises*, not against a phrase from the
+    # docstring above it: the note says "background conversation", the sentence
+    # explaining why says "background agent", and matching the explanation
+    # rather than the text is how this came to fail on a note that was working
+    # perfectly. The two halves that matter are that nobody will reply and that
+    # the last message is the whole delivery.
+    assert "nobody will reply" in seen["prompt"]
+    assert "final message" in seen["prompt"]
+
+
+def test_a_child_with_nobody_waiting_is_not_given_the_framing():
+    seen = {}
+
+    def turn(key, prompt, **kw):
+        seen["prompt"] = prompt
+        return SimpleNamespace(ok=True, messages=["done"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    settle(registry, registry.spawn("find the bug"))
+    assert "background agent" not in seen["prompt"]
+
+
+def test_a_failing_turn_reports_the_failure_rather_than_an_empty_success():
+    def turn(key, prompt, **kw):
+        return SimpleNamespace(ok=False, messages=[],
+                               error={"message": "the model refused"})
+
+    registry, _ = registry_for(turn=turn)
+    handle = settle(registry, registry.spawn("go"))
+    assert handle.state == FAILED and handle.error == "the model refused"
+
+
+def test_a_raising_turn_is_caught_and_carried_on_the_handle():
+    def turn(key, prompt, **kw):
+        raise RuntimeError("the box died")
+
+    registry, runtime = registry_for(turn=turn)
+    handle = settle(registry, registry.spawn("go"))
+    assert handle.state == FAILED and "the box died" in handle.error
+    # Still closed: the session must not leak past a crashing turn.
+    assert runtime.closed
+
+
+def test_a_scheduled_failure_is_pushed_because_nobody_will_collect_it():
+    def turn(key, prompt, **kw):
+        raise RuntimeError("nightly broke")
+
+    registry, runtime = registry_for(turn=turn)
+    settle(registry, registry.spawn("go", title="Nightly"))  # no owner
+    assert eventually(
+        lambda: any("Nightly" in message for message in runtime.pushed))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Collecting.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_collect_with_no_ids_takes_everything_this_owner_started():
+    registry, _ = registry_for()
+    handles = [registry.spawn(f"job {i}", owner="repl") for i in range(3)]
+    for handle in handles:
+        settle(registry, handle)
+
+    reports = registry.collect(owner="repl")
+    assert len(reports) == 3
+    assert all(r["state"] == DONE for r in reports)
+    # Taken once. A second call has nothing left, which is what stops the
+    # barrier re-delivering what the agent already read.
+    assert registry.collect(owner="repl") == []
+
+
+def test_collect_does_not_take_another_owners_children():
+    registry, _ = registry_for()
+    mine = registry.spawn("mine", owner="repl")
+    theirs = registry.spawn("theirs", owner="telegram")
+    settle(registry, mine)
+    settle(registry, theirs)
+
+    reports = registry.collect(owner="repl")
+    assert [r["id"] for r in reports] == [mine.id]
+
+
+def test_polling_with_timeout_zero_leaves_a_running_child_uncollected():
+    """A poll must not consume a report that has not been produced yet."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["late"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    handle = registry.spawn("slow", owner="repl")
+    try:
+        polled = registry.collect(owner="repl", timeout=0)
+        assert polled[0]["state"] == RUNNING
+        assert registry.pending_for("repl"), "a poll must not collect"
+    finally:
+        release.set()
+    settle(registry, handle)
+    assert registry.collect(owner="repl")[0]["text"] == "late"
+
+
+def test_a_child_past_its_deadline_is_cancelled_rather_than_waited_on():
+    """A deadline is a hard cutoff: no result, and the model is told so."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["too late"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    handle = registry.spawn("slow", owner="repl", timeout_seconds=1)
+    try:
+        report = registry.collect([handle.id])[0]
+        assert report["state"] == CANCELLED and not report["ok"]
+        assert not report["text"]
+        notice = registry.get(handle.id).notice()
+        assert "TIMED OUT" in notice
+        assert "do not report anything on its behalf" in notice
+    finally:
+        release.set()
+
+
+def test_a_cancelled_child_never_reports_a_late_success():
+    """The failure the model already saw must not be contradicted."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["finished anyway"],
+                               error=None)
+
+    registry, _ = registry_for(turn=turn)
+    handle = registry.spawn("slow", owner="repl")
+    registry.cancel(handle.id)
+    release.set()
+    time.sleep(0.3)  # give the worker time to try to settle it
+
+    assert registry.get(handle.id).state == CANCELLED
+    assert "finished anyway" not in registry.get(handle.id).text
+
+
+def test_cancelling_before_the_turn_starts_stops_it_starting():
+    """A child cancelled while queued must not run work already reported failed."""
+    started = []
+
+    def turn(key, prompt, **kw):
+        started.append(key)
+        return SimpleNamespace(ok=True, messages=["ran"], error=None)
+
+    # One worker, occupied, so the second spawn is still queued.
+    registry, _ = registry_for(config={"max_concurrent_subagents": 1})
+    hold = threading.Event()
+
+    def occupy(key, prompt, **kw):
+        hold.wait(5)
+        return SimpleNamespace(ok=True, messages=["first"], error=None)
+
+    registry.runtime._turn = occupy
+    first = registry.spawn("first", owner="repl")
+    registry.runtime._turn = turn
+    second = registry.spawn("second", owner="repl")
+
+    registry.cancel(second.id)
+    hold.set()
+    settle(registry, first)
+    time.sleep(0.3)
+
+    assert started == [], "a cancelled child must not start"
+    assert registry.get(second.id).state == CANCELLED
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The barrier.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_the_barrier_queues_uncollected_reports_and_asks_for_a_redrive():
+    registry, runtime = registry_for()
+    session = FakeSession("repl", 7)
+    runtime.sessions["repl"] = session
+    for i in range(2):
+        settle(registry, registry.spawn(f"job {i}", owner="repl",
+                                        owner_conversation_id=7))
+
+    assert registry.barrier(session) is BarrierOutcome.REPORTS_DELIVERED
+    assert len(session.pending_user_inputs) == 2
+    assert all("Background agent" in m["payload"] for m in session.pending_user_inputs)
+
+
+def test_the_barrier_announces_waiting_then_thinking():
+    from events.event_bus import bus
+    from events.event_channels import SESSION_TURN_ACTIVITY
+
+    registry, _ = registry_for()
+    session = FakeSession("repl", 7)
+    session.turn_id = "parent-turn"
+    settle(registry, registry.spawn("job", owner="repl",
+                                    owner_conversation_id=7))
+    seen = []
+    unsubscribe = bus.subscribe(SESSION_TURN_ACTIVITY, seen.append)
+    try:
+        assert registry.barrier(session) is BarrierOutcome.REPORTS_DELIVERED
+    finally:
+        unsubscribe()
+    assert [(event["turn_id"], event["phase"]) for event in seen] == [
+        ("parent-turn", "waiting"), ("parent-turn", "thinking")]
+
+
+def test_the_barrier_abstains_on_the_redriven_half():
+    """Firing twice would hold every turn open forever."""
+    registry, runtime = registry_for()
+    session = FakeSession("repl", 7)
+    settle(registry, registry.spawn("job", owner="repl",
+                                    owner_conversation_id=7))
+
+    assert registry.barrier(session) is BarrierOutcome.REPORTS_DELIVERED
+    session.pending_user_inputs.clear()
+    assert registry.barrier(session) is BarrierOutcome.NONE
+    assert session.pending_user_inputs == []
+
+
+def test_the_barrier_does_not_re_deliver_what_was_collected_explicitly():
+    """One delivery, decided by whoever collects first."""
+    registry, _ = registry_for()
+    session = FakeSession("repl", 7)
+    settle(registry, registry.spawn("job", owner="repl",
+                                    owner_conversation_id=7))
+
+    assert registry.collect(owner="repl")[0]["state"] == DONE
+    assert registry.barrier(session) is BarrierOutcome.NONE
+    assert session.pending_user_inputs == []
+
+
+def test_a_report_is_dropped_when_the_session_moved_conversations():
+    """The result still lives in the child's own conversation; it does not
+    get to leak into whatever the user opened next."""
+    registry, _ = registry_for()
+    session = FakeSession("repl", 7)
+    settle(registry, registry.spawn("job", owner="repl",
+                                    owner_conversation_id=7))
+    session.conversation_id = 9  # the user switched away
+
+    assert registry.barrier(session) is BarrierOutcome.NONE
+    assert session.pending_user_inputs == []
+
+
+def test_the_barrier_takes_the_children_with_it_when_the_user_cancels():
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["late"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    session = FakeSession("repl", 7)
+    handle = registry.spawn("slow", owner="repl", owner_conversation_id=7)
+    session.cancel_event.set()
+    try:
+        assert registry.barrier(session) is BarrierOutcome.NONE
+        assert registry.get(handle.id).state == CANCELLED
+        assert session.pending_user_inputs == []
+    finally:
+        release.set()
+
+
+def test_queued_user_input_wakes_the_barrier_then_waiting_resumes():
+    """A detached child does not make its parent deaf. Speaking wakes the
+    parent without collecting or cancelling the child; after the message is
+    drained, the next barrier call waits for and delivers the same child."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kw):
+        release.wait(5)
+        return SimpleNamespace(ok=True, messages=["child report"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    session = FakeSession("repl", 7)
+    handle = registry.spawn("slow", owner="repl", owner_conversation_id=7)
+    outcomes = []
+    waiter = threading.Thread(
+        target=lambda: outcomes.append(registry.barrier(session)), daemon=True)
+    waiter.start()
+    time.sleep(0.05)
+
+    with session.lock:
+        session.pending_user_inputs.append({
+            "action_type": "send_text", "payload": "one more thing"})
+    waiter.join(BARRIER_POLL_SECONDS + 1)
+
+    assert outcomes == [BarrierOutcome.USER_INPUT]
+    assert not handle.collected
+    assert handle.state == RUNNING
+
+    with session.lock:
+        session.pending_user_inputs.clear()  # the parent loop drained it
+    release.set()
+    settle(registry, handle)
+
+    assert registry.barrier(session) is BarrierOutcome.REPORTS_DELIVERED
+    assert handle.collected
+    assert any("child report" in item["payload"]
+               for item in session.pending_user_inputs)
+
+
+def test_the_barrier_survives_a_broken_session():
+    """A barrier that breaks a turn is worse than one that misses a report."""
+    registry, _ = registry_for()
+    settle(registry, registry.spawn("job", owner="repl"))
+
+    class Hostile:
+        key = "repl"
+        conversation_id = None
+        cancel_event = None
+
+        @property
+        def lock(self):
+            raise RuntimeError("no lock here")
+
+    assert registry.barrier(Hostile()) is BarrierOutcome.NONE
+
+
+@pytest.mark.parametrize("trigger", ["completion", "input", "cancel", "child_cancel"])
+def test_barrier_wakes_without_waiting_for_poll_timeout(monkeypatch, trigger):
+    from runtime.subagents import Handle
+
+    monkeypatch.setattr("runtime.subagents.BARRIER_POLL_SECONDS", 5)
+    registry = SubagentRegistry()
+    session = FakeSession("repl", 7)
+    handle = Handle(id="child", conversation_id=8, title="child", timeout=30,
+                    owner="repl", owner_conversation_id=7)
+    registry._handles[handle.id] = handle
+    checked, returned = threading.Event(), threading.Event()
+    original = registry._has_user_input
+
+    def check(session):
+        answer = original(session)
+        checked.set()
+        return answer
+
+    monkeypatch.setattr(registry, "_has_user_input", check)
+    outcomes = []
+
+    def wait():
+        outcomes.append(registry.barrier(session))
+        returned.set()
+
+    worker = threading.Thread(target=wait, daemon=True)
+    worker.start()
+    try:
+        assert checked.wait(2)
+        if trigger == "completion":
+            registry._finish(handle, DONE, text="report")
+        elif trigger == "child_cancel":
+            registry.cancel(handle.id)
+        elif trigger == "input":
+            with session.lock:
+                session.pending_user_inputs.append({"action_type": "send_text", "payload": "hi"})
+            registry.wake(session.key)
+        else:
+            session.cancel_event.set()
+            registry.wake(session.key)
+        assert returned.wait(1), "barrier waited for the polling timeout"
+        expected = (BarrierOutcome.USER_INPUT if trigger == "input" else
+                    BarrierOutcome.NONE if trigger == "cancel" else
+                    BarrierOutcome.REPORTS_DELIVERED)
+        assert outcomes == [expected]
+        assert registry._barrier_wakes == {}
+        if trigger == "input":
+            assert not handle.collected and not handle.finished
+    finally:
+        session.cancel_event.set()
+        registry.wake(session.key)
+        worker.join(2)
+
+
+def test_completion_during_barrier_state_check_is_not_lost(monkeypatch):
+    from runtime.subagents import Handle
+
+    monkeypatch.setattr("runtime.subagents.BARRIER_POLL_SECONDS", 5)
+    registry = SubagentRegistry()
+    session = FakeSession("repl", 7)
+    handle = Handle(id="child", conversation_id=8, title="child", timeout=30,
+                    owner="repl", owner_conversation_id=7)
+    registry._handles[handle.id] = handle
+
+    def complete_after_finished_check(session):
+        registry._finish(handle, DONE, text="report")
+        return False
+
+    monkeypatch.setattr(registry, "_has_user_input", complete_after_finished_check)
+    returned = threading.Event()
+    outcomes = []
+
+    def wait():
+        outcomes.append(registry.barrier(session))
+        returned.set()
+
+    worker = threading.Thread(target=wait, daemon=True)
+    worker.start()
+    try:
+        assert returned.wait(1), "completion wake was lost before waiting"
+        assert outcomes == [BarrierOutcome.REPORTS_DELIVERED]
+    finally:
+        session.cancel_event.set()
+        registry.wake(session.key)
+        worker.join(2)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The barrier, from inside a real drive.
+#
+# The bug these exist for: the barrier used to live only inside the two
+# end_turn doorways, so a turn leaving by any other route walked out past its
+# own children and their reports were never delivered. It reproduces only with
+# a real ConversationLoop, because a hand-called barrier is by definition on
+# the path that works.
+# ──────────────────────────────────────────────────────────────────────
+
+def _turn_harness(tmp_path, responses, turn=None):
+    """A real runtime whose agent gets scripted responses."""
+    from agent.tool_registry import ToolRegistry
+    from pipeline.database import Database
+    from plugins.native.tool import BaseTool, ToolResult
+    from runtime.conversation_runtime import ConversationRuntime
+
+    def _resp(content="", tool_calls=None):
+        return SimpleNamespace(content=content, tool_calls=tool_calls or [],
+                               has_tool_calls=bool(tool_calls),
+                               is_error=False, prompt_tokens=0, error=None)
+
+    seen = []
+
+    class LLM:
+        context_size = 0
+        model_name = "fake"
+        name = "fake"
+        loaded = True
+        supports_streaming = False
+
+        def chat(self, request, on_delta=None):
+            text = "\n".join(str(m.get("content") or "")
+                             for m in request.messages)
+            if "[Note: you are a background agent" in text:
+                return _resp(content="CHILD REPORT")
+            seen.append(text)
+            kind, value = responses[min(len(seen) - 1, len(responses) - 1)]
+            if kind == "spawn":
+                import json
+                return _resp(tool_calls=[{
+                    "id": f"c{len(seen)}", "name": "spawner",
+                    "arguments": json.dumps({"prompt": value})}])
+            if kind == "boom":
+                return _resp(tool_calls=[{"id": "b", "name": "boom",
+                                          "arguments": "{}"}])
+            return _resp(content=value)
+
+    class Spawner(BaseTool):
+        name = "spawner"
+        description = "spawn"
+        parameters = {"type": "object",
+                      "properties": {"prompt": {"type": "string"}}}
+        requires_services = []
+        max_calls = 20
+
+        def run(self, context, **kwargs):
+            handle = context.runtime.subagents.spawn(
+                kwargs.get("prompt") or "x", title=kwargs.get("prompt") or "x",
+                owner=context.session_key,
+                owner_conversation_id=(context.runtime.sessions
+                                       .get(context.session_key)
+                                       .conversation_id))
+            return ToolResult(True, data={"id": handle.id},
+                              llm_summary="spawned")
+
+    db = Database(str(tmp_path / "turn.db"))
+    cid = db.create_conversation("parent")
+    registry = ToolRegistry(db, {}, {})
+    registry.register(Spawner())
+    rt = ConversationRuntime(
+        db=db, services={"llm": LLM()}, tool_registry=registry,
+        config={"max_concurrent_subagents": 4,
+                "subagent_timeout_seconds": 30})
+    registry.runtime = rt
+    if turn is not None:
+        rt.subagents._config = rt.config
+    rt.load_conversation("repl", cid)
+    rt.active_session_key = "repl"
+    return rt, seen
+
+
+def test_a_turn_with_a_failing_tool_call_still_collects_its_children(tmp_path):
+    """A failed tool call is feedback, not a turn-ender, so this one does
+    reach a doorway. Pinned anyway: it is the shape the live failure was
+    reported in, and it must keep working whichever barrier catches it."""
+    rt, seen = _turn_harness(tmp_path, [
+        ("spawn", "do the thing"),
+        ("boom", None),              # a tool that does not exist -> failure
+        ("text", "PARENT FINAL"),
+    ])
+    try:
+        rt.iterate_agent_turn("repl", "go")
+        history = "\n".join(seen)
+        assert "[Background agent" in history, (
+            "the child's report never reached the model")
+        assert not rt.subagents.pending_for("repl")
+    finally:
+        rt.subagents.stop()
+
+
+def test_children_are_collected_even_when_the_loop_never_reaches_a_doorway(tmp_path):
+    """The backstop, exercised on a drive that leaves by no doorway at all.
+
+    ``drive`` is stubbed to return the way a failed action, a priority handoff
+    or an exhausted iteration budget leaves it: without enacting end_turn and
+    without consulting either end_turn doorway. Before the backstop in
+    ``_drive_agent_turn`` this abandoned every pending child silently.
+    """
+    rt, seen = _turn_harness(tmp_path, [("text", "unused")])
+    session = rt.sessions["repl"]
+    handle = rt.subagents.spawn("do the thing", title="Orphan", owner="repl",
+                                owner_conversation_id=session.conversation_id)
+    settle(rt.subagents, handle)
+
+    import runtime.runtime_config as cfg
+    from runtime.session import RuntimeResult
+
+    class SilentLoop:
+        def drive(self, *a, **kw):
+            return "", [], []          # no doorway, no end_turn
+
+    original, cfg.build_loop = cfg.build_loop, lambda *a, **kw: SilentLoop()
+    try:
+        rt._drive_agent_turn(session, RuntimeResult())
+    finally:
+        cfg.build_loop = original
+        rt.subagents.stop()
+
+    assert any("Background agent" in m["payload"] for m in session.pending_user_inputs), (
+        "a drive that reached no doorway abandoned its child")
+
+
+def test_a_normal_turn_still_collects_its_children(tmp_path):
+    """The path that always worked, kept working."""
+    rt, seen = _turn_harness(tmp_path, [
+        ("spawn", "do the thing"),
+        ("text", "spawned, ending"),
+        ("text", "PARENT FINAL"),
+    ])
+    try:
+        rt.iterate_agent_turn("repl", "go")
+        assert "[Background agent" in "\n".join(seen)
+        session = rt.sessions["repl"]
+        rows = rt.db.get_conversation_messages(session.conversation_id)
+        ids = {row["turn_id"] for row in rows if row["role"] == "assistant"}
+        assert len(ids) == 1 and None not in ids
+        assert session.turn_id is None
+        child_ids = {row[0] for row in rt.db.conn.execute(
+            "SELECT turn_id FROM conversation_messages WHERE conversation_id != ? AND role = 'assistant'",
+            (session.conversation_id,))}
+        assert child_ids and not ids.intersection(child_ids)
+    finally:
+        rt.subagents.stop()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Scheduled spawns: the bus half.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_a_timekeeper_job_on_the_spawn_channel_starts_a_child():
+    """The only route a scheduled agent can arrive by."""
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    seen = {}
+
+    def turn(key, prompt, **kw):
+        seen["prompt"] = prompt
+        return SimpleNamespace(ok=True, messages=["briefed"], error=None)
+
+    registry, runtime = registry_for(turn=turn)
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "write the morning brief",
+            "title": "Morning brief",
+            "_timekeeper": {"job_name": "brief", "one_time": False},
+        })
+        deadline = time.time() + 5
+        while not seen and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        registry.stop()
+
+    assert seen.get("prompt") == "write the morning brief"
+    # No report channel, so no framing and nothing to collect — a scheduled
+    # child's delivery surface is the user-facing push from its own turn.
+    assert "background agent" not in seen["prompt"]
+    assert registry.pending_for("repl") == []
+    cid, = runtime.db.conversations
+    assert runtime.db.conversations[cid]["category"] == "Scheduled"
+
+
+def test_a_one_time_job_files_its_conversation_separately():
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    registry, runtime = registry_for()
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "remind me",
+            "_timekeeper": {"job_name": "once", "one_time": True},
+        })
+        deadline = time.time() + 5
+        while not runtime.db.conversations and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        registry.stop()
+
+    cid, = runtime.db.conversations
+    assert runtime.db.conversations[cid]["category"] == "Scheduled (one-time)"
+
+
+def test_a_recurring_job_pins_its_conversation_so_one_transcript_accumulates():
+    """Without this, every firing opens a new conversation and the job's
+    history scatters across dozens of them."""
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    patched = {}
+
+    class Keeper:
+        def get_job(self, name):
+            return {"payload": {"prompt": "brief"}}
+
+        def update_job(self, name, patch):
+            patched[name] = patch
+
+    registry, runtime = registry_for()
+    runtime.services["timekeeper"] = Keeper()
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "brief",
+            "_timekeeper": {"job_name": "nightly", "one_time": False},
+        })
+        deadline = time.time() + 5
+        while "nightly" not in patched and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        registry.stop()
+
+    cid, = runtime.db.conversations
+    assert patched["nightly"]["payload"]["conversation_id"] == cid
+    assert patched["nightly"]["payload"]["prompt"] == "brief"
+
+
+def test_two_firings_reuse_one_conversation_even_before_persistence_returns():
+    """The in-process binding closes the async persistence race."""
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    release = threading.Event()
+
+    class Keeper:
+        def get_job(self, name):
+            release.wait(5)
+            return {"payload": {"prompt": "brief", "custom": "kept"}}
+
+        def update_job(self, name, patch):
+            self.patch = patch
+
+    registry, runtime = registry_for()
+    keeper = Keeper()
+    runtime.services["timekeeper"] = keeper
+    registry.start()
+    event = {"prompt": "brief",
+             "_timekeeper": {"job_name": "nightly", "one_time": False}}
+    try:
+        bus.emit(SUBAGENT_SPAWN, event)
+        assert eventually(lambda: len(runtime.db.conversations) == 1)
+        assert eventually(lambda: all(h.finished
+                                      for h in registry._handles.values()))
+        bus.emit(SUBAGENT_SPAWN, event)
+        assert eventually(lambda: len(registry._handles) == 2 and all(
+            h.finished for h in registry._handles.values()))
+    finally:
+        release.set()
+        assert eventually(lambda: hasattr(keeper, "patch"))
+        registry.stop()
+
+    assert len(runtime.db.conversations) == 1
+    assert keeper.patch["payload"]["custom"] == "kept"
+
+
+def test_clear_before_run_keeps_the_bound_conversation():
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    registry, runtime = registry_for()
+    cid = runtime.create_conversation("Daily", category="Scheduled")
+    runtime.db.messages.append((cid, "assistant", "yesterday"))
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "brief", "conversation_id": cid,
+            "clear_before_run": True,
+            "_timekeeper": {"job_name": "daily", "one_time": False},
+        })
+        assert eventually(lambda: all(h.finished
+                                      for h in registry._handles.values()))
+    finally:
+        registry.stop()
+
+    assert runtime.cleared == [cid]
+    assert list(runtime.db.conversations) == [cid]
+    assert runtime.db.messages == []
+
+
+def test_a_failed_binding_write_is_reported_to_the_user():
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    class BrokenKeeper:
+        def get_job(self, name):
+            raise RuntimeError("disk unavailable")
+
+    registry, runtime = registry_for()
+    runtime.services["timekeeper"] = BrokenKeeper()
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "brief",
+            "_timekeeper": {"job_name": "daily", "one_time": False},
+        })
+        assert eventually(lambda: any("was not saved" in p
+                                      for p in runtime.pushed))
+    finally:
+        registry.stop()
+
+
+def test_a_job_removed_during_spawn_is_not_updated_or_left_cached():
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    class RemovedKeeper:
+        updated = False
+
+        def get_job(self, name):
+            return None
+
+        def update_job(self, name, patch):
+            self.updated = True
+
+    registry, runtime = registry_for()
+    keeper = RemovedKeeper()
+    runtime.services["timekeeper"] = keeper
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "brief",
+            "_timekeeper": {"job_name": "gone", "one_time": False},
+        })
+        assert eventually(lambda: "gone" not in
+                          registry._scheduled_conversations)
+    finally:
+        registry.stop()
+
+    assert keeper.updated is False
+
+
+def test_pinning_the_conversation_never_holds_the_publisher_s_thread():
+    """The freeze, from the subscriber's side.
+
+    ``bus.emit`` runs handlers on the publisher's thread, and the publisher
+    here is the timekeeper — mid-``poll``, holding its box's one call lock.
+    Pinning the conversation calls straight back into that same service, so
+    doing it inline blocked on the lock the publisher could not release until
+    this handler returned. The box wedged until the hard ceiling killed it, and
+    every later ``cron.*`` call parked another sandbox worker on it forever.
+
+    A real box would deadlock rather than fail, so this asserts the property
+    that prevents it: ``_on_event`` returns without waiting on the keeper.
+    Note the registry's own ``except`` cannot cover the real case — a deadlock
+    is a block, not a raise.
+    """
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class SlowKeeper:
+        """Stands in for a box whose lock is held by whoever published."""
+
+        def get_job(self, name):
+            """Block, exactly as waiting on a held box lock would."""
+            entered.set()
+            release.wait(timeout=10.0)
+            return {"payload": {}}
+
+        def update_job(self, name, patch):
+            """Never reached while blocked."""
+
+    registry, runtime = registry_for()
+    runtime.services["timekeeper"] = SlowKeeper()
+    registry.start()
+    try:
+        started = time.monotonic()
+        bus.emit(SUBAGENT_SPAWN, {
+            "prompt": "brief",
+            "_timekeeper": {"job_name": "nightly", "one_time": False},
+        })
+        elapsed = time.monotonic() - started
+
+        assert entered.wait(timeout=5.0), "the pin never ran at all"
+        assert elapsed < 2.0, f"the publisher was held for {elapsed:.1f}s"
+    finally:
+        release.set()
+        registry.stop()
+
+
+def test_a_scheduled_spawn_that_cannot_start_tells_the_user():
+    """Nobody is collecting, so a refusal that is not pushed is one nobody
+    ever learns about."""
+    from events.event_bus import bus
+    from events.event_channels import SUBAGENT_SPAWN
+
+    registry, runtime = registry_for()
+    registry.start()
+    try:
+        bus.emit(SUBAGENT_SPAWN, {"prompt": "   "})  # refused: no prompt
+        deadline = time.time() + 5
+        while not runtime.pushed and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        registry.stop()
+
+    assert runtime.pushed and "did not start" in runtime.pushed[0]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# agent.schedule: the Request that writes the job.
+# ──────────────────────────────────────────────────────────────────────
+
+class RecordingKeeper:
+    """Just enough Timekeeper to see what job definition was written."""
+
+    def __init__(self):
+        self.jobs = {}
+
+    def create_job(self, name, job):
+        self.jobs[name] = job
+        return job
+
+
+def _schedule(args):
+    """Call the agent.schedule handler with a recording Timekeeper."""
+    from sandbox.guest.requests import AGENT_SCHEDULE
+    from sandbox.handlers import HANDLERS
+    from tests.support import call_handler
+
+    keeper = RecordingKeeper()
+    ctx = SimpleNamespace(services={"timekeeper": keeper}, runtime=None)
+    return call_handler(AGENT_SCHEDULE, ctx, args), keeper
+
+
+def test_scheduling_writes_a_job_on_the_kernels_own_spawn_channel():
+    """The channel and payload shape are the kernel's, which is the whole
+    reason this is a Request rather than a hand-built cron.create."""
+    from events.event_channels import SUBAGENT_SPAWN
+
+    result, keeper = _schedule({"prompt": "morning brief", "cron": "0 9 * * *",
+                                "title": "Brief"})
+    assert result.ok
+    job = keeper.jobs["brief"]
+    assert job["channel"] == SUBAGENT_SPAWN
+    assert job["cron"] == "0 9 * * *" and job["one_time"] is False
+    assert job["run_at"] is None and job["enabled"] is True
+    assert job["payload"] == {"title": "Brief", "prompt": "morning brief",
+                              "attachments": []}
+
+
+def test_a_one_time_schedule_resolves_the_cron_to_an_absolute_time():
+    """The Timekeeper wants a run_at, not a cron, for a job that fires once."""
+    result, keeper = _schedule({"prompt": "remind me", "cron": "0 9 * * *",
+                                "one_time": True, "title": "Reminder"})
+    assert result.ok
+    job = keeper.jobs["reminder"]
+    assert job["one_time"] is True and job["cron"] is None
+    assert job["run_at"] and "T" in job["run_at"]
+
+
+def test_scheduling_refuses_a_malformed_cron_rather_than_writing_it():
+    result, keeper = _schedule({"prompt": "go", "cron": "not a cron"})
+    assert not result.ok and "cron" in result.error
+    assert keeper.jobs == {}
+
+
+def test_scheduling_needs_both_a_prompt_and_a_cron():
+    assert not _schedule({"cron": "0 9 * * *"})[0].ok
+    assert not _schedule({"prompt": "go"})[0].ok
+
+
+def test_the_documented_orchestration_script_actually_runs(tmp_path):
+    """The SDK's fan-out example, executed exactly as written.
+
+    The whole reason spawning is in the SDK is that an agent should reach for
+    a script instead of authoring a tool — and it will only do that if the one
+    example it is shown works. So the example is run rather than trusted, the
+    same rule ``tests/test_sdk_docs.py`` applies to the rest of the document.
+    """
+    import re
+    from pathlib import Path
+
+    import sandbox  # noqa: F401  - installs the ``guest`` package alias
+    from guest.loader import unload_box
+    from sandbox import Sandbox
+
+    doc = Path(__file__).resolve().parents[1] / "docs/SDK.md"
+    source = next(
+        block for block in re.findall(
+            r"```python\n(.*?)```", doc.read_text(encoding="utf-8"), re.S)
+        if "def main(sdk, questions)" in block)
+    script = tmp_path / "research.py"
+    script.write_text(source, encoding="utf-8")
+
+    # One child answers, one overruns its deadline — the example has to handle
+    # both, and a version that only handled success would still pass a
+    # happy-path test.
+    slow = threading.Event()
+
+    def turn(key, prompt, **kw):
+        if "never" in prompt:
+            slow.wait(5)
+        return SimpleNamespace(ok=True, messages=[f"answer to {prompt[-6:]}"],
+                               error=None)
+
+    # The example asks for 600s; the configured ceiling caps it, which is how
+    # a one-second deadline is imposed on a five-second child from out here.
+    registry, runtime = registry_for(
+        turn=turn, config={"max_concurrent_subagents": 4,
+                           "subagent_timeout_seconds": 1})
+    runtime.subagents = registry
+    ctx = SimpleNamespace(runtime=runtime, session_key=None, user_id=1,
+                          services={}, config=runtime.config, db=runtime.db,
+                          root_dir=str(tmp_path))
+
+    box = Sandbox()
+    try:
+        result = box.run(script, "main",
+                         kwargs={"questions": ["question one", "never ends"]},
+                         context=ctx)
+    finally:
+        slow.set()
+        unload_box("research")
+        box.shutdown()
+
+    assert result.ok, result.error
+    assert "answer to" in result.data["report"]
+    assert result.data["lost"] and "cancelled" in result.data["lost"][0]
+
+
+def test_the_schedule_command_names_the_kernels_spawn_channel():
+    """A command cannot import the kernel, so it spells the channel out.
+
+    That leaves exactly one way for the two to drift, and this closes it.
+    """
+    from events.event_channels import SUBAGENT_SPAWN
+    from sandbox.validator import validate_file
+
+    source = validate_file("bundled/commands/command_schedule.py").source
+    assert f'SUBAGENT_CHANNEL = "{SUBAGENT_SPAWN}"' in source
+
+
+def test_a_long_report_says_how_much_was_cut():
+    """A preview the model mistakes for the whole report is worse than an
+    obvious truncation."""
+    from runtime.subagents import NOTICE_CAP
+
+    def turn(key, prompt, **kw):
+        return SimpleNamespace(ok=True, messages=["x" * (NOTICE_CAP + 500)],
+                               error=None)
+
+    registry, _ = registry_for(turn=turn)
+    handle = settle(registry, registry.spawn("go", owner="repl"))
+    notice = handle.notice()
+    assert "report truncated" in notice
+    assert f"{NOTICE_CAP + 500:,} chars total" in notice
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Agent profiles. A child may be given *less* than its spawner has, which is
+# what makes it safe to hand a subagent a tool that writes.
+# ──────────────────────────────────────────────────────────────────────
+
+PROFILES = {
+    "default": {"llm": "default", "whitelist_or_blacklist_tools": "blacklist",
+                "tools_list": []},
+    "memory_curator": {"llm": "default",
+                       "whitelist_or_blacklist_tools": "whitelist",
+                       "tools_list": ["memory"]},
+    "researcher": {"llm": "default",
+                   "whitelist_or_blacklist_tools": "whitelist",
+                   "tools_list": ["hybrid_search"]},
+}
+
+
+def profile_registry(**config):
+    """A registry whose runtime knows about profiles and records what it took."""
+    registry, runtime = registry_for(
+        config={"max_concurrent_subagents": 4, "subagent_timeout_seconds": 300,
+                "agent_profiles": PROFILES, "active_agent_profile": "default",
+                **config})
+    runtime.took: list[tuple[str, str]] = []
+    runtime.set_agent_profile = (
+        lambda key, profile: runtime.took.append((key, profile)) or True)
+    return registry, runtime
+
+
+def test_a_named_profile_reaches_the_child_and_its_report():
+    """The marker is only half of it: the session has to take the profile too,
+    because ``set_agent_profile`` is what rebuilds the tool specs the turn
+    actually calls through."""
+    registry, runtime = profile_registry()
+    handle = settle(registry, registry.spawn("curate", owner="repl",
+                                             profile="memory_curator"))
+    assert handle.profile == "memory_curator"
+    assert handle.report()["profile"] == "memory_curator"
+    assert runtime.took == [(f"{SESSION_PREFIX}{handle.conversation_id}",
+                             "memory_curator")]
+
+
+def test_an_unknown_profile_raises_rather_than_running_unrestricted():
+    """The one direction this must not fail in.
+
+    Substituting ``default`` would run the child with every tool installed
+    while the caller believed it was confined, and nothing would say so.
+    """
+    registry, _ = profile_registry()
+    with pytest.raises(ValueError, match="no agent profile named 'curator'"):
+        registry.spawn("go", owner="repl", profile="curator")
+
+
+def test_naming_no_profile_inherits_the_spawners_rather_than_default():
+    """A session pinned to a narrow profile must not spawn a wide child.
+
+    That was the old behaviour — the marker said ``default`` unconditionally —
+    and it is a widening nobody asked for.
+    """
+    registry, runtime = profile_registry()
+    parent = runtime.open_session("repl", conversation_id=7)
+    parent.profile_override = "researcher"
+    parent.frontend_name = None
+
+    handle = settle(registry, registry.spawn("go", owner="repl"))
+    assert handle.profile == "researcher"
+
+
+def test_a_spawn_with_no_spawner_session_falls_back_to_default():
+    """A scheduled job has no session to inherit from, so there is nothing to
+    read and ``default`` is the honest answer."""
+    registry, _ = profile_registry()
+    handle = settle(registry, registry.spawn("go", owner=None))
+    assert handle.profile == "default"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# A synchronous spawn and the caller's own wall clock.
+# ──────────────────────────────────────────────────────────────────────
+
+class _StuckHandle:
+    """A child that never finishes, so the caller's clock is what decides."""
+
+    id = "sa_1"
+    title = "Research"
+    conversation_id = 42
+
+    def report(self):
+        return {"id": self.id, "state": RUNNING, "ok": False, "error": "",
+                "conversation_id": self.conversation_id}
+
+
+class _StuckRegistry:
+    """Enough registry for the ``wait=True`` loop, recording what it cancels."""
+
+    def __init__(self):
+        self.cancelled = []
+
+    def spawn(self, prompt, **kwargs):
+        return _StuckHandle()
+
+    def collect(self, ids, timeout=None):
+        return [_StuckHandle().report()]
+
+    def cancel(self, handle_id):
+        self.cancelled.append(handle_id)
+        return True
+
+
+def _spawn_waiting(wall: float):
+    """Drive ``agent.spawn(wait=True)`` with ``wall`` seconds of ceiling left."""
+    from sandbox import provenance
+    from sandbox.guest.requests import AGENT_SPAWN
+    from sandbox.policy import Chain
+    from tests.support import call_handler
+
+    registry = _StuckRegistry()
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(subagents=registry, sessions={}),
+        session_key="repl", user_id=1)
+    execution = SimpleNamespace(
+        cancelled=False,
+        remaining=lambda: {"running": 300.0, "wall": wall,
+                           "deadline": 300.0, "ceiling": 600.0})
+    with provenance.serving(Chain(), None, execution):
+        return call_handler(AGENT_SPAWN, ctx,
+                            {"prompt": "go", "wait": True}), registry
+
+
+def test_a_synchronous_spawn_gives_up_before_its_own_box_is_killed():
+    """The wall ceiling is not discounted for time blocked on the kernel, so a
+    child running to its full deadline outlives the box waiting on it. The
+    handler has to answer first: a starved box never resumes, so the tool's
+    own error branch would not run and nothing would reach the agent but the
+    runner's generic timeout — naming the declared deadline, which is not what
+    killed it."""
+    result, registry = _spawn_waiting(wall=0.5)
+    assert not result.ok
+    assert registry.cancelled == ["sa_1"]
+
+
+def test_a_child_lost_to_the_ceiling_still_names_its_conversation():
+    """The whole cost of dying on the wrong path is the agent believing the
+    work is gone. It is not — the partial transcript is in the child's own
+    conversation, and the id is the only way back to it."""
+    result, _ = _spawn_waiting(wall=0.5)
+    assert "ran out of time" in result.error
+    assert "conversation #42" in result.error
+
+
+def test_plenty_of_wall_clock_left_is_not_a_reason_to_give_up():
+    """The guard is a deadline, not a policy: a caller with time to spare
+    keeps waiting, and one reading no enforced deadline carries on — the
+    convention ``abandoned`` already follows, so a handler written against
+    either reads as "carry on" wherever nothing is being enforced."""
+    from sandbox.provenance import Caller
+
+    def caller(execution):
+        return Caller(chain=None, execution=execution)
+
+    assert not caller(None).out_of_time
+    assert not caller(SimpleNamespace(remaining=lambda: {"wall": None})).out_of_time
+    assert not caller(SimpleNamespace(remaining=lambda: {"wall": 400.0})).out_of_time
+    assert caller(SimpleNamespace(remaining=lambda: {"wall": 0.5})).out_of_time
+
+
+def test_every_blocking_handler_asks_the_same_two_questions():
+    """The four waiting handlers are a real 2x2 — subagent or script, wait now
+    or collect later — but the rule they wait by is one thing. It was written
+    out four times and three of the copies were missing half of it, so what is
+    pinned here is that each site reaches the shared answer rather than
+    rolling its own."""
+    import ast
+    import inspect
+
+    from sandbox.handlers import kernel
+
+    source = inspect.getsource(kernel)
+    tree = ast.parse(source)
+    waiting = {"_agent_spawn", "_agent_collect", "_script_run",
+               "_script_collect"}
+    seen = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in waiting:
+            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            attrs = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+            seen[node.name] = bool(
+                "_give_up_waiting" in names
+                or {"abandoned", "out_of_time"} <= attrs)
+    assert seen == {name: True for name in waiting}, seen
+
+
+def test_a_collector_hands_back_what_is_ready_rather_than_dying_with_it():
+    """A collector answers the two questions differently from a spawner: there
+    is nothing to report to somebody who left, but somebody still waiting
+    would rather have the finished children than be killed holding all of
+    them. ``stop`` leaves the running ones alone, so they stay collectable."""
+    release = threading.Event()
+
+    def turn(key, prompt, **kwargs):
+        release.wait(timeout=5.0)
+        return SimpleNamespace(ok=True, messages=["done"], error=None)
+
+    registry, _ = registry_for(turn=turn)
+    handle = registry.spawn("slow", owner="repl")
+    try:
+        reports = registry.collect([handle.id], owner="repl",
+                                   stop=lambda: True)
+        assert [r["state"] for r in reports] == [RUNNING]
+        assert not handle.collected
+    finally:
+        release.set()
+        settle(registry, handle)

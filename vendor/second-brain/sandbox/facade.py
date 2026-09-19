@@ -1,0 +1,861 @@
+"""The front door — one API for running anything under the sandbox.
+
+Underneath there are three mechanisms (a thread runner, a process runner, and
+resident boxes) with three different shapes. Callers should not have to know
+which one they are using: whether code is isolated, how long it may take, and
+whether it stays resident are all *declarations in the file*, resolved here.
+
+So one call does the whole sequence:
+
+    validate -> read declarations -> resolve the box -> clamp -> pick a runner
+
+If a file will not pass validation it is never executed, and the bytes that
+were validated are the bytes that run — the report carries them, so a file
+that changes in between was never checked.
+
+Two lifetimes, three entry points:
+
+- :meth:`Sandbox.run` — ephemeral, blocking. Returns a Result.
+- :meth:`Sandbox.start` — ephemeral, non-blocking. Returns a :class:`Run` to
+  wait on, poll, or cancel later. This is the ``wait=False`` shape: a tool
+  that spawns background work returns immediately while the work continues.
+- :meth:`Sandbox.open` — resident. Returns a box to call into until stopped.
+
+Every box the sandbox opens is tracked, so :meth:`Sandbox.shutdown` can close
+them all. An untracked resident box is an orphaned process after a restart.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
+from pathlib import Path
+
+from .approval import build_approver
+from .boxes import DEFAULT_START_TIMEOUT, BoxError, PersistentBox, open_box
+from .guest.box import PERSISTENT, SUBPROCESS, Membership, resolve
+from .isolation import required_isolation
+from .guest.loader import install_parsers, load_entry, unload_box
+from .guest.requests import Result
+from .interpreter import Execution, Interpreter
+from .policy import Chain, chain_session
+from .runner import run_in_process
+from .runner_subprocess import drain as drain_prewarmed
+from .runner_subprocess import run_in_subprocess
+from .validator import validate_file
+
+logger = logging.getLogger("Sandbox")
+
+# How long ``Run.wait()`` blocks when nobody named a limit. Comfortably past
+# the runner's own ceiling (``MAX_TIMEOUT_SECONDS``), so it never pre-empts a
+# run that is legitimately still going — it exists only to break the case
+# where the run has not begun because the pool is saturated.
+WAIT_CEILING = 660.0
+
+
+#: How long a finished-but-uncollected run is kept before it is swept. Nothing
+#: obliges a caller to collect, and a script that starts detached work and then
+#: fails leaves its results behind — so the registry has to forget on its own or
+#: it is a leak with no symptom until the process is out of memory. Generous
+#: against the longest a run can take (``HARD_CEILING``), because the failure to
+#: avoid is dropping a result somebody was about to ask for.
+COLLECT_RETENTION = 1800.0
+
+
+class _Act:
+    """One Request a frontend detached, and its answer when it has one.
+
+    Not a :class:`Run`: no code executes, so there is no box, no watchdog and
+    nothing to cancel — just a Request making its ordinary way through the
+    gate on a thread of its own, so the caller's box is free to render the
+    dialog it may raise.
+    """
+
+    _next_id = 0
+    _id_lock = threading.Lock()
+
+    def __init__(self, owner: str, request_type: str):
+        with _Act._id_lock:
+            _Act._next_id += 1
+            self.id = f"act-{_Act._next_id}"
+        self.owner = owner
+        self.type = request_type
+        self.result: Result | None = None
+        self.finished_at: float | None = None
+
+
+class Run:
+    """An ephemeral execution in flight.
+
+    Returned by :meth:`Sandbox.start`. The work is already running; this is
+    the handle for finding out how it went, or for stopping it.
+    """
+
+    _next_id = 0
+    _id_lock = threading.Lock()
+
+    def __init__(self, name: str, chain: Chain, execution: Execution,
+                 interpreter: Interpreter):
+        self.name = name
+        self.chain = chain
+        # A handle, because a detached run outlives the call that started it
+        # and there has to be something to name it by later. Counter rather
+        # than uuid so it reads in a log line; process-local, which is all it
+        # ever has to be — nothing persists a run id.
+        with Run._id_lock:
+            Run._next_id += 1
+            self.id = f"run-{Run._next_id}"
+        #: Who may collect this run: the chain root of whatever started it.
+        #: Set by :meth:`Sandbox.start` when a caller asks to keep it.
+        self.owner: str | None = None
+        self.finished_at: float | None = None
+        #: The file this run came from, as ``script.run`` names it. ``name`` is
+        #: the *box* — the stem — and the two Requests must not answer the same
+        #: key with two different strings, which is what "tally" beside
+        #: "tally.py" would be.
+        self.label: str = name
+        self._execution = execution
+        self._interpreter = interpreter
+        self._future = None
+        self._proc = None
+        self._cancelled = False
+
+    def _attach(self, future):
+        """Bind the future once the work has been submitted."""
+        self._future = future
+        return self
+
+    def _attach_proc(self, proc):
+        """Remember the child process so cancelling can reach it."""
+        self._proc = proc
+
+    @property
+    def done(self) -> bool:
+        """Whether the work has finished, one way or another."""
+        return self._future is not None and self._future.done()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether this run was cancelled."""
+        return self._cancelled
+
+    def wait(self, timeout: float | None = None) -> Result:
+        """Block for the result. Safe to call more than once.
+
+        The default is bounded rather than forever. The work itself is already
+        deadlined by its runner, so waiting past that means the run never
+        started — which happens when the background pool is full of runs
+        waiting on *this* pool, and an unbounded wait there is a hang with no
+        way out.
+        """
+        if self._future is None:
+            return Result.failure("run was never started")
+        deadline = WAIT_CEILING if timeout is None else timeout
+        try:
+            return self._future.result(timeout=deadline)
+        except FuturesTimeout:
+            return Result.failure("still running", retryable=True)
+        except Exception as exc:
+            return Result.failure(f"run failed: {exc}")
+
+    def report(self) -> dict:
+        """What this run looks like from outside, as plain data.
+
+        The shape ``script.collect`` answers with, and the same four states a
+        subagent handle reports — a caller that has learned one has learned
+        both. ``running`` carries no ``data``, because there is none yet.
+        """
+        if not self.done:
+            state = "running"
+            result = None
+        else:
+            result = self.wait(timeout=0)
+            state = ("cancelled" if self._cancelled
+                     else "done" if result.ok else "failed")
+        return {
+            "id": self.id,
+            "script": self.label,
+            "state": state,
+            "ok": bool(result.ok) if result is not None else False,
+            "data": result.data if result is not None else None,
+            "error": (result.error if result is not None else "") or "",
+        }
+
+    def cancel(self) -> None:
+        """Stop it: starve the Requests, then close the pipe.
+
+        Starvation alone only reaches code that propagates its failures; a
+        loop that ignores Results keeps going. Killing the child is what ends
+        both sides. In-process there is no kill, so a compute loop with no
+        Requests survives — the honest limit of that runner.
+        """
+        self._cancelled = True
+        self._interpreter.cancel(self._execution)
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+class Sandbox:
+    """The kernel's handle on sandboxed execution."""
+
+    def __init__(self, interpreter: Interpreter | None = None, *,
+                 context=None, approve=None, record=None, runtime=None,
+                 session_key=None, max_background: int = 16):
+        """
+        context:
+            The kernel's context object, passed to every handler — Second
+            Brain's ``SecondBrainContext``. Lives on the host side and never
+            crosses into the guest.
+        runtime:
+            The conversation runtime. Supplying it wires approval to the
+            kernel's own doorway — ``vet_permission`` hooks, the user's
+            trusted list, then a dialog. Without one, and without an explicit
+            ``approve``, everything unsafe is refused.
+        """
+        if approve is None and runtime is not None:
+            approve = build_approver(runtime, session_key)
+        self.interpreter = interpreter or Interpreter(
+            approve=approve, record=record, context=context)
+        # Trees to resolve ``dependencies_files`` against. Set by the bridge,
+        # which is the part of the sandbox allowed to know about plugin
+        # layout; empty means "look only in the plugin's own tree".
+        self.plugin_roots: list = []
+        self._pool = ThreadPoolExecutor(max_workers=max_background,
+                                        thread_name_prefix="sandbox-bg")
+        self._boxes: dict[str, PersistentBox] = {}
+        # One lock per box name, held across the open so two callers cannot
+        # both spawn. Keyed by name rather than one global lock so opening a
+        # slow service does not block opening an unrelated one.
+        self._opening: dict[str, threading.Lock] = {}
+        #: box name -> the file it was opened from, so a name collision
+        #: across trees is caught rather than silently resolved.
+        self._source_of: dict[str, str] = {}
+        self._runs: list[Run] = []
+        #: Detached runs somebody asked to keep, by id, until collected or
+        #: swept. Deliberately *not* ``_runs``: that list is what ``/cancel``
+        #: sweeps and it drops a run the moment it finishes, which is correct
+        #: for interruption and useless for collection — the result is gone
+        #: before anyone can ask. Only a run started with ``collect_owner``
+        #: lands here, so ordinary tool and command runs still cost nothing.
+        self._collectable: dict[str, Run] = {}
+        #: Detached *Requests* a frontend asked for, by handle. Separate from
+        #: ``_collectable`` because these run no code at all — there is no box,
+        #: no deadline and no cancellation of guest work, only one Request
+        #: through the ordinary gate — so a ``Run`` would be almost entirely
+        #: empty fields. Same one-shot, owner-scoped, swept contract though.
+        self._acts: dict[str, _Act] = {}
+        self._lock = threading.Lock()
+
+    def bind_runtime(self, runtime, session_key=None) -> None:
+        """Wire approval to the kernel's doorway, once a runtime exists.
+
+        Boot order is why this is a separate call rather than a constructor
+        argument. Services and frontends are discovered and loaded well before
+        the conversation runtime is built, so the sandbox they run in has to
+        exist first — and a sandbox with nobody to ask refuses every unsafe
+        Request. That is the right default for the gap and the wrong answer
+        forever: without this, ``/packages install`` and every other
+        approval-gated capability fails with the policy's refusal reason
+        instead of putting a dialog in front of the user.
+
+        Idempotent, and it does not clobber an approver supplied explicitly —
+        a test that wired its own decision keeps it.
+        """
+        if runtime is None or self.interpreter.can_ask:
+            return
+        self.interpreter.set_approver(build_approver(runtime, session_key))
+
+    def bind_context(self, factory) -> None:
+        """Wire the host object that *answers* Requests.
+
+        ``factory(session_key) -> context`` — Second Brain's
+        ``SecondBrainContext``, which lives on this side of the boundary and
+        never crosses. An ephemeral run is handed one per call, and a frontend
+        is handed one when its box opens, but a *service* has neither: it is
+        resident, it opens before any session exists, and nothing was giving
+        it anything. Every config, database and runtime Request from a service
+        therefore failed, which is how the timekeeper came to hold jobs it
+        could not persist.
+
+        Injected rather than imported because the sandbox must stay ignorant
+        of ``runtime.*``; the composition root supplies it, exactly as it
+        supplies the approver.
+        """
+        self.interpreter.set_context_factory(factory)
+
+    def bind_ledger(self, record) -> None:
+        """Wire the flight recorder.
+
+        ``record(chain, request, decision, result, context=None)``. Without it
+        every effect a plugin performs is invisible to the action ledger, which
+        is the one place unattended work is supposed to be reconstructable
+        from. Injected for the same reason the context is: the sink writes to a
+        kernel table and the sandbox does not know what a database is.
+
+        The trailing context is the one the execution's handlers answered from.
+        It is optional because a sink recording only *what* happened needs
+        nothing else; the kernel's own reads it to say *whose* conversation the
+        effect belonged to, which no other argument can answer.
+        """
+        self.interpreter.set_record(record)
+
+    # ──────────────────────────────────────────────────────────────
+    # Resolving what a file asked for.
+    # ──────────────────────────────────────────────────────────────
+
+    def inspect(self, source):
+        """Validate a file and resolve the box it would run in.
+
+        Returns ``(report, spec)``. Does not import or execute anything.
+        """
+        report = validate_file(source)
+        declared = report.declarations
+        # A file may hold several services, and they share one box — so the
+        # box's ceilings have to fit its *slowest and largest* occupant, not
+        # whichever class happened to be written first. Taking the maximum is
+        # the only reading that cannot silently starve a sibling; the kernel
+        # still clamps whatever comes out.
+        occupants = list(declared.get("classes") or []) or [declared]
+        timeout = max(float(spec.get("timeout") or 0) for spec in occupants)
+        memory_mb = max(int(spec.get("memory_mb") or 0) for spec in occupants)
+        # Isolation is the one field the file does not get a vote on: it comes
+        # from which tree the file lives in, which is not something the file
+        # can assert. Everything else here is still declared intent, resolved
+        # and clamped downstream.
+        membership = Membership(
+            source=Path(source).stem,
+            box=str(declared.get("box") or ""),
+            isolation=required_isolation(source, report),
+            lifetime=str(declared.get("lifetime") or ""),
+            timeout=timeout,
+            memory_mb=memory_mb,
+        )
+        spec = resolve([membership])[membership.box_name]
+        return report, spec
+
+    def _prepare(self, source, *, isolated=None, timeout=None, name=None):
+        """Validate and resolve, or explain why the file will not run."""
+        report, spec = self.inspect(source)
+        if not report.ok:
+            raise BoxError(report.render())
+        if report.disclaimed:
+            logger.warning("%s runs with a disclaimer:\n%s",
+                           report.filename, report.render())
+        return report, spec, {
+            "name": name or spec.name,
+            "isolated": spec.isolation == SUBPROCESS if isolated is None
+            else isolated,
+            "timeout": timeout if timeout is not None else (
+                spec.timeout or None),
+            "memory_mb": spec.memory_mb or None,
+            "extra_roots": self.dependency_roots(
+                source, report.declarations.get("dependencies_files")),
+            "parsers": self.parser_modules(
+                report.declarations.get("parse_modalities")),
+            # Carried to the loader so the bytes that ran are the bytes that
+            # passed. Validation reads a path and execution opens it again;
+            # without this the two could disagree and nothing would notice.
+            "digest": report.digest,
+        }
+
+    @staticmethod
+    def parser_modules(declared) -> list:
+        """The parser files backing a plugin's declared ``parse_modalities``.
+
+        Resolution is the kernel's, deliberately. A modality is a fact about
+        which parser packages are installed right now, and the box has no way
+        to know that — so the plugin names *what it needs* and the kernel
+        answers with *which files provide it*. That is also what makes the
+        declaration safe to act on: naming a capability cannot reach a file
+        the kernel would not have offered anyway.
+
+        Importing :mod:`parsing` lazily keeps the sandbox's import graph free
+        of the kernel; this is a host-side module and may, but the module-level
+        edge would be one more thing to explain in the boundary test.
+        """
+        if not declared:
+            return []
+        import parsing
+
+        return [str(path) for path in parsing.sources_for(declared)]
+
+    def dependency_roots(self, source, declared) -> list:
+        """Where a plugin's declared ``dependencies_files`` actually live.
+
+        The declaration is tree-relative (``parsers/parse_image.py``) because
+        that is how the store ships it, but at runtime the file sits in
+        whichever tree it was installed into. Resolution walks the plugin's
+        own tree first and then the others, so an installed tool can declare
+        a parser that only ships with the app.
+
+        Returns directories rather than files: they join the box's import
+        path, which is what turns a declaration into an importable name.
+        """
+        if not declared:
+            return []
+
+        source = Path(source)
+        own_tree = self._tree_of(source)
+        search = [own_tree, *(t for t in self.plugin_roots if t != own_tree)]
+
+        found, missing = [], []
+        for relative in declared:
+            for tree in search:
+                candidate = tree / relative
+                if candidate.is_file():
+                    if candidate.parent not in found:
+                        found.append(candidate.parent)
+                    break
+            else:
+                missing.append(relative)
+        if missing:
+            # Not fatal here: the import itself will fail with a better
+            # message, and a plugin may declare a file it only needs when
+            # installed a particular way.
+            logger.debug("%s declares unresolved dependencies: %s",
+                         source.name, missing)
+        return found
+
+    @staticmethod
+    def _tree_of(source: Path) -> Path:
+        """The tree a plugin source sits in.
+
+        Asked of the layout rather than counted in path segments. Two levels up
+        is right for ``<tree>/<family>/plugin.py`` and wrong for a family-local
+        ``<tree>/<family>/helpers/x.py``, where it yields the family directory —
+        so a helper declaring a dependency searched its own folder's parent
+        instead of its tree, and resolved a sibling only by luck.
+
+        Falls back to the old guess for a path in no known tree (a temp file, a
+        test fixture), which is the only case that answer was ever right for.
+        """
+        try:
+            import trees
+            found = trees.locate(source)
+        except Exception:
+            found = None
+        return found.tree.path if found is not None else source.parent.parent
+
+    # ──────────────────────────────────────────────────────────────
+    # Ephemeral.
+    # ──────────────────────────────────────────────────────────────
+
+    def run(self, source, entry: str = "", *, kwargs: dict | None = None,
+            chain: Chain | None = None, name: str | None = None,
+            isolated: bool | None = None, timeout: float | None = None,
+            context=None, method: str = "run",
+            once: bool = False) -> Result:
+        """Run once and wait for the answer. The ``wait=True`` shape."""
+        run = self.start(source, entry, kwargs=kwargs, chain=chain, name=name,
+                         isolated=isolated, timeout=timeout, context=context,
+                         method=method, once=once)
+        return run.wait()
+
+    def start(self, source, entry: str = "", *, kwargs: dict | None = None,
+              chain: Chain | None = None, name: str | None = None,
+              isolated: bool | None = None, timeout: float | None = None,
+              on_done=None, context=None, method: str = "run",
+              once: bool = False, collect_owner: str | None = None,
+              report_guard=None) -> Run:
+        """Run without waiting. The ``wait=False`` shape.
+
+        The work begins immediately on a background thread and the caller
+        keeps going. ``on_done`` fires with the Result when it finishes, which
+        is how a spawner queues a completion notice back to its session.
+
+        ``collect_owner`` keeps the run's result after it finishes so that
+        owner can :meth:`collect` it later. Without it the result is discarded
+        the moment the run ends, which is right for a caller that is holding
+        the ``Run`` itself and wrong for one that only has an id.
+
+        ``once`` waives the persistent-lifetime refusal below. A resident
+        plugin still has one-shot moments — ``on_install``, ``on_uninstall`` —
+        and calling one named method and discarding the box is not the mistake
+        that check exists to catch.
+
+        ``report_guard`` is handed the validator's reading of the exact bytes
+        this start will execute, and raises to stop it. Kernel callers only:
+        it is how ``script.run`` authorizes a property of the source without
+        the classification and the launch reading two different files.
+        """
+        report, spec, opts = self._prepare(source, isolated=isolated,
+                                           timeout=timeout, name=name)
+        # A kernel caller may need to authorize a property of the exact bytes
+        # this start will execute. The digest in ``opts`` binds the loader to
+        # this report, so a guard here closes the path-validation race without
+        # exposing either the report or the callback to guest code.
+        if report_guard is not None:
+            report_guard(report)
+        # A service or frontend adapted as a one-shot run would set up a
+        # transport and never be called again, so the default is a refusal
+        # rather than a surprise. ``once`` is the caller stating it wants one
+        # method, not the plugin.
+        if spec.lifetime == PERSISTENT and not once:
+            raise BoxError(
+                f"{opts['name']} declares a persistent lifetime; open it as a "
+                f"resident box rather than running it")
+
+        # A box names the shared import namespace, not the code being called.
+        # Sibling scripts may share a box and call one another; recording the
+        # box twice would make every nested effect look like recursion.
+        run_name = name or Path(source).stem
+        execution = Execution(name=run_name,
+                              chain=(chain or Chain()).push(run_name),
+                              context=context)
+        run = Run(run_name, execution.chain, execution, self.interpreter)
+        run.label = Path(str(source)).name or run_name
+
+        def _work() -> Result:
+            """Do the run on a background thread."""
+            try:
+                if opts["isolated"]:
+                    return run_in_subprocess(
+                        self.interpreter, str(source), entry, name=run_name,
+                        kwargs=kwargs, timeout=opts["timeout"],
+                        memory_mb=opts["memory_mb"], box=spec.name,
+                        box_root=str(Path(source).parent),
+                        extra_roots=[str(p) for p in opts["extra_roots"]],
+                        parsers=opts["parsers"],
+                        execution=execution, on_proc=run._attach_proc,
+                        method=method, digest=opts["digest"])
+                # In-process the box is this process, so the parsers are
+                # imported here — before the entry, so a module-scope route
+                # lookup in the plugin finds them.
+                install_parsers(opts["parsers"], box_name=spec.name,
+                                root=str(Path(source).parent))
+                target = load_entry(source, entry, box_name=spec.name,
+                                    method=method,
+                                    extra_roots=opts["extra_roots"],
+                                    digest=opts["digest"])
+                return run_in_process(
+                    self.interpreter, target, name=run_name, kwargs=kwargs,
+                    timeout=opts["timeout"], execution=execution)
+            finally:
+                if not opts["isolated"]:
+                    unload_box(spec.name)
+
+        def _finish(future):
+            """Notify the caller, without letting a bad callback matter."""
+            with self._lock:
+                if run in self._runs:
+                    self._runs.remove(run)
+                # Stamped under the same lock the sweep reads it under, so a
+                # run cannot be swept while it is still being marked finished.
+                if run.owner is not None:
+                    run.finished_at = time.monotonic()
+
+            if on_done is None:
+                return
+            try:
+                on_done(future.result())
+            except Exception:
+                logger.exception("on_done callback failed for %s", run_name)
+
+        with self._lock:
+            self._runs.append(run)
+            if collect_owner is not None:
+                run.owner = collect_owner
+                self._collectable[run.id] = run
+                self._sweep_collectable()
+        future = self._pool.submit(_work)
+        future.add_done_callback(_finish)
+        return run._attach(future)
+
+    # ──────────────────────────────────────────────────────────────
+    # Collecting detached runs.
+    # ──────────────────────────────────────────────────────────────
+
+    def _sweep_collectable(self) -> None:
+        """Forget results nobody came back for. Caller holds ``_lock``.
+
+        Swept on the way in rather than on a timer: the only thing that grows
+        this registry is starting another detached run, so that is exactly when
+        it is worth looking. A process that stops starting them stops needing
+        the sweep.
+        """
+        cutoff = time.monotonic() - COLLECT_RETENTION
+        for run_id, run in list(self._collectable.items()):
+            if run.finished_at is not None and run.finished_at < cutoff:
+                del self._collectable[run_id]
+                logger.debug("swept uncollected run %s (%s)", run_id, run.name)
+
+    def collectable(self, owner: str, ids=None) -> list[Run]:
+        """The detached runs ``owner`` may collect, in start order.
+
+        ``ids=None`` means all of them. An id belonging to somebody else is
+        skipped rather than refused: a caller naming an id it does not own has
+        made a mistake about *which* run, and answering "no such run" says that
+        without also disclosing that one exists.
+        """
+        wanted = None if ids is None else {str(i) for i in ids}
+        with self._lock:
+            return [run for run in self._collectable.values()
+                    if run.owner == owner
+                    and (wanted is None or run.id in wanted)]
+
+    def take(self, run: Run) -> None:
+        """Hand a finished run's result over, once.
+
+        Delivery is one-shot for the reason a subagent report is: two
+        collectors both acting on one answer is worse than one of them getting
+        nothing, and "did I already handle this?" is not a question the caller
+        can answer from the outside.
+        """
+        with self._lock:
+            self._collectable.pop(run.id, None)
+
+    def find_run(self, run_id: str, owner: str) -> Run | None:
+        """One detached run by id, if this owner started it."""
+        with self._lock:
+            run = self._collectable.get(str(run_id))
+        return run if run is not None and run.owner == owner else None
+
+    # ──────────────────────────────────────────────────────────────
+    # Detached Requests, for a frontend acting as one of its sessions.
+    # ──────────────────────────────────────────────────────────────
+
+    def act(self, request, chain: Chain, context, owner: str, *, on_done=None) -> str:
+        """Send one Request on its own thread. Returns a handle to collect by.
+
+        The thread is the whole point. The caller is a resident frontend
+        holding its box's single call lock, and this Request may be unsafe —
+        in which case the approver draws a dialog by calling ``render`` back
+        into that same box. Answering inline would deadlock until the dialog
+        expired, which is the same shape ``handlers.kernel._drive`` exists to
+        prevent for anything that drives the state machine.
+
+        Nothing here decides authority. ``chain`` and ``context`` are built by
+        the handler from facts the kernel owns, and the Request goes through
+        :meth:`Interpreter.submit` like any other — same gate, same
+        ``classify``, same ledger row.
+        """
+        act = _Act(owner, getattr(request, "type", ""))
+        execution = Execution(name=f"act:{act.type}", chain=chain)
+        execution.context = context
+
+        def run():
+            """Answer the handle, whatever happens. A lost act never returns."""
+            try:
+                result = self.interpreter.submit(execution, request)
+            except Exception as exc:
+                logger.exception("detached %s failed", act.type)
+                result = Result.failure(f"{act.type} failed: {exc}")
+            with self._lock:
+                act.result = result
+                act.finished_at = time.monotonic()
+            # Publish the answer before waking its frontend. Never call guest
+            # code here: the frontend may still hold its box's call lock.
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:
+                    logger.exception("detached %s completion callback failed", act.type)
+
+        with self._lock:
+            self._acts[act.id] = act
+            self._sweep_acts()
+        threading.Thread(target=run, name=f"sandbox-act-{act.id}",
+                         daemon=True).start()
+        return act.id
+
+    def collect_act(self, handle: str, owner: str) -> Result | None:
+        """A detached Request's answer, once, or ``None`` while it runs.
+
+        An unknown or somebody else's handle answers ``None`` for the reason
+        :meth:`collectable` skips rather than refuses: naming a handle you do
+        not own is a mistake about *which* one, and saying so should not also
+        disclose that it exists.
+        """
+        with self._lock:
+            act = self._acts.get(str(handle))
+            if act is None or act.owner != owner or act.result is None:
+                return None
+            del self._acts[act.id]
+            return act.result
+
+    def _sweep_acts(self) -> None:
+        """Forget answers nobody came back for. Caller holds ``_lock``."""
+        cutoff = time.monotonic() - COLLECT_RETENTION
+        for handle, act in list(self._acts.items()):
+            if act.finished_at is not None and act.finished_at < cutoff:
+                del self._acts[handle]
+                logger.debug("swept uncollected act %s (%s)", handle, act.type)
+
+    # ──────────────────────────────────────────────────────────────
+    # Resident.
+    # ──────────────────────────────────────────────────────────────
+
+    def open(self, source, entry: str = "", *, name: str | None = None,
+             chain: Chain | None = None, isolated: bool | None = None,
+             call_timeout: float | None = None,
+             start_timeout: float = DEFAULT_START_TIMEOUT,
+             manage_lifecycle: bool = True, entries=()) -> PersistentBox:
+        """Load a resident box and keep a handle on it.
+
+        ``entries`` opens the box with several plugin classes in it, addressed
+        by ``box.call(..., target=name)``. The box is still one box under one
+        name, which is what makes a second opener find it rather than spawn a
+        rival — see the reuse check below.
+        """
+        report, spec, opts = self._prepare(source, isolated=isolated,
+                                           timeout=call_timeout, name=name)
+        box_name = opts["name"]
+        # One opener per name at a time. The check and the insert used to be
+        # under the lock with the *open* between them, so two callers could
+        # both miss, both spawn a process, and the second overwrite the first
+        # in ``_boxes`` — leaving a live box nothing held a handle to, which
+        # ``shutdown`` could never close. A per-name lock is enough and does
+        # not serialize opens of different boxes against each other.
+        with self._lock:
+            opening = self._opening.setdefault(box_name, threading.Lock())
+        with opening:
+            with self._lock:
+                existing = self._boxes.get(box_name)
+                if existing is not None and existing.alive:
+                    # Box names are not namespaced by tree, so two files with
+                    # the same stem in different trees land here asking for
+                    # the same box. Handing back the other one would run the
+                    # wrong code under the right name; say so instead.
+                    if self._source_of.get(box_name) not in (None,
+                                                             str(source)):
+                        raise BoxError(
+                            f"box {box_name!r} is already open from "
+                            f"{self._source_of[box_name]}; two plugins cannot "
+                            f"share a box name across trees — rename one, or "
+                            f"declare box = \"...\" on it")
+                    return existing
+            return self._open_locked(source, entry, box_name, opts, chain,
+                                     start_timeout, manage_lifecycle,
+                                     entries)
+
+    def _open_locked(self, source, entry, box_name, opts, chain,
+                     start_timeout, manage_lifecycle,
+                     entries=()) -> PersistentBox:
+        """Open one box, with this name's opener lock already held."""
+        box = open_box(self.interpreter, source, entry, name=box_name,
+                       isolated=opts["isolated"], chain=chain,
+                       call_timeout=opts["timeout"],
+                       start_timeout=start_timeout,
+                       box_root=str(Path(source).parent),
+                       extra_roots=[str(p) for p in opts["extra_roots"]],
+                       parsers=opts["parsers"],
+                       memory_mb=opts["memory_mb"],
+                       manage_lifecycle=manage_lifecycle,
+                       digest=opts["digest"], entries=entries)
+        with self._lock:
+            stale = self._boxes.get(box_name)
+            self._boxes[box_name] = box
+            self._source_of[box_name] = str(source)
+        # A dead box under this name still owns a process or a thread until
+        # somebody closes it. Replacing the handle without stopping it is how
+        # an orphan outlives its own registry entry.
+        if stale is not None and stale is not box:
+            try:
+                stale.stop()
+            except Exception:
+                logger.exception("could not stop the box %s replaced", box_name)
+        return box
+
+    def box(self, name: str) -> PersistentBox | None:
+        """The resident box under this name, if one is loaded."""
+        box = self._boxes.get(name)
+        return box if box is not None and box.alive else None
+
+    def boxes(self) -> list:
+        """Every resident box currently loaded."""
+        return [b for b in self._boxes.values() if b.alive]
+
+    def close(self, name: str, timeout: float | None = None) -> Result:
+        """Stop one resident box.
+
+        ``timeout`` is how long its occupants get to stop cleanly before they
+        are starved. It is passed through rather than left to the box's own
+        default because ``shutdown`` already took one and was dropping it here
+        — so bounding a shutdown bounded only the *runs*, and each box still
+        waited out ten seconds of its own.
+        """
+        with self._lock:
+            box = self._boxes.pop(name, None)
+            self._source_of.pop(name, None)
+        if box is None:
+            return Result(data=False)
+        outcome = box.stop() if timeout is None else box.stop(timeout)
+        unload_box(name)
+        return outcome
+
+    # ──────────────────────────────────────────────────────────────
+    # Interruption.
+    # ──────────────────────────────────────────────────────────────
+
+    def interrupt_session(self, session_key: str) -> int:
+        """Cancel every ephemeral run this session started. Returns how many.
+
+        What ``/cancel`` reaches for. Nothing needed plumbing: ``_runs``
+        already tracks what is in flight, ``Run.cancel`` already starves and
+        then closes the pipe, and ``bridge._root_for`` already roots an
+        agent-caused tool call at the session key it happened in — so
+        ``chain_session`` is an exact filter rather than a guess.
+
+        **Resident boxes are deliberately out of scope.** A service or a
+        frontend is not the turn's work, and a cancel that took the transport
+        down with it would be worse than the freeze it is fixing. Only
+        ephemeral runs live in ``_runs``; the model call is stopped separately
+        and by name.
+        """
+        if not session_key:
+            return 0
+        with self._lock:
+            runs = [run for run in self._runs
+                    if not run.done and chain_session(run.chain) == session_key]
+        for run in runs:
+            run.cancel()
+        if runs:
+            logger.info("interrupted %d run(s) for session %s",
+                        len(runs), session_key)
+        return len(runs)
+
+    # ──────────────────────────────────────────────────────────────
+    # Teardown.
+    # ──────────────────────────────────────────────────────────────
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """Cancel background runs and close every resident box.
+
+        Without this a restart leaves orphaned processes behind, which is the
+        whole reason the sandbox tracks what it opened — pre-warmed children
+        included, since one waiting for a START that will never come is an
+        orphan like any other.
+        """
+        with self._lock:
+            runs, self._runs = list(self._runs), []
+            names = list(self._boxes)
+
+        # Cancel first, then give the runs a moment to unwind *before* the
+        # gate goes away. A run still draining when the interpreter stops
+        # would otherwise wait on an answer that can no longer come.
+        for run in runs:
+            if not run.done:
+                run.cancel()
+        deadline = time.monotonic() + timeout
+        for run in runs:
+            run.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+        for name in names:
+            try:
+                self.close(name, timeout)
+            except Exception:
+                logger.exception("failed to close box %s", name)
+        self._pool.shutdown(wait=False)
+        self.interpreter.shutdown()
+        # Last, deliberately. Everything above can still lease a child —
+        # closing a resident box may restart one — and a drain that ran first
+        # would be undone by the next lease, which starts a fresh filler.
+        # Nothing can ask for one past this line.
+        drain_prewarmed()

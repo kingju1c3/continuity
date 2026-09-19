@@ -1,0 +1,8 @@
+# Runtime state created by an armed handoff chain — never committed.
+dist/
+.handoff/
+AI_Continuation_Document-*.md
+
+# OS / editor cruft
+.DS_Store
+*.swp

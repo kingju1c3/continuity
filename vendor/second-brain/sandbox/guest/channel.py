@@ -1,0 +1,101 @@
+"""The guest's transport — how sandboxed code reaches the kernel.
+
+The guest has exactly one way out: write a Request, block, read a Result. No
+queues, no threads, no interpreter. Whatever is on the other end of the two
+streams — a pipe today, a container socket later — is not the guest's concern,
+which is what makes the same plugin code run unchanged under every runner.
+
+The host has its own in-process channel (see ``sandbox.interpreter``). Both
+satisfy the same two-method shape: ``send`` and ``log``.
+"""
+
+from __future__ import annotations
+
+from . import protocol
+from .requests import Request, Result
+
+
+class Terminated(BaseException):
+    """Raised by ``sdk.respond`` to unwind the sandboxed code.
+
+    Deriving from ``BaseException`` rather than ``Exception`` on purpose, for
+    the same reason ``KeyboardInterrupt`` does: a plugin wrapping its work in
+    ``except Exception`` must not accidentally swallow the kernel tearing it
+    down and carry on running.
+
+    Sandboxed code has to ask to end its own life, and asking has to actually
+    end it — otherwise ``respond`` would record an answer and then keep
+    running. Every runner catches this and takes the carried value as the
+    execution's result.
+    """
+
+    def __init__(self, value):
+        super().__init__("sandboxed code responded")
+        self.value = value
+
+
+class PipeChannel:
+    """Newline-delimited JSON over two byte streams.
+
+    Takes any reader/writer pair, not pipes specifically — a container's
+    socket or attach stream works here unchanged.
+    """
+
+    def __init__(self, reader, writer):
+        self._reader = reader
+        self._writer = writer
+
+    def send(self, request: Request) -> Result:
+        """Send a Request upstream and block for the answer."""
+        try:
+            protocol.write_message(self._writer, {
+                "kind": protocol.REQUEST,
+                "request": request.to_dict(),
+            })
+        except protocol.StreamClosed:
+            # Same condition as a closed read, one step earlier: the host is
+            # gone. Unwind through the same door so plugin code sees one story.
+            raise Terminated(None) from None
+        message = protocol.read_message(self._reader)
+        if message is None:
+            # The host closed the channel: we are being torn down. Unwind
+            # rather than spin making Requests nobody will answer.
+            raise Terminated(None)
+        if message.get("kind") != protocol.RESULT:
+            raise protocol.ProtocolError(
+                f"expected a result, got {message.get('kind')}")
+        return Result.from_dict(message["result"])
+
+    def notify(self, request: Request) -> None:
+        """Send a Request and do not wait for the answer.
+
+        The one-way half of the wire. It exists for effects issued in bulk —
+        streamed text, above all — where blocking for a Result per item would
+        cost a full round trip per token and make streaming across a process
+        boundary pointless.
+
+        Giving up the answer means giving up knowing whether it was allowed,
+        which is why this is not the default and why only a Request that can
+        do nothing on its own is sent this way.
+        """
+        try:
+            protocol.write_message(self._writer, {
+                "kind": protocol.NOTICE,
+                "request": request.to_dict(),
+            })
+        except protocol.StreamClosed:
+            raise Terminated(None) from None
+
+    def log(self, level: str, message: str) -> None:
+        """Send a log line upstream to the kernel's sink.
+
+        A closed wire is swallowed rather than unwound: logging is the one
+        thing a plugin does that must never change control flow, least of all
+        during a teardown where the log line is likely *about* the teardown.
+        """
+        try:
+            protocol.write_message(self._writer, {
+                "kind": protocol.LOG, "level": level, "message": message,
+            })
+        except protocol.StreamClosed:
+            pass

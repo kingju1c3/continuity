@@ -1,0 +1,389 @@
+"""Cross-user conversation isolation (the "user dimension").
+
+Ownership lives on ``conversations.user_id`` and is enforced by
+``runtime.assert_conversation_access`` on every load/mutate-by-id path — not just
+hidden from picker lists. These tests drive the guard with a real DB and two
+sessions bound to different users, asserting that a non-owner is refused on every
+direct path while the owner (and ``override=True``) succeed.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+# Settle the runtime<->state_machine package-init cycle before importing the
+# runtime class (state_machine/__init__ pulls the runtime in).
+import state_machine  # noqa: F401
+from state_machine import ConversationRuntime
+from tests.support import plain_runtime
+from pipeline.database import Database, DEFAULT_USER_ID
+from plugins.native.frontend import BaseFrontend
+from sandbox import Sandbox
+from sandbox.handlers.kernel import _config_write
+
+
+@pytest.fixture
+def runtime(tmp_path):
+    db = Database(str(tmp_path / "iso.db"))
+    rt = plain_runtime(db)
+    # Two sessions bound to different users. Stub the session objects directly —
+    # the guard only reads ``user_id`` and the DB, so this keeps the test focused
+    # on enforcement rather than full session hydration.
+    rt.sessions = {
+        "A": SimpleNamespace(user_id=DEFAULT_USER_ID),
+        "B": SimpleNamespace(user_id=2),
+    }
+    return rt
+
+
+def _owned_by_a(runtime):
+    return runtime.db.create_conversation(title="A's", user_id=DEFAULT_USER_ID)
+
+
+def test_access_guard(runtime):
+    cid = _owned_by_a(runtime)
+    assert runtime.assert_conversation_access("A", cid) is True
+    assert runtime.assert_conversation_access("B", cid) is False
+    assert runtime.assert_conversation_access("B", cid, override=True) is True
+    # A missing conversation is reported as inaccessible, not crashing.
+    assert runtime.assert_conversation_access("A", 99999) is False
+
+
+def test_load_history_refuses_non_owner_without_leaking(runtime):
+    cid = _owned_by_a(runtime)
+    result = runtime.load_history("B", cid)
+    assert result.ok is False
+    # A refusal is an error, not chat: the non-leaking sentence is delivered
+    # once, on the kind a client branches on.
+    assert result.messages == []
+    assert result.error["code"] == "not_found"
+    assert result.error["message"] == "No such conversation."
+
+
+def test_inject_user_message_refuses_non_owner_without_leaking(runtime):
+    cid = _owned_by_a(runtime)
+    result = runtime.inject_user_message("B", "hello", conversation_id=cid)
+    assert result.ok is False
+    # A refusal is an error, not chat: the non-leaking sentence is delivered
+    # once, on the kind a client branches on.
+    assert result.messages == []
+    assert result.error["code"] == "not_found"
+    assert result.error["message"] == "No such conversation."
+    assert runtime.db.get_conversation_messages(cid) == []
+
+
+def test_mutations_refuse_non_owner_and_are_noops(runtime):
+    cid = _owned_by_a(runtime)
+
+    assert runtime.delete_conversation("B", cid) is False
+    assert runtime.set_conversation_category("B", cid, "x") is False
+    assert runtime.set_conversation_notification_mode("B", cid, "on") is None
+    # Nothing changed: the row still exists, uncategorised.
+    row = runtime.db.get_conversation(cid)
+    assert row is not None and row["category"] is None
+
+
+def test_owner_can_delete(runtime):
+    cid = _owned_by_a(runtime)
+    assert runtime.delete_conversation("A", cid) is True
+    assert runtime.db.get_conversation(cid) is None
+
+
+def test_override_bypasses_guard(runtime):
+    cid = _owned_by_a(runtime)
+    assert runtime.delete_conversation("B", cid, override=True) is True
+    assert runtime.db.get_conversation(cid) is None
+
+
+def test_last_active_conversation_is_per_user(tmp_path):
+    db = Database(str(tmp_path / "last-active.db"))
+    other_uid = db.upsert_user("web", "alice")
+    base_cid = db.create_conversation(title="base", user_id=DEFAULT_USER_ID)
+    other_cid = db.create_conversation(title="alice", user_id=other_uid)
+
+    rt = plain_runtime(db)
+    rt.set_session_user("base", DEFAULT_USER_ID)
+    rt.set_session_user("alice", other_uid)
+    rt.active_session_key = "base"
+    rt._persist_active_conversation(base_cid)
+    rt.active_session_key = "alice"
+    rt._persist_active_conversation(other_cid)
+
+    assert db.get_user_config(DEFAULT_USER_ID)["last_active_conversation_id"] == base_cid
+    assert db.get_user_config(other_uid)["last_active_conversation_id"] == other_cid
+    assert "last_active_conversation_id" not in rt.config
+
+    # The restore announces itself as a notification rather than handing back a
+    # string, so the title is where the restored conversation is named.
+    from events.event_bus import bus
+    from events.event_channels import NOTIFICATION_PUSHED
+
+    seen = []
+    unsubscribe = bus.subscribe(NOTIFICATION_PUSHED, seen.append)
+    try:
+        rt2 = plain_runtime(db)
+        rt2.set_session_user("alice", other_uid)
+        rt2.restore_last_active("alice")
+    finally:
+        unsubscribe()
+
+    assert any("alice" in (n.get("title") or "") for n in seen)
+    assert rt2.sessions["alice"].conversation_id == other_cid
+
+
+def test_set_session_user_switches_account_and_never_crosses_ownership(tmp_path):
+    """Changing identity on a *live* session behaves like an account switch.
+
+    Regression for a hazard the stateful fuzzer surfaced: ``set_session_user``
+    used to overwrite ``session.user_id`` while the session still held the old
+    user's conversation, leaving the new identity able to read/append to a
+    conversation it does not own. It must instead detach the departing user's
+    conversation (remembering it as their last-active) and load the new user's
+    own last-active.
+    """
+    db = Database(str(tmp_path / "switch.db"))
+    alice = db.upsert_user("web", "alice")
+    base_cid = db.create_conversation(title="base", user_id=DEFAULT_USER_ID)
+    alice_cid = db.create_conversation(title="alice", user_id=alice)
+    db.set_user_config(alice, {"last_active_conversation_id": alice_cid})
+
+    rt = plain_runtime(db)
+    rt.set_session_user("s", DEFAULT_USER_ID)
+    rt.load_conversation("s", base_cid)
+    assert rt.sessions["s"].conversation_id == base_cid
+
+    # Switch the live session to alice.
+    rt.set_session_user("s", alice)
+
+    # Identity moved, and the session is no longer holding base's conversation.
+    assert rt.session_user_id("s") == alice
+    assert rt.sessions["s"].conversation_id != base_cid
+    # Alice is dropped into her own last-active conversation.
+    assert rt.sessions["s"].conversation_id == alice_cid
+    # The departing base user's conversation was remembered for switch-back.
+    assert db.get_user_config(DEFAULT_USER_ID)["last_active_conversation_id"] == base_cid
+
+
+def test_load_history_preserves_session_user_binding(tmp_path):
+    """Switching conversations via ``load_history`` must keep the session's
+    identity binding.
+
+    Regression for a bug the stateful fuzzer surfaced: when the session was
+    already on a different conversation, ``load_history`` closed the session
+    before reloading, so ``load_conversation``'s identity-carry found no
+    existing session and silently reset ``user_id`` to the base user — leaving
+    a base-user session bound to another user's conversation after the access
+    guard had already passed.
+    """
+    db = Database(str(tmp_path / "load-history.db"))
+    alice = db.upsert_user("web", "alice")
+    first = db.create_conversation(title="first", user_id=alice)
+    second = db.create_conversation(title="second", user_id=alice)
+
+    rt = plain_runtime(db)
+    rt.set_session_user("s", alice)
+    rt.load_conversation("s", first)
+
+    result = rt.load_history("s", second)
+
+    assert result.ok
+    assert rt.sessions["s"].conversation_id == second
+    assert rt.session_user_id("s") == alice  # identity survived the switch
+
+
+def test_delete_conversation_detaches_live_sessions(tmp_path):
+    """Deleting a conversation must reconcile any session still holding it.
+
+    Regression for a bug of the same class as the identity-switch one: a
+    conversation can be deleted from a different session than the one viewing it
+    (another tab/frontend, the agent, or ``/conversations`` deleting the
+    currently-open conversation). The holding session used to keep
+    ``conversation_id`` pointing at the deleted row and crash on its next write
+    with a FOREIGN KEY violation. It must be detached to ``None`` instead.
+    """
+    db = Database(str(tmp_path / "del.db"))
+    rt = plain_runtime(db)
+    rt.set_session_user("A", DEFAULT_USER_ID)
+    cid = db.create_conversation(title="x", user_id=DEFAULT_USER_ID)
+    rt.load_conversation("A", cid)
+    assert rt.sessions["A"].conversation_id == cid
+
+    # Delete from a *different* session owned by the same user.
+    rt.set_session_user("B", DEFAULT_USER_ID)
+    assert rt.delete_conversation("B", cid) is True
+
+    assert db.get_conversation(cid) is None
+    assert rt.sessions["A"].conversation_id is None  # detached, not dangling
+
+
+def test_delete_active_conversation_resets_session_like_new_chat(tmp_path):
+    db = Database(str(tmp_path / "delete-active.db"))
+    rt = plain_runtime(db)
+    rt.set_session_user("web", DEFAULT_USER_ID)
+    cid = db.create_conversation(title="active", user_id=DEFAULT_USER_ID)
+    session = rt.load_conversation("web", cid)
+    session.history.append({"role": "user", "content": "do not carry me"})
+
+    assert rt.delete_conversation("web", cid) is True
+
+    fresh = rt.sessions["web"]
+    assert db.get_conversation(cid) is None
+    assert fresh is not session
+    assert fresh.conversation_id is None
+    assert fresh.history == []
+    assert fresh.user_id == DEFAULT_USER_ID
+
+
+def test_handle_action_self_heals_stale_binding_from_raw_delete(tmp_path):
+    """The write-path backstop detaches a stale binding even when the deletion
+    bypassed ``runtime.delete_conversation`` entirely.
+
+    Simulates any future mutator that forgets to reconcile holding sessions: we
+    delete the row straight through ``db`` (the documented system path), leaving
+    the live session dangling. The next action must self-heal rather than crash
+    with a FOREIGN KEY violation when ``persist_marker`` runs.
+    """
+    db = Database(str(tmp_path / "heal.db"))
+    rt = plain_runtime(db)
+    rt.set_session_user("A", DEFAULT_USER_ID)
+    cid = db.create_conversation(title="x", user_id=DEFAULT_USER_ID)
+    rt.load_conversation("A", cid)
+    assert rt.sessions["A"].conversation_id == cid
+
+    # Raw delete — bypasses runtime.delete_conversation's own detach helper.
+    db.delete_conversation(cid)
+
+    # A benign action drives handle_action; the backstop heals the binding and
+    # the trailing persist_marker no-ops on a None conversation (no FK crash).
+    rt.handle_action("A", "cancel")
+    assert rt.sessions["A"].conversation_id is None
+
+
+def test_close_session_clears_dangling_active_session_key(tmp_path):
+    """Closing the active session must not leave ``active_session_key`` dangling.
+
+    ``is_attended`` compares against ``active_session_key``; a pointer to a
+    closed session would mark every other live session unattended until some
+    action reset it. Same bug class — a mutation (session removal) that skipped
+    reconciling state a guard relies on.
+    """
+    db = Database(str(tmp_path / "active.db"))
+    rt = plain_runtime(db)
+    rt.set_session_user("A", DEFAULT_USER_ID)
+    rt.active_session_key = "A"
+
+    rt.close_session("A")
+
+    assert rt.active_session_key is None
+    assert rt.is_attended("B") is False  # no stale "A is active" leaking through
+
+
+def test_set_session_user_with_no_prior_conversation_is_a_plain_bind(tmp_path):
+    """The up-front bind path (no conversation yet) stays a simple identity set."""
+    db = Database(str(tmp_path / "bind.db"))
+    alice = db.upsert_user("web", "alice")
+    rt = plain_runtime(db)
+
+    rt.set_session_user("s", alice)  # no session/conversation existed yet
+
+    assert rt.session_user_id("s") == alice
+    assert rt.sessions["s"].conversation_id is None
+
+
+def test_agent_switch_persists_active_profile_per_user(tmp_path):
+    db = Database(str(tmp_path / "agent-profile.db"))
+    uid = db.upsert_user("web", "alice")
+    rt = plain_runtime(db, config={
+        "agent_profiles": {"default": {"llm": "default"}, "writer": {"llm": "default"}},
+    })
+    rt.set_session_user("alice", uid)
+    context = SimpleNamespace(
+        config={"agent_profiles": rt.config["agent_profiles"], "active_agent_profile": "default"},
+        runtime=rt, session_key="alice", db=db, user_id=uid,
+    )
+
+    sandbox = Sandbox(context=context, approve=lambda *_: True)
+    try:
+        result = sandbox.run(
+            "bundled/commands/command_agent.py",
+            "AgentCommand",
+            kwargs={
+                "args": {
+                    "profile_name": "writer",
+                    "action": "switch",
+                },
+            },
+        )
+    finally:
+        sandbox.shutdown()
+
+    assert result.data == "Switched agent profile to: writer"
+    assert db.get_user_config(uid)["active_agent_profile"] == "writer"
+    assert "active_agent_profile" not in rt.config
+
+
+def test_a_user_scoped_setting_persists_per_user(tmp_path):
+    db = Database(str(tmp_path / "skip.db"))
+    uid = db.upsert_user("web", "alice")
+    rt = plain_runtime(db)
+    rt.set_session_user("alice", uid)
+    context = SimpleNamespace(
+        config={"startup_restore_conversation": True},
+        runtime=rt, session_key="alice", db=db, user_id=uid,
+    )
+
+    result = _config_write(
+        context,
+        {"key": "startup_restore_conversation", "value": False},
+    )
+    assert result.ok
+    assert db.get_user_config(uid)["startup_restore_conversation"] is False
+    assert "startup_restore_conversation" not in rt.config
+
+
+def test_open_session_binds_identity_prebound_session(tmp_path):
+    """Binding identity up-front then opening a specific conversation must not
+    raise SessionConflict — an unbound session (conversation_id None) is free
+    to bind; only a session on a *different* conversation conflicts."""
+    db = Database(str(tmp_path / "prebind.db"))
+    alice = db.upsert_user("web", "alice")
+    cid = db.create_conversation(title="alice", user_id=alice)
+    rt = plain_runtime(db)
+
+    rt.set_session_user("s", alice)  # creates the session, conversation None
+    session = rt.open_session("s", conversation_id=cid)
+
+    assert session.conversation_id == cid
+    assert rt.session_user_id("s") == alice
+
+
+def test_identity_switch_restores_last_active_even_without_prior_conversation(tmp_path):
+    """An account switch lands the new user in their last-active conversation
+    regardless of whether the departing user had a conversation open."""
+    db = Database(str(tmp_path / "switch-empty.db"))
+    alice = db.upsert_user("web", "alice")
+    bob = db.upsert_user("web", "bob")
+    a_cid = db.create_conversation(title="alice", user_id=alice)
+    db.set_user_config(alice, {"last_active_conversation_id": a_cid})
+    rt = plain_runtime(db)
+
+    rt.set_session_user("s", bob)    # bob bound, no conversation yet
+    rt.set_session_user("s", alice)  # switch with prev_conv None
+
+    assert rt.session_user_id("s") == alice
+    assert rt.sessions["s"].conversation_id == a_cid
+
+
+def test_frontend_identify_can_mint_user_type(tmp_path):
+    class WebFrontend(BaseFrontend):
+        name = "web"
+
+    db = Database(str(tmp_path / "frontend-user-type.db"))
+    rt = plain_runtime(db)
+    frontend = WebFrontend()
+    frontend.runtime = rt
+
+    uid = frontend.identify("s", "alice", user_type="creator")
+
+    assert db.get_user(uid)["user_type"] == "creator"
+    assert rt.session_user_id("s") == uid

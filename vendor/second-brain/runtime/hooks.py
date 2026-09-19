@@ -1,0 +1,573 @@
+"""The doorways around the agent turn — one registry, six moments.
+
+Every agent turn is the same short ritual: the turn starts, the model thinks,
+the agent acts, think/act repeats, the turn ends. This module puts a labeled
+doorway at every moment of that ritual, and the one rule of the whole system
+is: **nothing influences a turn except by standing at a doorway.** If nobody
+is registered at a doorway, the kernel walks straight through and behaves
+exactly as it would with no hooks at all.
+
+The six moments (in the order a turn meets them):
+
+=================  ==========  =====================================================
+Moment             Kind        What standing there means
+=================  ==========  =====================================================
+``turn_start``     adjuster    The agent is about to begin; slip a note into its
+                               pocket (mutate the session: prompt extras,
+                               staged attachments, queued actions).
+``shape_scope``    adjuster    Here is the toolbox the agent will see; hand back
+                               a changed one.
+``vet_permission`` verdict     The agent wants to run something sensitive; say
+                               yes, say no, or stay silent.
+``llm_call``     escort      Own the round trip to the model: rewrite the
+                               request, place the call yourself, inspect the
+                               answer, and go around again if you don't like it.
+``end_turn``       verdict     The doorman at the exit: the agent says "I'm
+                               done" — let it leave, send it back with a note,
+                               or demand one last tool call first.
+``turn_finish``    observer    The turn is over; look at what happened. Touch
+                               nothing.
+=================  ==========  =====================================================
+
+Three kinds of doorway:
+
+- **Observer** — watches, touches nothing.
+- **Adjuster** — handed a thing, may return a changed thing, never sees what
+  happens next. (A verdict is an adjuster whose answer is a decision object;
+  the first non-``None`` answer wins.)
+- **Escort** — signature ``fn(ctx, payload, proceed)``. The escort holds both
+  the request and the phone: it decides when to dial (``proceed``), sees the
+  response before anyone else, and may redial. Escorts nest like an onion —
+  the first registered is the outermost wrapper.
+
+The uniform contract, enforced here so every hook can rely on it:
+
+- Every hook receives ``(ctx, payload)`` — ``ctx`` is a :class:`HookContext`
+  (session, runtime, moment), ``payload`` is the moment-specific dataclass.
+- Return ``None`` to abstain; return a value to speak.
+- A raising hook is logged and skipped — a hook can never break a turn. For
+  escorts, "skipped" means transparent: the call proceeds as if the escort
+  were not there (and a response already obtained is never thrown away or
+  fetched twice).
+
+Registration: ``runtime.hooks.add(moment, fn)`` from a service's
+``bind_runtime``/``_load``; ``runtime.hooks.remove(fn)`` at unload. See
+``templates/hook_template.py`` for worked examples of every kind.
+
+Ordering: hooks run in registration order — which is simply plugin load order —
+and for escorts the first registered is the outermost wrapper. There is
+deliberately no priority knob; add one only when two real plugins actually
+conflict.
+
+How the two *verdict* doorways settle a disagreement differs, on purpose:
+
+- ``end_turn`` is **first non-None wins**. An early ``Allow`` positively waves
+  the agent through and later doormen are not consulted.
+- ``vet_permission`` is **deny beats allow**. Every gate is asked, and any
+  refusal wins however late it comes.
+
+Composition follows the cost of being wrong. A doorman that guesses wrong costs
+a turn; a gate that guesses wrong costs a capability. Under first-wins a
+permissive gate loaded before a restrictive one silently decided policy by
+filename order, which is not a decision anybody makes on purpose.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger("Hooks")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The six moments.
+# ──────────────────────────────────────────────────────────────────────
+
+TURN_START = "turn_start"
+SHAPE_SCOPE = "shape_scope"
+VET_PERMISSION = "vet_permission"
+LLM_CALL = "llm_call"
+END_TURN = "end_turn"
+TURN_FINISH = "turn_finish"
+
+MOMENTS = (TURN_START, SHAPE_SCOPE, VET_PERMISSION, LLM_CALL, END_TURN, TURN_FINISH)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The envelope and the moment payloads.
+# ──────────────────────────────────────────────────────────────────────
+
+@dataclass
+class HookContext:
+    """The envelope every hook receives, at every doorway: whose turn this
+    is (``session``), the runtime it lives in, and which doorway we are
+    standing at (``moment``)."""
+
+    session: Any
+    runtime: Any
+    moment: str
+
+
+@dataclass
+class ModelRequest:
+    """One outgoing trip to the model, materialized so escorts can rewrite it.
+
+    ``llm`` is the **name** of the LLM profile that will take the call — a
+    string like ``"gpt-4o-mini"``, not a live object. Swapping models is
+    therefore ``request.llm = "some-profile"``, and the kernel resolves it
+    when the call is placed. That is the same handle-not-the-thing move as
+    ``<secret:...>``: it reads identically for a native escort and a sandboxed
+    one (which could never be handed a live model anyway), and it stops a hook
+    holding a reference to a brain past the call that lent it. An empty name
+    means the session's default.
+
+    ``messages`` is exactly what the model will be shown; ``tools`` is the
+    toolbox offered (provider schemas); ``tool_choice`` forces tool use when
+    the backend supports it (``Brain.supports_tool_choice``); ``params`` are
+    extra provider kwargs forwarded only when non-empty; ``attachments`` is
+    the media bundle riding along, routed against the resolved model's
+    capabilities as the call is placed.
+
+    ``params`` starts empty even for a profile that configures some. The
+    resolved profile's own params are merged *underneath* these as the call
+    is placed, so writing one here overrides the profile and writing none
+    inherits it — and swapping ``llm`` picks up the new profile's params
+    rather than carrying the old profile's along.
+    """
+
+    llm: Any
+    messages: list
+    tools: Optional[list] = None
+    tool_choice: Any = None
+    params: dict = field(default_factory=dict)
+    attachments: Any = None
+
+
+@dataclass
+class TurnEnding:
+    """What the doorman at the exit is shown: the text the agent wants to
+    leave behind, why the turn is ending, and how many times a doorman has
+    already sent it back this turn (the fire budget's odometer)."""
+
+    final_text: Optional[str] = None
+    # "model_finished" — the model produced final text and wants to stop.
+    # "budget_exhausted" — the loop ran out of tool-call/iteration budget.
+    reason: str = "model_finished"
+    doorman_fires: int = 0
+
+
+@dataclass
+class TurnOutcome:
+    """What the ``turn_finish`` observers see once the logical turn is over.
+
+    ``reason`` says *how* it ended, and exists because ``end_turn`` is only
+    consulted on two of the nine ways out of ``ConversationLoop.drive``. A
+    doorman naturally reads itself as "the doorman at the exit"; it is the
+    doorman at *two* exits, and a cancel, a priority handoff or a failed
+    action all walk straight past it. ``turn_finish`` fires on all of them, so
+    this is where an observer can reconcile what it did or did not get asked
+    about.
+
+    The vocabulary extends ``TurnEnding.reason`` rather than competing with
+    it — the first two values are that field's, and mean the same thing here:
+
+    - ``"model_finished"`` — the model produced final text and the doormen let
+      it leave.
+    - ``"budget_exhausted"`` — the loop ran out of tool-call/iteration budget.
+    - ``"cancelled"`` — somebody stopped the turn.
+    - ``"priority_handoff"`` — the state machine gave priority back mid-turn.
+    - ``"action_failed"`` — a non-tool action failed and ended the drive. (A
+      failed *tool* call is feedback, not an ending; the loop continues.)
+    - ``"no_action"`` — the loop asked for an action and got none.
+    - ``"crashed"`` — ``drive`` raised. Set by the runtime, not the loop, which
+      by then is not running.
+    - ``"redrive"`` — the drive ended so the turn could be driven again.
+
+    **``"redrive"`` is rare here and that is not an accident.** Observers fire
+    once per *logical* turn, so a re-driven turn reaches them only on the drive
+    that actually ends it. It surfaces only when ``allow_restart=False`` voided
+    a restart the loop had asked for — a turn that wanted to go round again and
+    was not allowed to.
+
+    Empty string means the loop never said, which should not happen and is
+    left readable rather than guessed at.
+    """
+
+    ok: bool = True
+    cancelled: bool = False
+    final_text: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class PermissionQuery:
+    """The question a ``vet_permission`` verdict answers.
+
+    Two stages knock at this doorway:
+
+    - ``"approval"`` — something sensitive wants to happen; abstaining falls
+      through to the kernel's own approval flow (a dialog, then
+      asking the human).
+    - ``"unattended_call"`` — it was asked for from a session with no human
+      present. Abstaining falls through to the kernel default: refuse. A gate
+      that answers allow lets it proceed anyway.
+
+    **Two kinds of asker, told apart by ``origin``.** The first three fields
+    describe a *tool* asking to run a sensitive command, which is what this
+    doorway was built for. Sandboxed code asks a different question — a typed
+    Request, already classified, arriving with the chain of provenance that
+    caused it — and flattening that into a command string throws away
+    everything a gate would want to reason about.
+
+    So the richer fields are carried alongside rather than replacing anything:
+    ``command`` still holds a readable rendering, so gates written against the
+    original shape keep working untouched, while a sandbox-aware gate can read
+    ``request``, ``chain`` and ``decision`` directly.
+    """
+
+    tool_name: Optional[str]
+    command: str
+    stage: str = "approval"
+
+    # "tool" — a tool call asking to run something sensitive.
+    # "request" — sandboxed code whose Request the policy function refused.
+    origin: str = "tool"
+
+    # Populated only when origin == "request". A sandbox ``Request`` (its
+    # ``type`` and ``args``), the ``Chain`` of provenance rooted in whatever
+    # caused the work, and the ``Decision`` that sent it here with its reason.
+    request: Any = None
+    chain: Any = None
+    decision: Any = None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Doorman verdicts (returned from ``end_turn`` hooks).
+# ──────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Allow:
+    """Let the agent leave. Equivalent to abstaining, but explicit — and it
+    short-circuits later doormen, so a policy can positively wave someone
+    through."""
+
+
+@dataclass
+class SendBack:
+    """Send the agent back inside with a note; the loop clears the final text
+    and asks the model again. ``ephemeral=True`` shows the note to the model
+    without recording it in history; ``allow_tools=False`` makes the comeback
+    call text-only (how the kernel's over-budget doorman gets a summary
+    without more tool calls)."""
+
+    note: str
+    ephemeral: bool = False
+    allow_tools: bool = True
+
+
+@dataclass
+class RequireTool:
+    """Demand one specific tool before the agent may leave: the loop issues
+    one more model call offering only that tool, forced via ``tool_choice``
+    where the backend supports it, degrading to a :class:`SendBack`-style
+    instruction where it doesn't."""
+
+    name: str
+    note: str = ""
+
+
+@dataclass
+class Redrive:
+    """End this drive without ending the logical turn and have the runtime
+    immediately re-drive it (the ``session.restart_turn`` semantics as a
+    verdict). The re-driven loop finishes the turn; turn starters do not
+    re-run."""
+
+
+class PermissionVerdict:
+    """A gate's answer to "may this command run?".
+
+    ``allow`` is the decision; ``reason`` is the model-facing explanation shown
+    when a call is denied. A gate that has no opinion returns ``None`` instead
+    of a verdict, letting the next gate (or the kernel default) decide.
+    """
+
+    __slots__ = ("allow", "reason")
+
+    def __init__(self, allow: bool, reason: str = ""):
+        """Initialize the verdict."""
+        self.allow = bool(allow)
+        self.reason = reason
+
+
+class HookRegistry:
+    """The switchboard: one labeled socket per moment, hung off the runtime
+    as ``runtime.hooks``. Plugins plug callables into sockets; at each moment
+    the kernel walks to the socket and calls whatever is plugged in. An empty
+    socket costs nothing."""
+
+    def __init__(self):
+        """Initialize an empty registry."""
+        self._hooks: dict[str, list[Callable]] = {m: [] for m in MOMENTS}
+
+    # ──────────────────────────────────────────────────────────────────
+    # Registration (called by plugins at load).
+    # ──────────────────────────────────────────────────────────────────
+
+    def add(self, moment: str, fn: Callable) -> None:
+        """Stand ``fn`` at the ``moment`` doorway. The one registration path."""
+        if moment not in self._hooks:
+            raise ValueError(f"Unknown hook moment: {moment!r}. Moments: {', '.join(MOMENTS)}")
+        self._hooks[moment].append(fn)
+
+    def remove(self, fn: Callable) -> None:
+        """Walk ``fn`` away from every doorway (for plugin unload)."""
+        for bucket in self._hooks.values():
+            try:
+                bucket.remove(fn)
+            except ValueError:
+                pass
+
+    def has(self, moment: str) -> bool:
+        """Whether anybody is standing at ``moment``.
+
+        For callers that must *prepare* something before knocking and would
+        rather not pay for it when the socket is empty — ``active_tool_registry``
+        detaches a copy of the tool registry before letting a shaper near it,
+        and every install today has no shaper at all.
+
+        Deliberately not used to skip the consultation itself: the walk over an
+        empty list already costs nothing, and a caller that branched on this
+        would have two code paths where one would do.
+        """
+        return bool(self._hooks.get(moment))
+
+    def stage_attachment(self, session, attachment: Any) -> bool:
+        """Queue one attachment for the next LLM call in this session.
+
+        The queue lives on the session (``session.staged_attachments``, like
+        ``pending_agent_actions``) — the registry itself holds no per-session
+        state. Created on demand so bare stub sessions work too.
+        """
+        if session is None or not getattr(session, "key", None):
+            return False
+        staged = getattr(session, "staged_attachments", None)
+        if staged is None:
+            staged = []
+            session.staged_attachments = staged
+        staged.append(attachment)
+        return True
+
+    # ──────────────────────────────────────────────────────────────────
+    # Consultation (called by the kernel at its doorways). The kernel-facing
+    # signatures predate the uniform contract and are kept stable; each
+    # method builds the HookContext envelope before knocking.
+    # ──────────────────────────────────────────────────────────────────
+
+    def _ctx(self, session, runtime, moment: str) -> HookContext:
+        """Internal helper to build the envelope for one doorway visit."""
+        return HookContext(session=session, runtime=runtime, moment=moment)
+
+    def vet_permission(self, session, tool_name: str | None, command: str,
+                       runtime=None, stage: str = "approval",
+                       origin: str = "tool", request=None, chain=None,
+                       decision=None) -> PermissionVerdict | None:
+        """Ask every gate. A refusal wins; otherwise the first allow wins.
+
+        **Deny beats allow, and that is the one place this differs from
+        ``end_turn``.** Doormen are first-non-``None``-wins, so an early
+        ``Allow`` silences the rest. Gates cannot work that way: with a
+        permissive gate and a restrictive one, first-wins meant *plugin load
+        order* — in practice filename order — decided whether a capability was
+        granted. Nobody chooses that, and nothing surfaces it.
+
+        The two doorways differ because the stakes differ, which is worth
+        stating so they do not look merely inconsistent: a wrong ``end_turn``
+        verdict costs a turn, and a wrong ``vet_permission`` allow costs a
+        capability. Composition follows the cost of being wrong, so this
+        doorway fails safe and the other fails cheap.
+
+        The cost is that a question nobody refuses now walks past every gate
+        instead of stopping at the first answer — N box round trips rather than
+        one, for sandboxed gates. A refusal still short-circuits, so the
+        expensive case is the permissive one.
+
+        Anything that is not recognisably a verdict is an abstention, with a
+        warning: ``sandbox.hooks.rebuild`` already draws that line for the
+        sandboxed side ("inventing a verdict from a malformed answer would be
+        worse than hearing nothing"), and the approver reads ``verdict.allow``
+        without guarding it.
+
+        ``origin`` and the three fields after it carry a sandboxed Request's
+        full context for gates that want it; gates written against
+        ``tool_name`` and ``command`` alone are unaffected.
+        """
+        ctx = self._ctx(session, runtime, VET_PERMISSION)
+        query = PermissionQuery(tool_name=tool_name, command=command,
+                                stage=stage, origin=origin, request=request,
+                                chain=chain, decision=decision)
+        allowed = None
+        for gate in self._hooks[VET_PERMISSION]:
+            try:
+                verdict = gate(ctx, query)
+            except Exception:
+                logger.exception("Permission gate raised; treating as abstain")
+                continue
+            if verdict is None:
+                continue
+            decided = getattr(verdict, "allow", None)
+            if decided is None:
+                logger.warning("Permission gate answered with %s, not a "
+                               "verdict; treating as abstain",
+                               type(verdict).__name__)
+                continue
+            if not decided:
+                return verdict
+            if allowed is None:
+                # Remember it, but keep asking — a later gate may refuse, and
+                # the whole point is that it gets to.
+                allowed = verdict
+        return allowed
+
+    def shape_scope(self, session, registry, runtime=None):
+        """Fold every shaper over the registry, in registration order."""
+        ctx = self._ctx(session, runtime, SHAPE_SCOPE)
+        for shaper in self._hooks[SHAPE_SCOPE]:
+            try:
+                shaped = shaper(ctx, registry)
+            except Exception:
+                logger.exception("Scope shaper raised; leaving registry unchanged")
+                continue
+            if shaped is not None:
+                registry = shaped
+        return registry
+
+    def start_turn(self, session, runtime=None) -> None:
+        """Run the ``turn_start`` adjusters (once per logical turn).
+
+        A starter receives the session with the latest user text already in
+        ``session.history``; it injects via ``session.system_prompt_extras``,
+        ``stage_attachment``, or ``session.pending_agent_actions``. Restart
+        re-drives (``Redrive`` / ``session.restart_turn``) are the same
+        logical turn and do NOT re-run starters. Starters run synchronously
+        on the drive thread, so they set the latency floor for every reply —
+        keep them fast (one small-model call at most).
+
+        The ``turn`` prompt cue is fired here, first and before the adjusters,
+        because the turn's first prompt is built downstream of them — a bump
+        after would mean the cue arrives one call late. It follows the same
+        "restart re-drives are the same logical turn" rule the starters do, and
+        gets it for free: the caller already guards on ``restart_drive``.
+
+        The context-window figure the prompt shows is frozen here for the same
+        reason and by the same rule. It is the previous call's billed input,
+        and it climbs with every model call of an agentic turn — but the
+        ``[SYSTEM CONTEXT UPDATE]`` block sits ahead of the whole transcript,
+        so a number that moved mid-turn would re-bill every row behind it.
+        Freezing it beside the cue means the prompt's clock and its context
+        figure move together, on the same definition of a turn: a restart
+        re-drive is the same logical turn and changes neither."""
+        import prompt_cues
+        prompt_cues.fire(prompt_cues.TURN)
+        if session is not None:
+            session.turn_prompt_tokens = getattr(
+                session, "last_prompt_tokens", None)
+        ctx = self._ctx(session, runtime, TURN_START)
+        for starter in self._hooks[TURN_START]:
+            try:
+                starter(ctx, None)
+            except Exception:
+                logger.exception("Turn starter raised; continuing")
+
+    def finish_turn(self, session, outcome: TurnOutcome | None = None, runtime=None) -> None:
+        """Run the ``turn_finish`` observers, then drop what the turn owned."""
+        ctx = self._ctx(session, runtime, TURN_FINISH)
+        for finalizer in self._hooks[TURN_FINISH]:
+            try:
+                finalizer(ctx, outcome)
+            except Exception:
+                logger.exception("Turn finalizer raised; continuing")
+        # Staged-but-undrained attachments do not survive the turn.
+        if getattr(session, "staged_attachments", None):
+            session.staged_attachments.clear()
+        # Neither does a queued-but-undrained agent action, which
+        # ``runtime/session.py`` has always said shared this exact lifecycle
+        # and which nothing actually cleared. Most turns drain the queue at a
+        # loop boundary and never reach here with anything in it; a turn that
+        # ended some other way — a failed action, a cancel, a priority
+        # handoff — left the action sitting there to fire on somebody's *next*
+        # turn instead, in a session whose state the queuing hook never saw.
+        if getattr(session, "pending_agent_actions", None):
+            session.pending_agent_actions.clear()
+        # Neither does a turn-scoped security mode. Cleared here, after the
+        # observers rather than by one of them, for the reason the compaction
+        # layer and the subagent barrier are stacked rather than registered:
+        # a grant that expires only when some plugin happens to be installed
+        # is not a grant that expires. Written directly rather than through
+        # ``runtime.clear_turn_security_mode`` so it still holds for a turn
+        # driven with no runtime behind it.
+        if getattr(session, "turn_security_mode", None):
+            session.turn_security_mode = None
+
+    def wrap_llm_call(self, session, runtime, base: Callable[[ModelRequest], Any]) -> Callable[[ModelRequest], Any]:
+        """Build the escort onion around one model call.
+
+        ``base`` is the innermost step — the actual backend call. Each
+        registered escort wraps the next; the first registered is outermost.
+        A raising escort is skipped *transparently*: if it already fetched a
+        response via ``proceed``, that response is used (never re-fetched);
+        if it raised before dialing, the call proceeds as if the escort were
+        not there.
+        """
+        ctx = self._ctx(session, runtime, LLM_CALL)
+        handler = base
+        for fn in reversed(self._hooks[LLM_CALL]):
+            handler = self._escort_layer(ctx, fn, handler)
+        return handler
+
+    @staticmethod
+    def _escort_layer(ctx: HookContext, fn: Callable, proceed: Callable) -> Callable:
+        """Internal helper: one layer of the onion, with the skip-transparently
+        error policy."""
+        def layer(request: ModelRequest):
+            last: dict[str, Any] = {"response": None, "called": False}
+
+            def guarded_proceed(req: ModelRequest | None = None):
+                last["response"] = proceed(req if req is not None else request)
+                last["called"] = True
+                return last["response"]
+
+            try:
+                out = fn(ctx, request, guarded_proceed)
+            except Exception:
+                logger.exception("Model-call escort raised; passing through")
+                return last["response"] if last["called"] else proceed(request)
+            if out is not None:
+                return out
+            # Escort abstained: use what it already fetched, or dial for it.
+            return last["response"] if last["called"] else proceed(request)
+        return layer
+
+    def vet_end_turn(self, session, runtime, ending: TurnEnding):
+        """Consult the doormen at the exit: first non-None verdict wins."""
+        ctx = self._ctx(session, runtime, END_TURN)
+        for doorman in self._hooks[END_TURN]:
+            try:
+                verdict = doorman(ctx, ending)
+            except Exception:
+                logger.exception("End-turn doorman raised; treating as abstain")
+                continue
+            if verdict is not None:
+                return verdict
+        return None
+
+    def drain_attachments(self, session) -> list[Any]:
+        """Return and clear attachments staged for the next model call."""
+        staged = getattr(session, "staged_attachments", None)
+        if not staged:
+            return []
+        drained = list(staged)
+        staged.clear()
+        return drained

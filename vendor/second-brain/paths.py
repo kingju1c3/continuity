@@ -1,0 +1,31 @@
+"""
+Centralized path constants.
+
+Every module that needs DATA_DIR or ROOT_DIR imports from here.
+"""
+
+import os
+import platform
+from pathlib import Path
+
+# Project root (where main.pyw lives)
+ROOT_DIR = Path(__file__).parent
+
+# Mutable user data: database, model cache, config, credentials
+_system = platform.system()
+if _system == "Windows":
+    DATA_DIR = Path(os.getenv("LOCALAPPDATA", "")) / "Second Brain"
+elif _system == "Darwin":
+    DATA_DIR = Path.home() / "Library" / "Application Support" / "Second Brain"
+else:
+    DATA_DIR = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "Second Brain"
+
+# The mirrored code trees are declared in ``trees.py``, which imports this
+# module. Anything wanting a tree path (``trees.WORKSPACE``, ``trees.INSTALLED``)
+# or a directory inside one asks there — the layout is one table, and a path
+# spelled in two files eventually gets spelled two ways.
+#
+# The attachment cache used to be ``DATA_DIR/attachment_cache`` and is declared
+# here no longer: it lives in the agent's own tree now, so it is
+# ``trees.attachment_cache()``. ``migrations.py`` moves an older one across.
+

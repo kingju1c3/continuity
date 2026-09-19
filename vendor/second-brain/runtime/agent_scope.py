@@ -1,0 +1,154 @@
+"""
+Agent scope - per-profile lens over the LLM prompt and tool registry.
+
+An agent profile stores an LLM reference plus optional prompt/tool scope.
+Data-source narrowing intentionally lives in custom tools now;
+the shared runtime only decides which tools the agent can see and call.
+"""
+
+import inspect
+import re
+from dataclasses import dataclass
+
+from agent.tool_registry import ToolRegistry
+
+_CALL_TOOL_RE = re.compile(r'context\.call_tool\(\s*["\']([^"\']+)["\']')
+
+
+@dataclass
+class AgentScope:
+    """Agent scope."""
+    profile_name: str
+    prompt_suffix: str = ""
+    tools_allow: set[str] | None = None
+    tools_deny: set[str] | None = None
+
+    @property
+    def has_tool_filter(self) -> bool:
+        """Return whether tool filter."""
+        return self.tools_allow is not None or bool(self.tools_deny)
+
+
+def load_scope(profile_name: str, config: dict) -> AgentScope:
+    """Parse a profile's supported scope fields into an ``AgentScope``."""
+    profile = config.get("agent_profiles", {}).get(profile_name, {}) or {}
+    tools_mode = _scope_mode(profile_name, profile)
+    tools_list = _scope_list(profile_name, profile)
+
+    return AgentScope(
+        profile_name=profile_name,
+        prompt_suffix=str(profile.get("prompt_suffix") or ""),
+        tools_allow=set(tools_list) if tools_mode == "whitelist" else None,
+        tools_deny=set(tools_list) if tools_mode == "blacklist" else None,
+    )
+
+
+def _scope_mode(profile_name: str, profile: dict) -> str:
+    """Internal helper to handle scope mode."""
+    key = "whitelist_or_blacklist_tools"
+    mode = profile.get(key, "blacklist")
+    if mode not in ("whitelist", "blacklist"):
+        raise ValueError(
+            f"Profile '{profile_name}' has invalid {key}: {mode!r}. "
+            "Use 'whitelist' or 'blacklist'."
+        )
+    return mode
+
+
+def _scope_list(profile_name: str, profile: dict) -> list:
+    """Internal helper to handle scope list."""
+    key = "tools_list"
+    value = profile.get(key, [])
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"Profile '{profile_name}' field {key} must be an array.")
+    return value
+
+
+def scoped_registry(base_registry: ToolRegistry, scope: AgentScope, db=None) -> ToolRegistry:
+    """Return a ``ToolRegistry`` that only exposes tools the scope allows."""
+    target_db = base_registry.db if db is None else db
+    if not scope.has_tool_filter and target_db is base_registry.db:
+        return base_registry
+
+    new_registry = ToolRegistry(target_db, base_registry.config, base_registry.services)
+    new_registry.orchestrator = base_registry.orchestrator
+    new_registry.runtime = base_registry.runtime
+
+    if not scope.has_tool_filter:
+        visible_names = set(base_registry.tools.keys())
+    elif scope.tools_allow is not None:
+        visible_names = set(scope.tools_allow)
+    else:
+        visible_names = {n for n in base_registry.tools if n not in (scope.tools_deny or set())}
+    callable_names = _expand_tool_dependencies(base_registry.tools, visible_names)
+
+    for name, tool in base_registry.tools.items():
+        if name in callable_names:
+            new_registry.tools[name] = tool
+    new_registry.visible_tool_names = visible_names
+    return new_registry
+
+
+def registry_with_tools(registry, tools=(), *, visible: bool = True):
+    """Return a cloned registry with extra tools, or ``registry`` if unclonable."""
+    tools = [tool for tool in (tools or []) if getattr(tool, "name", "")]
+    if not tools or not (hasattr(registry, "db") and hasattr(registry, "config") and hasattr(registry, "services")):
+        return registry
+    cloned = ToolRegistry(registry.db, registry.config, registry.services)
+    cloned.services = registry.services
+    cloned.orchestrator = getattr(registry, "orchestrator", None)
+    cloned.runtime = getattr(registry, "runtime", None)
+    cloned.tools.update(registry.tools)
+    if getattr(registry, "visible_tool_names", None) is not None:
+        cloned.visible_tool_names = set(registry.visible_tool_names)
+        if visible:
+            cloned.visible_tool_names.update(tool.name for tool in tools)
+    for tool in tools:
+        cloned.tools[tool.name] = tool
+    return cloned
+
+
+def resolve_agent_llm(profile_name: str, config: dict, services: dict = None):
+    """Resolve the brain an agent profile should drive with.
+
+    The registry answers first. ``services`` is the fallback and not a
+    vestige: a brain may be injected directly rather than configured as a
+    profile — a harness's fake, a caller wiring its own — and the registry
+    knows nothing about those. Whatever comes back has to speak ``chat``;
+    there is no adapter for anything else any more.
+    """
+    from llm import default_brain
+    from llm.registry import usable_brain
+
+    profile = (config.get("agent_profiles", {}) or {}).get(profile_name, {}) or {}
+    llm_ref = profile.get("llm") or "default"
+    if llm_ref == "default":
+        llm_ref = config.get("default_llm_profile") or ""
+    services = services or {}
+    if not llm_ref:
+        return default_brain(config) or services.get("llm")
+    return (usable_brain(llm_ref) or services.get(llm_ref)
+            or default_brain(config) or services.get("llm"))
+
+
+def _expand_tool_dependencies(tools: dict, names: set[str]) -> set[str]:
+    """Close ``names`` over tool→tool dependencies so scoped-in tools keep
+    their helpers callable. Declared ``dependencies_tools`` is the contract;
+    the source regex is a fallback for tools that haven't declared them."""
+    expanded, pending = set(names), list(names)
+    while pending:
+        tool = tools.get(pending.pop())
+        if tool is None:
+            continue
+        deps = list(getattr(tool, "dependencies_tools", None) or [])
+        try:
+            deps += _CALL_TOOL_RE.findall(inspect.getsource(tool.__class__))
+        except (OSError, TypeError):
+            pass
+        for dep in deps:
+            if dep in tools and dep not in expanded:
+                expanded.add(dep)
+                pending.append(dep)
+    return expanded

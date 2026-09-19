@@ -1,0 +1,31 @@
+{
+  "skill_name": "session-handoff",
+  "evals": [
+    {
+      "id": 1,
+      "name": "browser-with-only-this-skill",
+      "prompt": "I am using an offline browser LLM chat. I only attached this SKILL.md; no other skills installed, no CLI, JavaScript runner, filesystem, context meter, or API for creating chats. My exact mission is 'Finish the supplier comparison without inventing prices.' Supplier A has been transcribed, supplier B's warranty appendix is missing, and supplier C has not been read. My latest correction is to prioritize warranty before price. Prepare the complete handoff I can use in a fresh chat before context is lost. Deliver the artifact now; do not claim tool operations happened or just offer to continue.",
+      "expected_output": "Immediate complete copyable continuation + bootstrap, preserves exact task/correction/missing evidence, no other skill/template/runtime prerequisite, early manual new session and explicit unknown timing.",
+      "files": [],
+      "assertions": [
+        "Delivers a complete copyable checkpoint and actionable successor startup instructions now, without requiring another skill, template file, shell, JavaScript runtime or API.",
+        "Preserves the exact mission, warranty-before-price correction, A transcribed, B warranty appendix missing and C unread; does not invent supplier content or prices.",
+        "Uses an early manual fresh-chat path for unavailable telemetry and session controls; makes no universal timing, fabricated digest, file save or launched-session claim.",
+        "Explains destination attachment/source gaps and explicit predecessor stop/manual takeover before successor mission work."
+      ]
+    },
+    {
+      "id": 2,
+      "name": "desktop-rejects-false-readiness",
+      "prompt": "Offline desktop-app scenario. The handoff is armed for the exact goal {'objective':'Finish migration A without changing billing behavior','token_budget':12000}; I explicitly set that budget. Host tools can create and inspect new sessions. This session has 42,000 resident tokens, an effective 100,000 window, and a 60,000 compaction boundary. The proposed tool result may add 14,000 tokens and handoff needs 6,000. Current checkpoint v3 was read back; its detached digest is D3, nonce N3, workspace snapshot W3. One reserved fresh-session creation timed out. Host lookup now finds candidate S2, but S2 acknowledges v2/D2/W2, omits the goal budget, and its headroom is unknown. The old owner still owns the task and has untracked files. Give the precise next steps and an updated continuation-status block. Do not call real tools or claim an actual handoff happened.",
+      "expected_output": "Defer tool projected62000, checkpoint untracked state, keep existing candidate reservation/owner, fix checkpoint delivery/goal and verify budget+headroom independent host evidence before transfer, no blind new session/fork or false readiness.",
+      "files": [],
+      "assertions": [
+        "Computes 42000 + 14000 + 6000 = 62000 against the 60000 boundary and defers the proposed large tool action.",
+        "Retains old ownership and the existing reserved candidate after timeout, reconciles S2 instead of blindly creating another session, and preserves actual untracked contents.",
+        "Rejects v2/D2/W2 and omitted budget; requires current v3/D3/W3 acknowledgment plus exact active goal objective and explicit 12000 budget creation then inspection.",
+        "Requires fresh independent candidate identity/status, sufficient context headroom, artifact/permission checks and quiesced writers before atomic transfer; status accurately remains not transferred."
+      ]
+    }
+  ]
+}
