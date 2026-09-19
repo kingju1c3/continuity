@@ -136,8 +136,14 @@ def cmd_arm(a) -> int:
         st.close()
         return 3
     pending = pending_successor(st, ident.key)
+    existing_arm = get_arm(st, ident.key, sid)
     goal = a.goal or ""
     instructions = a.instructions or ""
+    if existing_arm and existing_arm.get("status") == "armed":
+        goal = str(existing_arm.get("goal") or goal)
+        prior = str(existing_arm.get("instructions") or "")
+        if prior:
+            instructions = prior + (("\n" + instructions) if instructions and instructions not in prior else "")
     inherited_from = None
     if pending and pending.get("host") == host:
         goal = str(pending.get("goal") or goal)
@@ -388,7 +394,7 @@ def cmd_status(a) -> int:
         "enabled": (ident.root / ".continuity" / "enabled.json").exists(),
         "lease": dict(lease) if lease else None,
         "armed": active_arm,
-        "successor_pending": pending_successor(st, ident.key),
+        "successor_pending": st.get_state(ident.key, "successor_pending"),
         "index": st.index_state(ident.key),
         "latest_handoff": {
             "id": handoff.get("_id"),
@@ -426,7 +432,7 @@ def cmd_doctor(a) -> int:
             get_arm(st, ident.key, str(st.active_lease(ident.key)["session_id"]))
             if st.active_lease(ident.key) else None
         ),
-        "successor_pending": pending_successor(st, ident.key),
+        "successor_pending": st.get_state(ident.key, "successor_pending"),
     }
     try:
         st.db.execute("SELECT count(*) FROM memories_fts").fetchone()
