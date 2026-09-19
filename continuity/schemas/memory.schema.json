@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Continuity Durable Memory",
+  "type": "object",
+  "required": ["project_key", "kind", "title", "content"],
+  "properties": {
+    "project_key": {"type": "string"},
+    "topic_key": {"type": ["string", "null"]},
+    "kind": {"type": "string"},
+    "title": {"type": "string"},
+    "content": {"type": "string"},
+    "source_session": {"type": ["string", "null"]},
+    "pinned": {"type": "boolean"}
+  }
+}
