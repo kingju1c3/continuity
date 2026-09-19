@@ -390,11 +390,20 @@ class Store:
         return payload
 
     def session_has_handoff(self, project_key: str, session_id: str) -> bool:
-        row = self.db.execute(
-            "SELECT 1 FROM handoffs WHERE project_key=? AND session_id=? LIMIT 1",
-            (project_key, session_id),
-        ).fetchone()
-        return row is not None
+        return self.latest_handoff_time(project_key, session_id) is not None
+
+    def latest_handoff_time(self, project_key: str, session_id: str | None = None) -> int | None:
+        if session_id is None:
+            row = self.db.execute(
+                "SELECT MAX(created_at) ts FROM handoffs WHERE project_key=?",
+                (project_key,),
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT MAX(created_at) ts FROM handoffs WHERE project_key=? AND session_id=?",
+                (project_key, session_id),
+            ).fetchone()
+        return int(row["ts"]) if row and row["ts"] is not None else None
 
     def add_freeze(self, project_key: str, session_id: str | None, event: str, payload: dict) -> int:
         cur = self.db.execute(
@@ -434,7 +443,7 @@ class Store:
 
     def mark_index_dirty(self, project_key: str, path: str | None = None) -> None:
         state = self.get_state(project_key, "index", {}) or {}
-        state.update({"dirty": True, "last_file": path, "dirty_at": int(time.time())})
+        state.update({"dirty": True, "last_file": path, "dirty_at": time.time_ns()})
         self.set_state(project_key, "index", state)
 
     def mark_index_fresh(self, project_key: str, *, files: int, symbols: int, edges: int) -> None:
