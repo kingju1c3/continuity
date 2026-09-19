@@ -229,9 +229,9 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
     return {"ok": True, "successor_name": name, "pid": proc.pid}
 
 
-def stage_codex_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
+def stage_manual_successor(store: Store, ident, *, host: str, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path, command: str) -> dict:
     pending = {
-        "schema": 1, "status": "pending", "host": "codex",
+        "schema": 1, "status": "pending", "host": host,
         "predecessor_session": predecessor_session, "handoff_id": handoff_id,
         "handoff_path": str(handoff_path), "goal": arm.get("goal", ""),
         "instructions": arm.get("instructions", ""),
@@ -240,7 +240,15 @@ def stage_codex_successor(store: Store, ident, *, predecessor_session: str, arm:
     store.set_state(ident.key, "successor_pending", pending)
     store.release_lease(ident.key, predecessor_session)
     set_arm_status(store, ident.key, predecessor_session, "transferred")
-    return {"ok": True, "manual_start": True, "command": f'cd "{ident.root}" && codex'}
+    return {"ok": True, "manual_start": True, "command": command}
+
+
+def stage_codex_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
+    return stage_manual_successor(
+        store, ident, host="codex", predecessor_session=predecessor_session,
+        arm=arm, handoff_id=handoff_id, handoff_path=handoff_path,
+        command=f'cd "{ident.root}" && codex',
+    )
 
 
 def inherit_pending_successor(store: Store, ident, *, host: str, session_id: str, event: dict) -> dict | None:
