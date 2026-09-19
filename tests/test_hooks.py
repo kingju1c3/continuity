@@ -240,6 +240,69 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(get_arm(st, ident.key, "c2")["status"], "armed")
                 st.close()
 
+    def test_no_auto_successor_codex_stages_without_spawn(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            self.enabled_project(root)
+            with patch.dict(os.environ, {"HOME": home}):
+                self.run_event(
+                    root,
+                    {"hook_event_name": "SessionStart", "session_id": "c1", "source": "startup"},
+                    host="codex",
+                )
+                self.arm(root, home, sid="c1", host="codex", auto=False)
+                with patch("continuity.boundary._spawn_codex_exec") as spawn:
+                    _, out, _ = self.run_event(
+                        root,
+                        {"hook_event_name": "PreCompact", "session_id": "c1", "trigger": "auto"},
+                        host="codex",
+                    )
+                spawn.assert_not_called()
+                payload = json.loads(out)
+                self.assertFalse(payload["continue"])
+                self.assertIn("detailed handoff was captured", payload["stopReason"])
+                st = Store.default()
+                pending = st.get_state(identity(root).key, "successor_pending")
+                self.assertEqual(pending["status"], "pending")
+                self.assertEqual(pending["host"], "codex")
+                st.close()
+
+    def test_successor_session_end_marks_ready_and_preserves_arm(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            self.enabled_project(root)
+            with patch.dict(os.environ, {"HOME": home}):
+                self.run_event(
+                    root,
+                    {"hook_event_name": "SessionStart", "session_id": "c1", "source": "startup"},
+                    host="codex",
+                )
+                self.arm(root, home, sid="c1", host="codex")
+                with patch("continuity.boundary.shutil.which", return_value=None):
+                    self.run_event(
+                        root,
+                        {"hook_event_name": "PreCompact", "session_id": "c1", "trigger": "auto"},
+                        host="codex",
+                    )
+                self.run_event(
+                    root,
+                    {"hook_event_name": "SessionStart", "session_id": "c2", "source": "startup"},
+                    host="codex",
+                )
+                self.run_event(
+                    root,
+                    {"hook_event_name": "SessionEnd", "session_id": "c2", "reason": "logout"},
+                    host="codex",
+                )
+                st = Store.default()
+                ident = identity(root)
+                pending = st.get_state(ident.key, "successor_pending")
+                self.assertEqual(pending["status"], "ready")
+                self.assertEqual(pending["successor_session"], "c2")
+                self.assertEqual(get_arm(st, ident.key, "c2")["status"], "armed")
+                self.assertIsNone(st.active_lease(ident.key))
+                st.close()
+
     def test_transferred_predecessor_blocks_further_prompt(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
             root = Path(project)
