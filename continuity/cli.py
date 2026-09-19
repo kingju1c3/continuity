@@ -82,6 +82,8 @@ def cmd_end(a) -> int:
         return 2
     st.end_session(sid)
     st.release_lease(ident.key, sid)
+    if get_arm(st, ident.key, sid):
+        disarm_session(st, ident.key, sid)
     print(f"released={sid}")
     st.close()
     return 0
@@ -128,6 +130,13 @@ def cmd_arm(a) -> int:
     host = a.host
     if host == "auto":
         host = active_host or "manual"
+    if active_host and host != active_host:
+        print(
+            f"Continuity refuses host mismatch: active lease host is {active_host}, requested {host}.",
+            file=sys.stderr,
+        )
+        st.close()
+        return 3
     if active_sid and sid != active_sid:
         print(
             f"Continuity refuses to arm session {sid}: active project owner is {active_sid}.",
