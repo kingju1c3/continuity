@@ -202,14 +202,22 @@ class HookTests(unittest.TestCase):
                     host="codex",
                 )
                 self.arm(root, home, sid="c1", host="codex")
-                _, out, _ = self.run_event(
-                    root,
-                    {"hook_event_name": "PreCompact", "session_id": "c1", "trigger": "auto"},
-                    host="codex",
-                )
+                with patch("continuity.boundary.shutil.which", return_value="/usr/bin/codex"), patch(
+                    "continuity.boundary._spawn_codex_exec",
+                    return_value=SimpleNamespace(pid=5151),
+                ), patch(
+                    "continuity.boundary._thread_id_from_log",
+                    return_value="thread-123",
+                ):
+                    _, out, _ = self.run_event(
+                        root,
+                        {"hook_event_name": "PreCompact", "session_id": "c1", "trigger": "auto"},
+                        host="codex",
+                    )
                 alert = json.loads(out)
                 self.assertFalse(alert["continue"])
-                self.assertIn("fresh Codex successor is staged", alert["stopReason"])
+                self.assertIn("fresh read-only Codex successor bootstrap thread", alert["stopReason"])
+                self.assertIn("codex resume thread-123", alert["stopReason"])
 
                 st = Store.default()
                 ident = identity(root)
@@ -243,11 +251,12 @@ class HookTests(unittest.TestCase):
                     host="codex",
                 )
                 self.arm(root, home, sid="c1", host="codex")
-                self.run_event(
-                    root,
-                    {"hook_event_name": "PreCompact", "session_id": "c1", "trigger": "auto"},
-                    host="codex",
-                )
+                with patch("continuity.boundary.shutil.which", return_value=None):
+                    self.run_event(
+                        root,
+                        {"hook_event_name": "PreCompact", "session_id": "c1", "trigger": "auto"},
+                        host="codex",
+                    )
                 _, out, _ = self.run_event(
                     root,
                     {
