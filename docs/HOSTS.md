@@ -28,6 +28,8 @@ The installer pins skill hook commands to the Python interpreter that installed 
 
 ## Codex
 
+Codex's native explicit skill syntax is `$continuity` (current Codex skills use `$<skill-name>`). Continuity does not depend on deprecated custom-prompt slash aliases.
+
 `continuity install --agents codex` installs:
 
 ```text
