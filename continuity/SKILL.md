@@ -184,24 +184,21 @@ If background launch fails, Continuity preserves the handoff and restores predec
 
 ### Codex
 
-Continuity captures the same detailed handoff and stages a successor transfer.
+Continuity captures the same detailed handoff and, when the local Codex CLI is available, automatically creates a **fresh persisted background Codex bootstrap thread** using non-interactive `codex exec --json`.
 
-A command hook has no controlling interactive terminal, so it must **not pretend** that it opened a new Codex TUI.
+The bootstrap runs read-only by default and is instructed only to verify the handoff/source and report readiness. Continuity captures the emitted `thread.started` ID when available.
 
-Instead:
-
-1. predecessor ownership is released after the handoff is durable;
-2. a pending Codex successor record is stored;
-3. the user is alerted with a fresh-session command;
-4. the next fresh Codex session in that project inherits the pending goal/instructions/handoff automatically.
-
-Typical fresh-session command:
+The user alert then gives the resume path:
 
 ```bash
-cd /path/to/project && codex
+codex resume <successor-thread-id>
 ```
 
-A transcript fork is not the preferred continuity path because the goal is fresh context with a durable handoff.
+A command hook still cannot safely open an interactive TUI window by itself. The distinction matters: Continuity can create the fresh resumable Codex thread automatically, while attaching an interactive terminal to that saved thread remains a user/host UI action.
+
+If the Codex executable is unavailable, Continuity falls back to staging a pending successor and tells the user to start `codex` from the project. The first fresh session inherits that pending handoff.
+
+A transcript fork is not preferred because the purpose is fresh context with durable state, not a duplicate of the predecessor transcript.
 
 Read `protocol/successor-transfer.md`.
 
