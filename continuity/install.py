@@ -73,6 +73,16 @@ def _skill_text() -> str:
     raise InstallError("packaged continuity/SKILL.md is missing")
 
 
+def _install_skill_bundle(target: Path) -> None:
+    package_root = Path(__file__).resolve().parent
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "SKILL.md").write_text(_skill_text(), encoding="utf-8")
+    for name in ("protocol", "schemas"):
+        src = package_root / name
+        if src.is_dir():
+            shutil.copytree(src, target / name, dirs_exist_ok=True)
+
+
 def _ours(entry: object) -> bool:
     if not isinstance(entry, dict):
         return False
@@ -189,7 +199,6 @@ def _enable(root: Path) -> Path:
 
 def install_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> list[str]:
     root = root.resolve()
-    skill = _skill_text()
     plan: list[str] = [str(root / ".continuity" / "enabled.json")]
 
     claude_settings = root / ".claude" / "settings.json"
@@ -227,9 +236,8 @@ def install_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> lis
     _enable(root)
 
     if "claude" in agents:
-        p = root / ".claude" / "skills" / "continuity" / "SKILL.md"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(skill, encoding="utf-8")
+        p = root / ".claude" / "skills" / "continuity"
+        _install_skill_bundle(p)
         assert claude_data is not None
         _backup(root, claude_settings)
         for event, entry in _claude_entries().items():
@@ -237,9 +245,8 @@ def install_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> lis
         _write_json(claude_settings, claude_data)
 
     if "codex" in agents:
-        p = root / ".agents" / "skills" / "continuity" / "SKILL.md"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(skill, encoding="utf-8")
+        p = root / ".agents" / "skills" / "continuity"
+        _install_skill_bundle(p)
 
         agents_md = root / "AGENTS.md"
         old = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
@@ -283,9 +290,9 @@ def uninstall_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> l
         return plan
 
     if "claude" in agents:
-        skill = root / ".claude" / "skills" / "continuity" / "SKILL.md"
+        skill = root / ".claude" / "skills" / "continuity"
         if skill.exists():
-            skill.unlink()
+            shutil.rmtree(skill)
         settings = root / ".claude" / "settings.json"
         if settings.exists():
             data = _read_json_object(settings)
@@ -294,9 +301,9 @@ def uninstall_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> l
             _write_json(settings, data)
 
     if "codex" in agents:
-        skill = root / ".agents" / "skills" / "continuity" / "SKILL.md"
+        skill = root / ".agents" / "skills" / "continuity"
         if skill.exists():
-            skill.unlink()
+            shutil.rmtree(skill)
         agents_md = root / "AGENTS.md"
         if agents_md.exists():
             _backup(root, agents_md)
