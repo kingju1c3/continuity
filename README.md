@@ -491,22 +491,51 @@ Then verify the handoff against the current tree and continue from the first unr
 
 ## Recommended daily workflow
 
-A good Continuity loop is intentionally small.
+A normal armed workflow is intentionally quiet.
 
-### Session open
+### Arm once
 
-```bash
-continuity start --host codex --emit-context
-continuity orient
+In Claude Code or Codex:
+
+```text
+/continuity
 ```
 
-### Before rediscovering something
+The skill immediately binds itself to the exact current host session. Manual equivalent:
+
+```bash
+continuity arm \
+  --host auto \
+  --goal "Current objective" \
+  --instructions "Constraints that must survive transfer"
+```
+
+Confirm when useful:
+
+```bash
+continuity status
+```
+
+### Work normally
+
+Continuity should not narrate itself during ordinary turns. It silently records edit freshness while armed.
+
+Use durable memory only when it saves future rediscovery:
 
 ```bash
 continuity recall "rate limiting"
+
+continuity remember \
+  "Use exponential backoff for billing retries" \
+  "**What**: Retry schedule is 1s, 2s, 4s, 8s with jitter.
+**Why**: Reduce synchronized retries against provider.
+**Where**: billing/retry.py
+**Learned**: Provider Retry-After wins when present." \
+  --kind decision \
+  --topic billing/retry-policy
 ```
 
-### Before broad repository exploration
+Use structural retrieval when needed:
 
 ```bash
 continuity query "where does billing retry logic live?"
@@ -514,35 +543,54 @@ continuity find "BillingRetry"
 continuity graph "billing"
 ```
 
-### After a durable decision
+### At the compaction boundary
+
+No manual polling is required. When the host emits `PreCompact`, an **armed** session automatically:
+
+1. alerts you before compaction;
+2. captures the durable automatic-boundary handoff;
+3. refreshes structural state;
+4. transfers ownership;
+5. creates or stages a fresh successor;
+6. blocks the predecessor compaction attempt so the transfer happens before context loss.
+
+For Claude, attach to the named successor shown in the alert:
 
 ```bash
-continuity remember \
-  "Use exponential backoff for billing retries" \
-  "**What**: Retry schedule is 1s, 2s, 4s, 8s with jitter.
-**Why**: Reduce synchronized retries against provider.
-**Where**: billing/retry.py
-**Learned**: Provider returns Retry-After for 429 and that value wins." \
-  --kind decision \
-  --topic billing/retry-policy
+claude --resume <continuity-successor-name>
 ```
 
-### After meaningful structural changes
+For Codex, attach to the persisted successor thread shown in the alert:
 
 ```bash
-continuity index
+codex resume <successor-thread-id>
 ```
 
-### Before stop / compaction / transfer
+### Optional explicit transfer
+
+If you intentionally want to hand off **before** compaction, create a richer semantic checkpoint:
 
 ```bash
-continuity checkpoint ...
+continuity checkpoint \
+  --goal "..." \
+  --instructions "..." \
+  --discoveries "..." \
+  --accomplished "..." \
+  --next-steps "..." \
+  --relevant-files "..." \
+  --verification "..."
 ```
 
-That is the core operating model:
+Disable passive transfer at any time:
+
+```bash
+continuity disarm
+```
+
+The operating model is:
 
 ```text
-OPEN → ORIENT → SEARCH → WORK → REMEMBER → REINDEX → CHECKPOINT → RESTORE
+INVOKE → ARM → WORK QUIETLY → PRECOMPACT ALERT → CAPTURE → FRESH SUCCESSOR → VERIFY → CONTINUE
 ```
 
 ---
@@ -622,9 +670,37 @@ continuity install --agents claude,codex
 
 The CLI is intentionally small and composable.
 
+### `continuity arm`
+
+Arm passive compaction-boundary continuity for the exact active host session.
+
+```bash
+continuity arm \
+  [--host auto|claude|codex|manual] \
+  [--session SESSION_ID] \
+  [--goal TEXT] \
+  [--instructions TEXT] \
+  [--no-auto-successor]
+```
+
+`--host auto` is preferred inside an installed host because it derives the host from the active session lease. A mismatched host/session is rejected rather than silently rebound.
+
+After arming, ordinary turns are passive. `--no-auto-successor` preserves the boundary alert and handoff but stages a manual fresh-session transfer.
+
+---
+
+### `continuity disarm`
+
+Disable passive boundary transfer for the active session.
+
+```bash
+continuity disarm [--session SESSION_ID]
+```
+
+---
 ### `continuity start`
 
-Register the current session and optionally print restoration context.
+Manually register a session and optionally print restoration context. Installed Claude/Codex workflows normally get exact session identity from host hooks, so this is a fallback/manual command rather than the preferred way to arm `/continuity`.
 
 ```bash
 continuity start [--host HOST] [--session SESSION_ID] [--emit-context]
@@ -1040,7 +1116,8 @@ The database contains:
 ├── .gitignore
 ├── LATEST.md
 ├── LATEST.json
-└── handoffs/
+├── handoffs/
+└── successors/        # Codex bootstrap JSONL logs when used
 ```
 
 The repository mirror is there for inspectability and local recovery. The installer configures it so generated continuity state is not committed by default.
@@ -1380,9 +1457,9 @@ No. It gives the project an explicit, local, inspectable continuity substrate th
 
 Yes, manually, as long as that environment can execute shell commands. Automatic lifecycle wiring is currently implemented for Claude Code and Codex.
 
-### Will it automatically create a new Claude/Codex session before context runs out?
+### Will it automatically create a fresh Claude/Codex successor before compaction?
 
-Not universally. Continuity can react to lifecycle events exposed by a host and can preserve/restore handoff state. Programmatic creation of a brand-new chat/session requires a supported host control surface and is not claimed by the portable core.
+When `/continuity` is armed and the local CLI is available, **yes at the reliable `PreCompact` boundary**: Claude gets a fresh named background session; Codex gets a fresh persisted read-only `codex exec --json` bootstrap thread. Continuity cannot force the host UI to open a new interactive window, so you attach to the prepared successor with the resume command shown in the alert. If the host executable is unavailable, the durable handoff is preserved and the successor is staged for manual launch.
 
 ### Why not store the full transcript?
 
