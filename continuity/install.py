@@ -101,7 +101,7 @@ def _install_skill_bundle(target: Path) -> None:
         f"command: '{yaml_hook_command}'",
     )
     (target / "SKILL.md").write_text(skill, encoding="utf-8")
-    for name in ("protocol", "schemas"):
+    for name in ("protocol", "schemas", "agents"):
         src = package_root / name
         if src.is_dir():
             shutil.copytree(src, target / name, dirs_exist_ok=True)
