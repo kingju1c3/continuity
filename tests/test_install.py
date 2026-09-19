@@ -66,6 +66,7 @@ class InstallTests(unittest.TestCase):
             self.assertIn("PreCompact:", skill)
             self.assertIn("statusMessage:", skill)
             self.assertIn("continuity arm", skill)
+            self.assertIn("-m continuity hook --host claude", skill)
             self.assertTrue(
                 (
                     root
