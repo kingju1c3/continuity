@@ -10,7 +10,6 @@ from .project import identity
 from .store import LeaseConflict, Store
 
 MAX_INPUT = 2 * 1024 * 1024
-CONTEXT_EVENTS = {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
 
 
 def _read_event() -> dict | None:
@@ -43,6 +42,10 @@ def _emit(event_name: str, additional_context: str, *, system_message: str | Non
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
+def _emit_block(reason: str) -> None:
+    sys.stdout.write(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+
+
 def _edit_path(event: dict, root: Path) -> str | None:
     tool_input = event.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -58,9 +61,21 @@ def _edit_path(event: dict, root: Path) -> str | None:
         for line in command.splitlines():
             line = line.strip()
             if line.startswith("*** Update File:") or line.startswith("*** Add File:"):
-                target = line.split(":", 1)[1].strip()
-                return target
+                return line.split(":", 1)[1].strip()
     return None
+
+
+def _freeze(store: Store, ident, host: str, sid: str | None, event_name: str, event: dict) -> dict:
+    payload = mechanical_freeze(ident.root, host=host, session_id=sid, event=event_name)
+    if event_name == "PostCompact":
+        summary = event.get("compact_summary")
+        if isinstance(summary, str) and summary.strip():
+            payload["compact_summary"] = summary[:20000]
+        trigger = event.get("trigger")
+        if isinstance(trigger, str):
+            payload["trigger"] = trigger
+    store.add_freeze(ident.key, sid, event_name, payload)
+    return payload
 
 
 def run_hook(host: str) -> int:
@@ -143,36 +158,53 @@ def run_hook(host: str) -> int:
 
         if event_name == "PostToolUse":
             tool_name = str(event.get("tool_name") or "")
-            if tool_name in {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"}:
+            edit_tools = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"}
+            shell_tools = {"Bash", "Shell", "shell"}
+            if tool_name in edit_tools | shell_tools:
                 path = _edit_path(event, ident.root)
                 store.mark_index_dirty(ident.key, path)
                 if path:
                     _emit(
                         "PostToolUse",
                         f"Continuity marked the structural index stale after editing {path}. "
-                        "Structural commands will refresh it before relying on indexed relationships.",
+                        "A semantic checkpoint should be written before this work is handed off.",
                     )
             return 0
 
         if event_name == "PreCompact":
-            freeze = mechanical_freeze(
-                ident.root, host=host, session_id=sid, event="PreCompact"
-            )
-            store.add_freeze(ident.key, sid, "PreCompact", freeze)
-            # PreCompact output support differs by host/version. Persisting the freeze is
-            # the durable guarantee; SessionStart(source=compact) hydrates it afterward.
+            _freeze(store, ident, host, sid, "PreCompact", event)
+            idx = store.index_state(ident.key)
+            trigger = str(event.get("trigger") or "")
+            if host == "claude" and trigger == "manual" and idx.get("dirty"):
+                _emit_block(
+                    "Continuity detected uncheckpointed project changes. "
+                    "Create a semantic continuity checkpoint first, then run /compact again."
+                )
+            return 0
+
+        if event_name == "PostCompact":
+            _freeze(store, ident, host, sid, "PostCompact", event)
             return 0
 
         if event_name == "Stop":
-            # Stop is a per-turn event in both supported hosts, not a session end.
-            # Never release ownership here.
+            idx = store.index_state(ident.key)
+            dirty_at = idx.get("dirty_at") if idx.get("dirty") else None
+            if dirty_at and sid and not store.session_has_handoff(ident.key, sid):
+                marker_key = f"stop-feedback:{sid}"
+                prior = store.get_state(ident.key, marker_key)
+                if prior != dirty_at:
+                    store.set_state(ident.key, marker_key, dirty_at)
+                    _emit(
+                        "Stop",
+                        "Continuity detected project changes without a semantic handoff for this session. "
+                        "Before ending this turn, run continuity checkpoint with the goal, constraints, "
+                        "discoveries, accomplished work, exact next steps, relevant files, and verification. "
+                        "The checkpoint command refreshes the structural index and binds the handoff to the active session.",
+                    )
             return 0
 
         if event_name == "SessionEnd":
-            freeze = mechanical_freeze(
-                ident.root, host=host, session_id=sid, event="SessionEnd"
-            )
-            store.add_freeze(ident.key, sid, "SessionEnd", freeze)
+            _freeze(store, ident, host, sid, "SessionEnd", event)
             if sid:
                 store.end_session(sid)
                 store.release_lease(ident.key, sid)
