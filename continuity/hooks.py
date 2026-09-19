@@ -224,13 +224,29 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
             handoff_id=handoff_id,
             handoff_path=handoff_path,
         )
-        reason = (
-            "Continuity handoff boundary reached: compaction is about to occur. "
-            "A detailed handoff was captured and a fresh Codex successor is staged. "
-            "Codex hooks cannot safely open an interactive TUI from this no-terminal hook. "
-            f"Start the fresh session with: {transfer.get('command')}. "
-            "The next fresh Codex session will inherit the staged handoff automatically."
-        )
+        if not transfer.get("ok"):
+            reason = (
+                "Continuity handoff boundary reached: compaction is about to occur. "
+                f"The detailed handoff was captured at {handoff_path}, but automatic Codex successor launch failed: "
+                f"{transfer.get('reason')}. Predecessor ownership was restored."
+            )
+        elif transfer.get("automatic"):
+            tid = transfer.get("thread_id")
+            thread_text = f" Successor thread: {tid}." if tid else ""
+            reason = (
+                "Continuity handoff boundary reached: compaction is about to occur. "
+                "A detailed handoff was captured and a fresh read-only Codex successor bootstrap thread was launched "
+                "in the background." + thread_text + " "
+                f"Resume it interactively with: {transfer.get('resume_command')}. "
+                "The successor must verify source before editing."
+            )
+        else:
+            reason = (
+                "Continuity handoff boundary reached: compaction is about to occur. "
+                "A detailed handoff was captured. The Codex executable was not available for automatic bootstrap. "
+                f"Start the fresh session with: {transfer.get('command')}. "
+                "The next fresh Codex session will inherit the staged handoff automatically."
+            )
         _alert_and_block(host, reason)
         return 0
 
@@ -320,8 +336,8 @@ def run_hook(host: str) -> int:
             if sid:
                 store.end_session(sid)
                 store.release_lease(ident.key, sid)
-                if arm and arm.get("status") == "armed":
-                    set_arm_status(store, ident.key, sid, "disarmed", ended=True)
+                # Keep arm state durable across an ordinary session exit/resume. The
+                # lease is released, but the same host session can resume still armed.
             return 0
 
         return 0
