@@ -7,6 +7,7 @@ import sys
 import uuid
 
 from .adapters import detect, structural_query
+from .boundary import arm_session, disarm_session, get_arm, pending_successor
 from .context import query_terms
 from .handoff import checkpoint_payload, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
@@ -107,6 +108,61 @@ def cmd_recover(a) -> int:
         {"manual": True, "recovered": True, "expected_owner": a.expected_owner},
     )
     print(f"recovered_session={sid}")
+    st.close()
+    return 0
+
+
+def cmd_arm(a) -> int:
+    ident, st = _ctx(a.path)
+    active_sid, active_host = _active_session(st, ident.key)
+    sid = a.session or active_sid
+    if not sid:
+        print(
+            "Continuity cannot arm without an exact session identity. "
+            "Install/repair host hooks or pass --session explicitly.",
+            file=sys.stderr,
+        )
+        st.close()
+        return 2
+    host = a.host
+    if host == "auto":
+        host = active_host or "manual"
+    if active_sid and sid != active_sid:
+        print(
+            f"Continuity refuses to arm session {sid}: active project owner is {active_sid}.",
+            file=sys.stderr,
+        )
+        st.close()
+        return 3
+    state = arm_session(
+        st,
+        ident.key,
+        sid,
+        host,
+        goal=a.goal or "",
+        instructions=a.instructions or "",
+        auto_successor=not a.no_auto_successor,
+    )
+    print(
+        "Continuity armed. It will remain passive during ordinary turns and trigger at the "
+        "host PreCompact boundary before compaction.\n"
+        + json.dumps(state, indent=2, sort_keys=True)
+    )
+    st.close()
+    return 0
+
+
+def cmd_disarm(a) -> int:
+    ident, st = _ctx(a.path)
+    sid = a.session
+    if not sid:
+        sid, _ = _active_session(st, ident.key)
+    if not sid:
+        print("No active Continuity session to disarm.", file=sys.stderr)
+        st.close()
+        return 2
+    state = disarm_session(st, ident.key, sid)
+    print(json.dumps(state, indent=2, sort_keys=True))
     st.close()
     return 0
 
@@ -302,12 +358,15 @@ def cmd_status(a) -> int:
     lease = st.active_lease(ident.key)
     handoff = st.latest_handoff(ident.key)
     freeze = st.latest_freeze(ident.key)
+    active_arm = get_arm(st, ident.key, str(lease["session_id"])) if lease else None
     result = {
         "project": str(ident.root),
         "branch": ident.branch,
         "head": ident.git_head,
         "enabled": (ident.root / ".continuity" / "enabled.json").exists(),
         "lease": dict(lease) if lease else None,
+        "armed": active_arm,
+        "successor_pending": pending_successor(st, ident.key),
         "index": st.index_state(ident.key),
         "latest_handoff": {
             "id": handoff.get("_id"),
@@ -341,6 +400,11 @@ def cmd_doctor(a) -> int:
         "agents_md": (ident.root / "AGENTS.md").exists(),
         "index": st.index_state(ident.key),
         "active_lease": dict(st.active_lease(ident.key)) if st.active_lease(ident.key) else None,
+        "armed": (
+            get_arm(st, ident.key, str(st.active_lease(ident.key)["session_id"]))
+            if st.active_lease(ident.key) else None
+        ),
+        "successor_pending": pending_successor(st, ident.key),
     }
     try:
         st.db.execute("SELECT count(*) FROM memories_fts").fetchone()
@@ -397,6 +461,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("end")
     s.add_argument("--session")
     s.set_defaults(fn=cmd_end)
+
+    s = sub.add_parser("arm")
+    s.add_argument("--host", default="auto")
+    s.add_argument("--session")
+    s.add_argument("--goal")
+    s.add_argument("--instructions")
+    s.add_argument("--no-auto-successor", action="store_true")
+    s.set_defaults(fn=cmd_arm)
+
+    s = sub.add_parser("disarm")
+    s.add_argument("--session")
+    s.set_defaults(fn=cmd_disarm)
 
     s = sub.add_parser("recover")
     s.add_argument("--host", default="manual")
