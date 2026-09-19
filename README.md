@@ -335,22 +335,17 @@ The installer makes that repository-local continuity state gitignored by default
 
 ### 4. Session restoration
 
-At the start of work:
-
-```bash
-continuity start --host codex --emit-context
-continuity orient
-```
-
-If a previous handoff exists, `start --emit-context` prints it. `orient` then gives the project identity, current Git state, latest handoff, recent durable memories, and detected optional adapters.
-
-To print the latest handoff directly:
+Installed host hooks register exact session identity automatically. The preferred successor flow is therefore:
 
 ```bash
 continuity resume
+continuity orient
+continuity status
 ```
 
-The successor should verify the handoff against current source and Git state before making edits.
+A successor created/staged by the passive boundary protocol also inherits the pending goal and constraints. It must still verify the handoff against current source and Git state before making edits.
+
+`continuity start --emit-context` remains available for manual or unsupported-host workflows, but it is not required for normal installed Claude/Codex sessions.
 
 ---
 
@@ -465,7 +460,9 @@ continuity arm --host auto --goal "Current objective" --instructions "Critical c
 
 Then work normally. Continuity stays passive until PreCompact. Use `continuity status` at any time to inspect arm/lease/successor state.
 
-### End of session
+### Intentional early handoff
+
+You do **not** need a checkpoint at every ordinary session turn or stop. If you want to transfer intentionally before PreCompact, create a richer semantic checkpoint:
 
 ```bash
 continuity checkpoint \
@@ -477,15 +474,17 @@ continuity checkpoint \
   --verification "Unit tests passing"
 ```
 
-### Next session
+### Successor session
+
+The boundary alert gives the attach/resume command. Once attached, verify:
 
 ```bash
-continuity start --host codex --emit-context
 continuity resume
 continuity orient
+continuity status
 ```
 
-Then verify the handoff against the current tree and continue from the first unresolved next step.
+Then continue from the first unresolved next step only after reconciling the handoff with the current tree.
 
 ---
 
@@ -1384,24 +1383,44 @@ continuity/
 │   ├── __init__.py
 │   ├── __main__.py
 │   ├── adapters.py
+│   ├── boundary.py        # passive arm + boundary handoff + successor launch
 │   ├── cli.py
+│   ├── context.py
 │   ├── handoff.py
 │   ├── hooks.py
 │   ├── indexer.py
 │   ├── install.py
 │   ├── project.py
 │   ├── store.py
-│   └── SKILL.md
+│   ├── SKILL.md
+│   ├── protocol/
+│   │   ├── passive-mode.md
+│   │   ├── compaction.md
+│   │   ├── successor-transfer.md
+│   │   ├── session-open.md
+│   │   ├── checkpoint-handoff.md
+│   │   ├── retrieval.md
+│   │   ├── memory-write.md
+│   │   ├── conflict-recovery.md
+│   │   └── security.md
+│   └── schemas/
+│       ├── arm.schema.json
+│       ├── checkpoint.schema.json
+│       ├── memory.schema.json
+│       └── session.schema.json
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── HOSTS.md
 │   ├── MEMORY_PROTOCOL.md
 │   └── SOURCES.md
-├── scripts/
-│   └── install.sh
 ├── tests/
+│   ├── test_arm_cli.py
+│   ├── test_boundary.py
 │   ├── test_handoff.py
+│   ├── test_hooks.py
 │   ├── test_indexer.py
+│   ├── test_install.py
+│   ├── test_premium.py
 │   └── test_store.py
 ├── LICENSE
 ├── README.md
