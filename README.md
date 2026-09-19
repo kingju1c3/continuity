@@ -101,7 +101,7 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 Continuity v0.3 changes the operating model from **active per-turn assistance** to **arm once, stay passive, transfer at the compaction boundary**.
 
-Invoke `/continuity` once in the session. The skill arms the exact current host session, then gets out of the way.
+Invoke the Continuity skill once in the session: **`/continuity` in Claude Code** or **`$continuity` in Codex**. Codex's current native explicit skill syntax is `$<skill-name>`; Continuity does not rely on deprecated custom-prompt slash aliases. The skill arms the exact current host session, then gets out of the way.
 
 ```text
 /continuity
@@ -335,7 +335,7 @@ The installer makes that repository-local continuity state gitignored by default
 
 ### 4. Session restoration
 
-Installed host hooks register exact session identity automatically. The preferred successor flow is therefore:
+Installed host hooks register exact session identity automatically. A successor bootstrap invokes/uses Continuity in the host-native form (`/continuity` for Claude Code, `$continuity` for Codex), then the preferred verification flow is:
 
 ```bash
 continuity resume
@@ -446,10 +446,11 @@ continuity install --agents codex
 
 ### First armed session
 
-In Claude Code or Codex, invoke:
+Invoke the installed skill explicitly:
 
 ```text
-/continuity
+Claude Code: /continuity
+Codex:       $continuity
 ```
 
 The skill's first action arms the exact host session. For manual use:
@@ -494,10 +495,11 @@ A normal armed workflow is intentionally quiet.
 
 ### Arm once
 
-In Claude Code or Codex:
+Use the native explicit skill syntax:
 
 ```text
-/continuity
+Claude Code: /continuity
+Codex:       $continuity
 ```
 
 The skill immediately binds itself to the exact current host session. Manual equivalent:
