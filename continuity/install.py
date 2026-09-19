@@ -12,8 +12,9 @@ MARKER_END = "<!-- continuity:end -->"
 AGENT_BLOCK = (
     MARKER_START
     + "\n## Continuity\n"
-    + "This project supports the /continuity passive handoff protocol. Invoking /continuity must arm the exact current "
-      "host session with continuity arm, then remain quiet during ordinary turns. At the host PreCompact boundary, "
+    + "This project supports the Continuity passive handoff protocol. Invoke it with /continuity in Claude Code or "
+      "$continuity in Codex. Invocation must arm the exact current host session with continuity arm, then remain quiet "
+      "during ordinary turns. At the host PreCompact boundary, "
       "Continuity alerts the user, captures a detailed machine-backed handoff, and transfers ownership to a fresh "
       "successor session when the host can do so safely. Current source and Git state always outrank historical memory.\n"
     + MARKER_END
