@@ -132,10 +132,11 @@ def _claude_entries() -> dict[str, dict]:
         },
         "UserPromptSubmit": {"hooks": [_handler("claude", timeout=10)]},
         "PostToolUse": {
-            "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
             "hooks": [_handler("claude", timeout=10)],
         },
         "PreCompact": {"hooks": [_handler("claude", timeout=10)]},
+        "PostCompact": {"hooks": [_handler("claude", timeout=10)]},
         "Stop": {"hooks": [_handler("claude", timeout=10)]},
         "SessionEnd": {"hooks": [_handler("claude", timeout=3)]},
     }
@@ -151,10 +152,11 @@ def _codex_entries() -> dict[str, dict]:
             "hooks": [_handler("codex", timeout=10, context_limit=3500)],
         },
         "PostToolUse": {
-            "matcher": "apply_patch|Write|Edit|MultiEdit",
+            "matcher": "apply_patch|Write|Edit|MultiEdit|Bash|Shell|shell",
             "hooks": [_handler("codex", timeout=10, context_limit=1200)],
         },
         "PreCompact": {"hooks": [_handler("codex", timeout=10)]},
+        "PostCompact": {"hooks": [_handler("codex", timeout=10)]},
         "Stop": {"hooks": [_handler("codex", timeout=10, context_limit=1200)]},
         "SessionEnd": {"hooks": [_handler("codex", timeout=3)]},
     }
