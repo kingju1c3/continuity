@@ -39,6 +39,24 @@ class BoundaryTests(unittest.TestCase):
             self.assertTrue(result["available"])
             self.assertLessEqual(len(result["text"]), MAX_TRANSCRIPT_CHARS)
 
+    def test_transcript_tail_redacts_common_secret_patterns(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "transcript.jsonl"
+            p.write_text(
+                json.dumps(
+                    {
+                        "role": "user",
+                        "text": "api_key=supersecretvalue123 and Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+                    }
+                )
+            )
+            result = transcript_tail(str(p))
+            self.assertTrue(result["available"])
+            self.assertTrue(result["redacted"])
+            self.assertNotIn("supersecretvalue123", result["text"])
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz", result["text"])
+            self.assertIn("REDACTED", result["text"])
+
     def test_missing_transcript_is_not_error(self):
         result = transcript_tail(None)
         self.assertFalse(result["available"])
