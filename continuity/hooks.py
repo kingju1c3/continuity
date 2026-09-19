@@ -59,7 +59,6 @@ def _alert_and_block(host: str, reason: str) -> None:
             "continue": False,
             "stopReason": reason,
             "systemMessage": reason,
-            "terminalSequence": "\u0007",
         }
     else:
         payload = {
