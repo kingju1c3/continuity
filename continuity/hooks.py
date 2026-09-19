@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 
 from .boundary import (
@@ -363,7 +364,7 @@ def run_hook(host: str) -> int:
                     and pending.get("successor_session") == sid
                     and pending.get("status") in {"consumed", "launched"}
                 ):
-                    pending.update({"status": "ready", "ready_at": __import__("time").time_ns()})
+                    pending.update({"status": "ready", "ready_at": time.time_ns()})
                     store.set_state(ident.key, "successor_pending", pending)
             return 0
 
