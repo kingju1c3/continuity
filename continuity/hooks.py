@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -120,14 +121,12 @@ def _session_start(store: Store, ident, host: str, sid: str | None, event: dict)
         {"event": "SessionStart", "source": event.get("source")},
     )
 
-    inherited = inherit_pending_successor(store, ident, host=host, session_id=sid, event=event)
     conflict = None
     try:
         store.acquire_lease(ident.key, sid, host)
     except LeaseConflict as exc:
         conflict = str(exc)
 
-    arm = inherited or get_arm(store, ident.key, sid)
     if conflict:
         _emit_context(
             "SessionStart",
@@ -135,6 +134,10 @@ def _session_start(store: Store, ident, host: str, sid: str | None, event: dict)
             system_message="Continuity detected a session ownership conflict.",
         )
         return 0
+
+    # Claim pending transfer only after this exact session successfully owns the project.
+    inherited = inherit_pending_successor(store, ident, host=host, session_id=sid, event=event)
+    arm = inherited or get_arm(store, ident.key, sid)
 
     # Normal sessions remain silent. Only armed/inherited sessions receive continuity context.
     if arm and arm.get("status") == "armed":
@@ -216,13 +219,26 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         return 0
 
     if host == "codex":
-        transfer = stage_codex_successor(
-            store,
-            ident,
-            predecessor_session=sid,
-            arm=arm,
-            handoff_id=handoff_id,
-            handoff_path=handoff_path,
+        transfer = (
+            stage_codex_successor(
+                store,
+                ident,
+                predecessor_session=sid,
+                arm=arm,
+                handoff_id=handoff_id,
+                handoff_path=handoff_path,
+            )
+            if auto
+            else stage_manual_successor(
+                store,
+                ident,
+                host="codex",
+                predecessor_session=sid,
+                arm=arm,
+                handoff_id=handoff_id,
+                handoff_path=handoff_path,
+                command=f"cd {shlex.quote(str(ident.root))} && codex",
+            )
         )
         if not transfer.get("ok"):
             reason = (
@@ -250,7 +266,11 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         _alert_and_block(host, reason)
         return 0
 
-    command = f'cd "{ident.root}" && claude' if host == "claude" else f'cd "{ident.root}"'
+    command = (
+        f"cd {shlex.quote(str(ident.root))} && claude"
+        if host == "claude"
+        else f"cd {shlex.quote(str(ident.root))}"
+    )
     transfer = stage_manual_successor(
         store,
         ident,
@@ -336,8 +356,15 @@ def run_hook(host: str) -> int:
             if sid:
                 store.end_session(sid)
                 store.release_lease(ident.key, sid)
-                # Keep arm state durable across an ordinary session exit/resume. The
-                # lease is released, but the same host session can resume still armed.
+                # Keep arm state durable across ordinary exit/resume.
+                pending = store.get_state(ident.key, "successor_pending")
+                if (
+                    isinstance(pending, dict)
+                    and pending.get("successor_session") == sid
+                    and pending.get("status") in {"consumed", "launched"}
+                ):
+                    pending.update({"status": "ready", "ready_at": __import__("time").time_ns()})
+                    store.set_state(ident.key, "successor_pending", pending)
             return 0
 
         return 0
