@@ -97,6 +97,45 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## Premium continuity runtime — v0.2
+
+Continuity v0.2 moves beyond command-only handoffs into an active lifecycle protocol.
+
+It now adds:
+
+- **exact host-session ownership** with one active lease per project;
+- **lease-conflict detection** instead of silent concurrent takeover;
+- **explicit abandoned-session recovery** with an expected-owner check;
+- **real SessionStart hydration** — the previous handoff, newer lifecycle freeze, durable memory, Git identity, and index freshness are injected into agent context;
+- **prompt-scoped retrieval** on UserPromptSubmit;
+- **mechanical PreCompact / PostCompact / SessionEnd freezes**;
+- **host compact-summary preservation** when the host exposes one;
+- **one-shot Stop feedback** when code changed after the latest semantic checkpoint;
+- **manual-compaction protection** on Claude Code when changes are still uncheckpointed;
+- **automatic structural freshness tracking** after edits/shell activity;
+- **automatic index refresh** before built-in structural queries and semantic checkpoints;
+- **memory revision history** for evolving topic keys;
+- **handoff drift detection** against current project root, branch, HEAD, working tree, and relevant files;
+- **fail-closed host configuration edits** with backups;
+- **project opt-in gating** for globally configured Codex hooks;
+- **dry-run, repair, and uninstall** operations that preserve unrelated host configuration;
+- a **complete installed protocol bundle** with lifecycle references and JSON schemas.
+
+Useful maintenance commands:
+
+```bash
+continuity status
+continuity memory-history architecture/auth-model
+continuity recover --host codex --expected-owner <old-session-id>
+continuity install --agents claude,codex --dry-run
+continuity repair --agents claude,codex
+continuity uninstall --agents claude,codex
+```
+
+The portable core still does not claim that every host can programmatically spawn a brand-new chat. What it now does is preserve, validate, and rehydrate the strongest available durable state across the lifecycle surfaces the host actually exposes.
+
+---
+
 ## Core capabilities
 
 ### 1. Curated persistent memory
