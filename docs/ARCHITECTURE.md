@@ -26,7 +26,7 @@ Memory is useful historical context; it never outranks current source or Git sta
 
 ## Armed session state
 
-Invoking `/continuity` arms the exact current host session. Arm state stores:
+Explicitly invoking the Continuity skill (`/continuity` in Claude Code, `$continuity` in Codex) arms the exact current host session. Arm state stores:
 
 - exact session ID and host;
 - active goal;
