@@ -93,6 +93,45 @@ class HookTests(unittest.TestCase):
                 self.assertIn("continuity checkpoint", stop1)
                 self.assertEqual(stop2, "")
 
+    def test_later_edit_requires_newer_handoff(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            self.enabled_project(root)
+            with patch.dict(os.environ, {"HOME": home}):
+                self.run_event(
+                    root,
+                    {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"},
+                )
+                st = Store.default()
+                ident = identity(root)
+                st.add_handoff(
+                    ident.key,
+                    "s1",
+                    {
+                        "version": 2,
+                        "kind": "semantic",
+                        "created_at": int(__import__("time").time()),
+                        "session_id": "s1",
+                        "host": "claude",
+                        "root": str(root),
+                        "git": {},
+                    },
+                )
+                st.close()
+                self.run_event(
+                    root,
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "s1",
+                        "tool_name": "Edit",
+                        "tool_input": {"file_path": str(root / "later.py")},
+                    },
+                )
+                _, stop, _ = self.run_event(
+                    root, {"hook_event_name": "Stop", "session_id": "s1"}
+                )
+                self.assertIn("newer than this session's latest semantic handoff", stop)
+
     def test_postcompact_persists_host_summary(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
             root = Path(project)
