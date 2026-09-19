@@ -32,7 +32,7 @@ continuity start --host <claude|codex|manual> --emit-context
 continuity orient
 ```
 
-Read `protocol/session-open.md` when opening or recovering a session.
+Read `continuity/protocol/session-open.md` when opening or recovering a session.
 
 Never silently ignore a `LEASE CONFLICT`.
 
@@ -69,7 +69,7 @@ continuity find SomeSymbol
 continuity graph some/module
 ```
 
-Read `protocol/retrieval.md`.
+Read `continuity/protocol/retrieval.md`.
 
 ### WORK
 
@@ -98,7 +98,7 @@ Use stable topic keys for evolving knowledge. Previous topic values remain in re
 continuity memory-history architecture/example
 ```
 
-Read `protocol/memory-write.md`.
+Read `continuity/protocol/memory-write.md`.
 
 ### CHECKPOINT
 
@@ -117,7 +117,7 @@ continuity checkpoint \
 
 A checkpoint must distinguish completed work, proposed work, verified facts, assumptions, and unverified items. The command refreshes structural state first and binds the handoff to the active session lease when available.
 
-Read `protocol/checkpoint-handoff.md`.
+Read `continuity/protocol/checkpoint-handoff.md`.
 
 ### RESTORE
 
@@ -142,7 +142,7 @@ Explicit abandoned-session recovery:
 continuity recover --host <host> --expected-owner <old-session-id>
 ```
 
-Read `protocol/conflict-recovery.md`.
+Read `continuity/protocol/conflict-recovery.md`.
 
 ## Automatic lifecycle behavior
 
@@ -196,7 +196,7 @@ When the host exposes a compact summary, Continuity preserves it with a post-com
 
 Continuity writes a final mechanical freeze, ends the session record, and releases the project lease.
 
-Read `protocol/compaction.md`.
+Read `continuity/protocol/compaction.md`.
 
 ## Mechanical freeze vs semantic checkpoint
 
@@ -283,7 +283,7 @@ If two memory states may both be valid because of branches/environments, use dis
 - Stale index: refresh before built-in structural use.
 - Missing continuity data: say it is missing; do not invent it.
 
-Read `protocol/security.md`.
+Read `continuity/protocol/security.md`.
 
 ## Installation and maintenance
 
@@ -322,19 +322,19 @@ continuity status
 
 Read only the reference needed for the current situation:
 
-- `protocol/session-open.md`
-- `protocol/retrieval.md`
-- `protocol/memory-write.md`
-- `protocol/checkpoint-handoff.md`
-- `protocol/compaction.md`
-- `protocol/conflict-recovery.md`
-- `protocol/security.md`
+- `continuity/protocol/session-open.md`
+- `continuity/protocol/retrieval.md`
+- `continuity/protocol/memory-write.md`
+- `continuity/protocol/checkpoint-handoff.md`
+- `continuity/protocol/compaction.md`
+- `continuity/protocol/conflict-recovery.md`
+- `continuity/protocol/security.md`
 
 Schemas:
 
-- `schemas/checkpoint.schema.json`
-- `schemas/memory.schema.json`
-- `schemas/session.schema.json`
+- `continuity/schemas/checkpoint.schema.json`
+- `continuity/schemas/memory.schema.json`
+- `continuity/schemas/session.schema.json`
 
 ## Integrity invariant
 
