@@ -56,6 +56,15 @@ class InstallTests(unittest.TestCase):
             self.assertTrue((root / ".claude" / "skills" / "continuity" / "protocol" / "session-open.md").exists())
             self.assertTrue((root / ".agents" / "skills" / "continuity" / "schemas" / "checkpoint.schema.json").exists())
 
+    def test_refuses_project_local_symlink_redirection(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project, TemporaryDirectory() as outside:
+            root = Path(project)
+            (root / ".claude").symlink_to(Path(outside), target_is_directory=True)
+            with patch.dict(os.environ, {"HOME": home}):
+                with self.assertRaises(InstallError):
+                    install_repo(root, ["claude"])
+            self.assertEqual(list(Path(outside).iterdir()), [])
+
     def test_uninstall_removes_only_continuity_owned_entries(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
             root = Path(project)
