@@ -1,821 +1,221 @@
-<div align="center">
+<!--
+  Continuity
+  Persistent project context for coding agents
+-->
 
-<img src="https://d2ol7oe51mr4n9.cloudfront.net/user_311XgUsRBKFoeOtsydaPHNvNFQv/e98b7dae-0925-4566-af97-02f99d95f2bf.jpg" alt="Continuity — Persistent Context for Coding Agents" width="100%" />
+<p align="center">
+  <img
+    src="https://d2ol7oe51mr4n9.cloudfront.net/user_311XgUsRBKFoeOtsydaPHNvNFQv/e98b7dae-0925-4566-af97-02f99d95f2bf.jpg"
+    alt="Continuity — persistent context for coding agents"
+    width="100%"
+  />
+</p>
 
-<br />
+<h1 align="center">Continuity</h1>
 
-# Continuity
+<p align="center">
+  <strong>Persistent project continuity for Claude Code, Codex, and other coding agents.</strong>
+</p>
 
-### Persistent context for coding agents.
+<p align="center">
+  Memory · Structure · Handoffs · Recovery
+</p>
 
-**Memory · Structure · Handoffs · Recovery**
-
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
-[![Tests](https://github.com/kingju1c3/continuity/actions/workflows/test.yml/badge.svg)](https://github.com/kingju1c3/continuity/actions/workflows/test.yml)
-[![Claude Code](https://img.shields.io/badge/Claude_Code-integrated-D97757)](docs/HOSTS.md)
-[![Codex](https://img.shields.io/badge/Codex-integrated-111827)](docs/HOSTS.md)
-[![Local First](https://img.shields.io/badge/Storage-local--first-0ea5e9)](#privacy-and-security)
-
-**Pick up where the last session stopped — with durable memory, codebase orientation, Git-verified handoffs, and host-aware session recovery.**
-
-[Quick Start](#quick-start) · [How It Works](#how-continuity-works) · [Installation](#installation) · [Usage](#usage) · [CLI Reference](#cli-reference) · [Architecture](#architecture) · [Troubleshooting](#troubleshooting)
-
-</div>
+<p align="center">
+  <a href="https://github.com/kingju1c3/continuity/actions/workflows/test.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/kingju1c3/continuity/test.yml?branch=main&style=flat-square&label=tests"></a>
+  <a href="https://www.python.org/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white"></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square"></a>
+  <img alt="Local first" src="https://img.shields.io/badge/storage-local--first-7c3aed?style=flat-square">
+  <img alt="SQLite + FTS5" src="https://img.shields.io/badge/memory-SQLite%20%2B%20FTS5-0f766e?style=flat-square">
+  <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-supported-D97757?style=flat-square">
+  <img alt="Codex" src="https://img.shields.io/badge/Codex-supported-111827?style=flat-square">
+</p>
 
 ---
 
 ## What is Continuity?
 
-Coding agents are powerful inside a session and surprisingly fragile across sessions.
+Coding agents are powerful inside a session, but sessions end, contexts compact, terminals restart, branches move, and the next agent often has to reconstruct work from scratch.
 
-A long-running task may involve dozens of decisions, discovered edge cases, partial fixes, architectural constraints, changed files, failed approaches, verification steps, and unresolved next actions. Then the session ends, the context window compacts, a new terminal opens, or a different agent takes over.
+**Continuity is a local-first continuity layer for coding agents.** It gives a project a durable record of the things that should survive between sessions without pretending that a transcript is the same thing as memory or that a summary is the same thing as source truth.
 
-The next session often starts with only fragments:
+Continuity separates project context into four different layers:
 
-- a Git working tree,
-- maybe a transcript,
-- maybe a summary,
-- maybe some project instructions,
-- and no reliable distinction between **what was discussed**, **what was decided**, **what was actually changed**, and **what still needs to happen**.
+| Layer | Question it answers | Backing state |
+| --- | --- | --- |
+| **Durable memory** | “What did we decide or learn?” | SQLite + FTS5 |
+| **Structural context** | “Where is this implemented and how is it connected?” | Local code index, optionally Graft / Graphify |
+| **Handoff state** | “What was done, what remains, and what should the successor do next?” | Semantic checkpoint + Git evidence |
+| **Current truth** | “What is actually true right now?” | Current source tree + Git |
 
-**Continuity is a local-first continuity layer for coding agents.**
+The goal is not to manufacture artificial “perfect memory.” The goal is to make session-to-session recovery **fast, explicit, inspectable, and evidence-backed**.
 
-It does not pretend that a new model invocation is literally the same running process. Instead, it builds the strongest practical approximation of continuity from durable, inspectable evidence:
-
-1. **Curated memory** for durable decisions and discoveries.
-2. **Structural context** for understanding where things live in the codebase.
-3. **Session state** for tracking work across agent runs.
-4. **Verified handoffs** that pair semantic summaries with current Git evidence.
-5. **Host integration** that restores context at session start and prompts checkpointing before compaction or exit.
-6. **Optional graph adapters** for deeper orientation through Graft and Graphify.
-
-The result is a successor session that can begin with far more than “read the repo and figure out what happened.”
+> **Current source and Git state always outrank stale memory.**
 
 ---
 
 ## Why Continuity exists
 
-Most continuity systems collapse several very different kinds of information into one bucket.
+A normal coding-agent workflow tends to break in predictable ways:
 
-Continuity deliberately does not.
+- the next session does not know what the previous session already tried;
+- decisions get rediscovered repeatedly;
+- context compaction drops details that mattered;
+- summaries claim work is finished when the tree says otherwise;
+- a new agent reads half the repository before finding the relevant files;
+- raw transcripts grow forever but become worse at retrieval;
+- architecture knowledge, user preferences, implementation details, and session state are mixed into one undifferentiated blob.
 
-> A transcript is not memory.  
-> A memory is not source truth.  
-> A code graph is not a handoff.  
-> A handoff is not the working tree.  
-> A summary is not verification.
+Continuity addresses those failures by giving each kind of state a different lifetime and authority.
 
-Each layer answers a different question:
-
-| Layer | Question it answers | Authority |
-|---|---|---|
-| **Current source + Git** | What is true in the project right now? | Highest |
-| **Structural index / graph** | Where is this implemented and how is it connected? | Derived from source |
-| **Durable memory** | What did we learn, decide, or standardize? | Historical context |
-| **Session handoff** | What was happening, what is done, and what happens next? | Predecessor account + Git snapshot |
-| **Transcript** | What was said during a session? | Raw history, usually too noisy |
-
-This separation is the core design decision behind Continuity.
+```text
+                            ┌────────────────────────────┐
+                            │       CURRENT SOURCE       │
+                            │        + Git state         │
+                            │     highest authority      │
+                            └─────────────┬──────────────┘
+                                          │
+                              verify / reconcile
+                                          │
+             ┌────────────────────────────┼────────────────────────────┐
+             │                            │                            │
+             ▼                            ▼                            ▼
+    ┌────────────────┐          ┌──────────────────┐        ┌──────────────────┐
+    │ DURABLE MEMORY │          │ STRUCTURAL INDEX │        │ SESSION HANDOFF  │
+    │ SQLite + FTS5  │          │ symbols + edges  │        │ semantic + Git   │
+    └────────────────┘          └──────────────────┘        └──────────────────┘
+             │                            │                            │
+             └────────────────────────────┴────────────────────────────┘
+                                          │
+                                          ▼
+                                ┌──────────────────┐
+                                │  NEXT AI SESSION │
+                                │ orient → verify  │
+                                │ → continue       │
+                                └──────────────────┘
+```
 
 ---
 
 ## Core capabilities
 
-### 1. Durable project memory
+### 1. Curated persistent memory
 
-Continuity stores curated memories in a local SQLite database with FTS5 full-text search.
+Continuity stores reusable project knowledge in a local SQLite database with FTS5 full-text search.
 
-Use it for knowledge that should survive the current session:
+Good memories include:
 
-- architectural decisions,
-- conventions,
-- root causes,
-- non-obvious discoveries,
-- environment/configuration decisions,
-- user constraints,
-- implementation patterns,
-- gotchas that would otherwise need to be rediscovered.
+- architecture decisions;
+- user-confirmed conventions;
+- non-obvious bug root causes;
+- configuration decisions;
+- known gotchas;
+- implementation constraints;
+- decisions that would be expensive to rediscover.
 
-It is intentionally **not** a transcript sink.
+Continuity is deliberately **not** a transcript sink. Save knowledge that has future value, not every interaction.
 
-A good memory is small, structured, searchable, and expensive to rediscover.
-
----
-
-### 2. Stable evolving topics
-
-Durable knowledge changes.
-
-Instead of creating ten contradictory memories about the same evolving design, Continuity supports stable topic keys:
+Stable topic keys make evolving knowledge update in place:
 
 ```bash
-continuity remember   "Authentication model"   "**What**: Switched from JWT-only auth to server-side sessions.
-**Why**: Revocation and device management requirements.
+continuity remember \
+  "Authentication model" \
+  "**What**: Session cookies replace JWT access tokens.
+**Why**: Server-side revocation is required.
 **Where**: src/auth/, middleware/session.py
-**Learned**: Existing refresh-token assumptions must be removed."   --kind architecture   --topic architecture/auth-model
+**Learned**: Mobile clients still use the refresh endpoint." \
+  --kind architecture \
+  --topic architecture/auth-model
 ```
 
-Saving another memory with the same project + topic key updates that topic rather than creating a competing copy.
+Calling `remember` later with the same `--topic` updates that topic instead of creating competing copies.
 
 ---
 
-### 3. Codebase orientation
+### 2. Structural code orientation
 
-Continuity contains a zero-third-party-dependency local structural index.
+Continuity includes a dependency-free local project index.
 
-The built-in index extracts:
+The built-in index:
 
-- files,
-- languages,
-- file digests,
-- Python classes,
-- Python functions,
-- Python imports,
-- common symbol declarations in other languages,
-- common import relationships.
+- walks supported source/text files;
+- uses Python AST parsing for Python symbols and imports;
+- uses conservative patterns for symbols/imports in common languages;
+- records file metadata, symbols, and import relationships;
+- keeps project indexes scoped to the detected project identity.
 
-This enables fast questions such as:
+Supported file extensions currently include:
+
+```text
+.py  .js  .jsx  .ts  .tsx  .go  .rs  .java  .kt
+.rb  .php .md   .toml .yaml .yml .json
+```
+
+Build or refresh the local index:
 
 ```bash
-continuity find AuthService
-continuity graph auth
+continuity index
+```
+
+Find a symbol:
+
+```bash
+continuity find "RetryPolicy"
+```
+
+Inspect structural neighbors:
+
+```bash
+continuity graph "src/upload.py"
+```
+
+Ask a structural question:
+
+```bash
 continuity query "where is retry policy implemented?"
 ```
 
-The structural index is a **regenerable cache**. Source code remains canonical.
+If Graft or Graphify are available, Continuity can delegate deeper structural queries to them. Otherwise it falls back to its built-in index.
 
 ---
 
-### 4. Optional Graft + Graphify adapters
+### 3. Evidence-backed session handoffs
 
-Continuity is standalone, but it can use specialized tools when they are already installed.
+A handoff is not just a prose summary.
 
-**Graft** is preferred for codebase-orientation queries when available.
+Continuity captures both:
 
-**Graphify** can be used when its persistent graph exists for richer relationship queries.
+**Semantic state**
+- goal;
+- instructions and constraints;
+- discoveries;
+- accomplished work;
+- next steps;
+- relevant files;
+- verification status.
 
-The fallback order is intentionally layered:
-
-```text
-Known source location
-      ↓
-Continuity local index
-      ↓
-Graft / Graphify when available
-      ↓
-Broad raw search / file traversal
-```
-
-That keeps simple tasks cheap while allowing richer graph tooling when useful.
-
----
-
-### 5. Git-evidenced handoffs
-
-Before a session ends, ownership transfers, or context is at risk, Continuity can create a semantic checkpoint containing:
-
-- current goal,
-- active instructions and constraints,
-- discoveries,
-- accomplished work,
-- exact next steps,
-- relevant files,
-- verification already performed,
-- verification still missing.
-
-Continuity then adds mechanical Git evidence:
-
-- repository root,
-- branch,
-- HEAD commit,
-- working-tree status,
+**Mechanical Git state**
+- project root;
+- current branch;
+- HEAD commit;
+- working-tree status;
 - diffstat.
 
-A successor therefore receives both:
-
-**“Here is what the previous agent believed.”**
-
-and
-
-**“Here is what Git says the project looked like.”**
-
-That distinction matters.
-
----
-
-### 6. Session recovery
-
-At a new session:
-
-```bash
-continuity start --host codex --emit-context
-```
-
-Continuity resolves the project, registers the session, and emits the latest handoff when one exists.
-
-A successor can then run:
-
-```bash
-continuity orient
-continuity resume
-```
-
-and begin from the previous session’s unresolved work instead of rediscovering the project from scratch.
-
----
-
-### 7. Claude Code and Codex integration
-
-Continuity can install host-specific skill/instruction files and lifecycle hooks.
-
-For Claude Code it installs:
-
-```text
-.claude/
-└── skills/
-    └── continuity/
-        └── SKILL.md
-```
-
-and augments supported lifecycle hooks in:
-
-```text
-.claude/settings.json
-```
-
-For Codex it installs:
-
-```text
-.agents/
-└── skills/
-    └── continuity/
-        └── SKILL.md
-```
-
-adds a marker-fenced Continuity section to:
-
-```text
-AGENTS.md
-```
-
-and, when a Codex user configuration directory exists, adds Continuity lifecycle hooks while preserving unrelated entries in:
-
-```text
-~/.codex/hooks.json
-```
-
-See [Host Integration](docs/HOSTS.md).
-
----
-
-## Design goals
-
-Continuity is built around several constraints.
-
-### Evidence over narrative
-
-If memory says one thing and the source says another, source wins.
-
-If a checkpoint claims a file was changed but the Git state does not support that claim, the mismatch should be surfaced.
-
-### Curated memory over raw transcript accumulation
-
-Storing everything feels comprehensive but produces noisy retrieval and stale contradictions.
-
-Continuity saves the things future sessions should actually reuse.
-
-### Project isolation
-
-Memory, sessions, structural data, and handoffs are project-scoped.
-
-Continuity does not silently restore context from an unrelated project.
-
-### Local-first operation
-
-The default store is local SQLite:
-
-```text
-~/.continuity/continuity.db
-```
-
-No hosted database or network service is required.
-
-### Fail visibly
-
-If continuity state is missing, stale, ambiguous, or inconsistent, the correct behavior is to report that condition — not fabricate continuity.
-
----
-
-# Quick Start
-
-## Requirements
-
-- **Python 3.11+**
-- **Git** strongly recommended
-- macOS, Linux, or Windows with a compatible Python environment
-- Claude Code and/or Codex are optional; the CLI also works manually
-
-Check Python:
-
-```bash
-python3 --version
-```
-
----
-
-## 1. Install Continuity
-
-### Recommended: install directly from GitHub
-
-```bash
-python3 -m pip install "git+https://github.com/kingju1c3/continuity.git"
-```
-
-Then verify:
-
-```bash
-continuity --help
-```
-
-### Development/editable installation
-
-```bash
-git clone https://github.com/kingju1c3/continuity.git
-cd continuity
-python3 -m pip install -e .
-```
-
-This is the best option when contributing to Continuity itself.
-
----
-
-## 2. Go to the project you want Continuity to manage
-
-```bash
-cd /path/to/your/project
-```
-
-Continuity resolves the Git top-level directory automatically when the current directory belongs to a Git repository.
-
----
-
-## 3. Install host integration
-
-For both Claude Code and Codex:
-
-```bash
-continuity install --agents claude,codex
-```
-
-Claude only:
-
-```bash
-continuity install --agents claude
-```
-
-Codex only:
-
-```bash
-continuity install --agents codex
-```
-
----
-
-## 4. Verify the installation
-
-```bash
-continuity doctor
-```
-
-Example shape:
-
-```json
-{
-  "python": "3.11.x",
-  "project": "/path/to/project",
-  "database": "/Users/you/.continuity/continuity.db",
-  "sqlite_fts5": true,
-  "graft": false,
-  "graphify": false,
-  "claude_skill": true,
-  "codex_skill": true,
-  "agents_md": true
-}
-```
-
-Graft and Graphify may correctly show `false`; they are optional.
-
----
-
-## 5. Build the initial structural index
-
-```bash
-continuity index
-```
-
-Example:
-
-```json
-{
-  "files": 184,
-  "symbols": 947,
-  "edges": 426
-}
-```
-
----
-
-## 6. Start your first session
-
-Codex:
-
-```bash
-continuity start --host codex --emit-context
-```
-
-Claude Code:
-
-```bash
-continuity start --host claude --emit-context
-```
-
-Generic/manual use:
-
-```bash
-continuity start --host manual --emit-context
-```
-
-On the first run you may see:
-
-```text
-No previous handoff recorded.
-```
-
-That is expected.
-
----
-
-# How Continuity works
-
-A healthy Continuity workflow follows a simple lifecycle:
-
-```text
-┌──────────────────────────────┐
-│ 1. SESSION START             │
-│ start → recover → orient     │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 2. WORK                      │
-│ source + graph + memory      │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 3. DURABLE LEARNINGS         │
-│ remember important knowledge │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 4. CHECKPOINT                │
-│ semantic state + Git evidence│
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 5. SUCCESSOR SESSION         │
-│ resume → verify → continue   │
-└──────────────────────────────┘
-```
-
----
-
-## Session opening protocol
-
-When beginning related project work:
-
-```bash
-continuity start --host codex --emit-context
-continuity orient
-```
-
-If a prior handoff exists:
-
-```bash
-continuity resume
-```
-
-Then verify that the checkpoint still matches reality:
-
-- same repository root?
-- expected branch?
-- expected HEAD?
-- expected modified files?
-- relevant files still exist?
-- someone else committed changes after the handoff?
-
-Only then continue from the recorded next action.
-
----
-
-## During the session
-
-### Search memory before re-solving known problems
-
-```bash
-continuity recall "database migration"
-```
-
-```bash
-continuity recall "authentication"
-```
-
-```bash
-continuity recall "why did we choose sqlite"
-```
-
-### Use the structural layer before reading the whole repository
-
-```bash
-continuity find SessionManager
-```
-
-```bash
-continuity graph session
-```
-
-```bash
-continuity query "where does the app initialize database state?"
-```
-
-### Refresh the index after meaningful structural changes
-
-```bash
-continuity index
-```
-
-Especially useful after:
-
-- moving files,
-- adding modules,
-- renaming classes,
-- reorganizing packages,
-- modifying import topology,
-- large refactors.
-
----
-
-# Durable memory
-
-## What should be remembered?
-
-A simple test:
-
-> Would a future session waste meaningful time or make a worse decision if this knowledge disappeared?
-
-If yes, it is probably worth saving.
-
-Good examples:
-
-- “Authentication now uses server-side sessions.”
-- “Do not call this API from the browser; it requires a service credential.”
-- “The flaky test was caused by a shared temporary directory.”
-- “This project intentionally keeps generated graph state out of Git.”
-- “The migration runner must remain idempotent.”
-- “The user explicitly chose approach B over approach A.”
-
-Poor examples:
-
-- raw compiler output,
-- every shell command,
-- a transient test count,
-- the entire conversation,
-- secrets,
-- information that is trivial to re-read from one obvious source file.
-
----
-
-## Recommended memory structure
-
-Use:
-
-```markdown
-**What**: What changed or was learned.
-**Why**: Why it matters.
-**Where**: Relevant files/components.
-**Learned**: Non-obvious constraints, edge cases, or gotchas.
-```
-
 Example:
 
 ```bash
-continuity remember   "Fixed duplicate upload records"   "**What**: Reused request_id as the idempotency key.
-**Why**: Automatic retries could write duplicate records.
-**Where**: src/upload/handler.py, tests/test_upload.py
-**Learned**: Retry handling must occur before persistence."   --kind bugfix   --topic upload/idempotency
+continuity checkpoint \
+  --host codex \
+  --goal "Finish retry-safe upload handling" \
+  --instructions "Preserve backwards-compatible API behavior" \
+  --discoveries "Duplicate rows occur when client retries race" \
+  --accomplished "Added request-id idempotency guard and unit tests" \
+  --next-steps "Run integration suite; inspect concurrent retry path" \
+  --relevant-files "src/upload.py tests/test_upload.py" \
+  --verification "Unit tests pass; integration suite not yet run"
 ```
 
----
-
-## Memory kinds
-
-`--kind` is free-form in the CLI, but these categories are useful conventions:
-
-| Kind | Use |
-|---|---|
-| `decision` | A choice made between alternatives |
-| `architecture` | System structure or design |
-| `bugfix` | Root cause + completed fix |
-| `discovery` | Non-obvious project knowledge |
-| `pattern` | Repeatable implementation convention |
-| `config` | Environment or tooling configuration |
-| `preference` | Durable user/team constraint |
-
----
-
-## Stable topic keys
-
-Use `--topic` when a concept is expected to evolve.
-
-Good:
-
-```text
-architecture/auth-model
-architecture/database
-config/test-runner
-workflow/release-process
-ui/design-system
-upload/idempotency
-```
-
-Avoid reusing one topic for unrelated facts.
-
-Topic keys are project-scoped.
-
----
-
-## Pinned memories
-
-Use `--pin` for especially important context:
-
-```bash
-continuity remember   "Production database constraint"   "Production migrations must be backward compatible with the previous app version."   --kind architecture   --topic database/migration-compat   --pin
-```
-
-Pinned memories are prioritized in memory retrieval ordering.
-
----
-
-# Structural context
-
-## Build the index
-
-```bash
-continuity index
-```
-
-The built-in index currently performs richer AST extraction for Python and conservative symbol/import extraction for several other common text/code formats.
-
-The index skips common generated/cache locations such as:
-
-```text
-.git
-.continuity
-node_modules
-.venv
-venv
-dist
-build
-target
-__pycache__
-.next
-.cache
-```
-
-Very large files are also bounded to prevent accidental indexing of oversized artifacts.
-
----
-
-## Find symbols
-
-```bash
-continuity find AuthService
-```
-
-Example output:
-
-```text
-src/auth/service.py:18 classdef AuthService
-src/auth/test_service.py:11 symbol AuthService
-```
-
-Use `--limit` to change the result count:
-
-```bash
-continuity find AuthService --limit 30
-```
-
----
-
-## Inspect graph neighbors
-
-```bash
-continuity graph auth
-```
-
-Example shape:
-
-```text
-src/api.py -[imports]-> auth.service (src/api.py:7)
-src/auth/service.py -[imports]-> auth.models (src/auth/service.py:3)
-```
-
-This is intentionally a lightweight graph, not a replacement for full static analysis.
-
----
-
-## Ask a structural question
-
-```bash
-continuity query "where is retry handling implemented?"
-```
-
-Query behavior:
-
-1. use Graft if installed and available;
-2. otherwise use Graphify when installed and a Graphify graph exists;
-3. otherwise fall back to Continuity's local structural search.
-
-This lets Continuity remain useful with zero optional dependencies while taking advantage of specialized tooling when present.
-
----
-
-# Checkpoints and handoffs
-
-A checkpoint should let a competent successor continue without reconstructing the entire session.
-
-## Create a checkpoint
-
-```bash
-continuity checkpoint   --host codex   --goal "Finish retry-safe upload handling"   --instructions "Preserve API compatibility; do not change response schema"   --discoveries "Duplicate writes occur when timeout retries race the first request"   --accomplished "Added idempotency check and unit coverage"   --next-steps "Run integration suite; inspect concurrent retry path; then update docs"   --relevant-files "src/upload/handler.py tests/test_upload.py docs/uploads.md"   --verification "Unit tests pass; integration suite has not been run"
-```
-
-Continuity automatically captures Git state at checkpoint time.
-
----
-
-## Handoff content
-
-A generated handoff contains sections similar to:
-
-```markdown
-# Continuity Handoff
-
-- Created: ...
-- Host: codex
-- Session: ...
-- Project: /path/to/project
-- Branch: feature/retry-safe-upload
-- HEAD: abc123...
-
-## Goal
-...
-
-## Instructions / Constraints
-...
-
-## Discoveries
-...
-
-## Accomplished
-...
-
-## Next Steps
-...
-
-## Relevant Files
-...
-
-## Verification
-...
-
-## Working Tree
-...
-
-## Diffstat
-...
-```
-
----
-
-## Where handoffs live
-
-The durable handoff record is stored in the Continuity database.
-
-For inspectability, the current project also receives local mirrors:
+Continuity writes the handoff to the local database and mirrors an inspectable copy under:
 
 ```text
 .continuity/
@@ -825,184 +225,397 @@ For inspectability, the current project also receives local mirrors:
     └── <timestamp>-<session>.md
 ```
 
-The installer creates:
-
-```text
-.continuity/.gitignore
-```
-
-so runtime continuity state is not accidentally committed by default.
+The installer makes that repository-local continuity state gitignored by default.
 
 ---
 
-## Resume from the latest handoff
+### 4. Session restoration
 
-```bash
-continuity resume
-```
-
-A successor should compare the checkpoint against current source and Git state before acting.
-
----
-
-# Usage
-
-## Standard Codex workflow
-
-### Start
+At the start of work:
 
 ```bash
 continuity start --host codex --emit-context
 continuity orient
 ```
 
-### Work
+If a previous handoff exists, `start --emit-context` prints it. `orient` then gives the project identity, current Git state, latest handoff, recent durable memories, and detected optional adapters.
+
+To print the latest handoff directly:
 
 ```bash
-continuity recall "relevant topic"
-continuity query "where does X happen?"
-continuity find SomeSymbol
+continuity resume
 ```
 
-### Save an important discovery
-
-```bash
-continuity remember   "Discovered cache invalidation rule"   "**What**: Cache keys include tenant ID.
-**Why**: Cross-tenant collisions are otherwise possible.
-**Where**: src/cache/key.py
-**Learned**: Never build the key from resource ID alone."   --kind discovery   --topic cache/key-format
-```
-
-### Refresh structure after code changes
-
-```bash
-continuity index
-```
-
-### Hand off
-
-```bash
-continuity checkpoint   --host codex   --goal "..."   --accomplished "..."   --next-steps "..."   --verification "..."
-```
+The successor should verify the handoff against current source and Git state before making edits.
 
 ---
 
-## Standard Claude Code workflow
+### 5. Claude Code and Codex lifecycle integration
 
-The workflow is the same; identify the host as Claude:
+Continuity can wire itself into supported host lifecycle surfaces.
 
 ```bash
-continuity start --host claude --emit-context
-continuity orient
+continuity install --agents claude,codex
 ```
 
-Install the Claude integration once per project:
+#### Claude Code
+
+The installer writes:
+
+```text
+.claude/
+├── settings.json
+└── skills/
+    └── continuity/
+        └── SKILL.md
+```
+
+It adds Continuity lifecycle command hooks for:
+
+- `SessionStart`;
+- `PreCompact`;
+- `Stop`.
+
+#### Codex
+
+The installer writes:
+
+```text
+.agents/
+└── skills/
+    └── continuity/
+        └── SKILL.md
+
+AGENTS.md
+```
+
+The `AGENTS.md` integration is marker-fenced so Continuity owns only its own section.
+
+If `~/.codex` exists, the installer also attempts to preserve foreign entries while adding Continuity hooks to:
+
+```text
+~/.codex/hooks.json
+```
+
+for:
+
+- `SessionStart`;
+- `UserPromptSubmit`;
+- `PreCompact`;
+- `Stop`.
+
+> Hooks can register/restorе continuity state and inject checkpoint instructions. They do **not** fabricate a semantic checkpoint and they do **not** guarantee that a host can spawn a brand-new chat/session automatically. Session creation is host-controlled.
+
+---
+
+## Quick start
+
+### Requirements
+
+- Python **3.11+**
+- Git is strongly recommended because project identity and handoff verification use Git when available.
+
+No database server, Docker daemon, Node runtime, vector database, cloud account, or API key is required for the core runtime.
+
+### Option A — install directly from GitHub
+
+```bash
+python3 -m pip install "git+https://github.com/kingju1c3/continuity.git"
+```
+
+### Option B — clone for development
+
+```bash
+git clone https://github.com/kingju1c3/continuity.git
+cd continuity
+
+python3 -m venv .venv
+source .venv/bin/activate      # macOS / Linux
+# .venv\Scripts\activate     # Windows PowerShell
+
+python -m pip install -e .
+```
+
+### Wire Continuity into a project
+
+After installing the CLI, change into the project where you want continuity:
+
+```bash
+cd /path/to/your/project
+continuity install --agents claude,codex
+continuity index
+continuity doctor
+```
+
+For only one host:
 
 ```bash
 continuity install --agents claude
 ```
 
-The installed skill instructs the agent to follow the same memory/orientation/checkpoint protocol.
-
----
-
-## Manual / other-agent workflow
-
-Continuity does not require MCP.
-
-Any agent or human that can execute shell commands can use:
+or:
 
 ```bash
-continuity start --host manual --emit-context
-continuity orient
-continuity recall "..."
-continuity query "..."
-continuity remember "..." "..."
-continuity checkpoint ...
-continuity resume
+continuity install --agents codex
 ```
 
-This makes Continuity usable with other coding agents even when no dedicated installer exists.
+### First session
+
+```bash
+continuity start --host codex --emit-context
+continuity orient
+```
+
+If there is no previous state yet, that is expected. Work normally, save durable decisions as they emerge, then checkpoint before the session ends.
+
+### End of session
+
+```bash
+continuity checkpoint \
+  --host codex \
+  --goal "Implement account lockout" \
+  --accomplished "Added lockout state and unit tests" \
+  --next-steps "Wire metrics and run full auth integration tests" \
+  --relevant-files "src/auth/lockout.py tests/test_lockout.py" \
+  --verification "Unit tests passing"
+```
+
+### Next session
+
+```bash
+continuity start --host codex --emit-context
+continuity resume
+continuity orient
+```
+
+Then verify the handoff against the current tree and continue from the first unresolved next step.
 
 ---
 
-# CLI reference
+## Recommended daily workflow
 
-Global syntax:
+A good Continuity loop is intentionally small.
+
+### Session open
+
+```bash
+continuity start --host codex --emit-context
+continuity orient
+```
+
+### Before rediscovering something
+
+```bash
+continuity recall "rate limiting"
+```
+
+### Before broad repository exploration
+
+```bash
+continuity query "where does billing retry logic live?"
+continuity find "BillingRetry"
+continuity graph "billing"
+```
+
+### After a durable decision
+
+```bash
+continuity remember \
+  "Use exponential backoff for billing retries" \
+  "**What**: Retry schedule is 1s, 2s, 4s, 8s with jitter.
+**Why**: Reduce synchronized retries against provider.
+**Where**: billing/retry.py
+**Learned**: Provider returns Retry-After for 429 and that value wins." \
+  --kind decision \
+  --topic billing/retry-policy
+```
+
+### After meaningful structural changes
+
+```bash
+continuity index
+```
+
+### Before stop / compaction / transfer
+
+```bash
+continuity checkpoint ...
+```
+
+That is the core operating model:
 
 ```text
-continuity [--path PATH] <command> [arguments]
+OPEN → ORIENT → SEARCH → WORK → REMEMBER → REINDEX → CHECKPOINT → RESTORE
 ```
-
-The global `--path` flag appears **before** the command:
-
-```bash
-continuity --path /path/to/repo doctor
-continuity --path /path/to/repo index
-```
-
-If omitted, Continuity uses the current directory and resolves its Git root when possible.
 
 ---
 
-## `continuity start`
+## Installation in detail
 
-Register a session and optionally emit recovered context.
+### Installing into the Python environment
+
+The package name is `continuity-ai`; the CLI command is `continuity`.
+
+Check that the executable is available:
 
 ```bash
-continuity start   [--host HOST]   [--session SESSION_ID]   [--emit-context]
+continuity --help
+```
+
+If your shell cannot find it, confirm the Python environment that received the installation:
+
+```bash
+python3 -m pip show continuity-ai
+python3 -m continuity --help
+```
+
+The module entrypoint works even when the console-script directory is not on `PATH`:
+
+```bash
+python3 -m continuity doctor
+```
+
+### Project-scoped installation
+
+Run host installation **from the target project root**, not from the Continuity repository unless the Continuity repository itself is the project you want to wire.
+
+```bash
+cd ~/code/my-project
+continuity install --agents claude,codex
+```
+
+Continuity resolves the Git toplevel when possible, so calling it from a nested project directory still scopes operations to the repository root.
+
+### Pointing at another project explicitly
+
+Every command accepts a global `--path` option. Because it is a global argument, place it **before** the subcommand:
+
+```bash
+continuity --path ../another-project orient
+continuity --path ../another-project index
+continuity --path ../another-project recall "auth"
+```
+
+### Upgrading
+
+Direct GitHub install:
+
+```bash
+python3 -m pip install --upgrade "git+https://github.com/kingju1c3/continuity.git"
+```
+
+Editable clone:
+
+```bash
+cd /path/to/continuity
+git pull
+python3 -m pip install -e .
+```
+
+After upgrading the package, rerun host installation inside projects where you want copied skill text / hooks refreshed:
+
+```bash
+cd /path/to/project
+continuity install --agents claude,codex
+```
+
+---
+
+## Command reference
+
+The CLI is intentionally small and composable.
+
+### `continuity start`
+
+Register the current session and optionally print restoration context.
+
+```bash
+continuity start [--host HOST] [--session SESSION_ID] [--emit-context]
 ```
 
 Examples:
 
 ```bash
-continuity start --host codex --emit-context
 continuity start --host claude --emit-context
-continuity start --host manual
+continuity start --host codex --session my-session --emit-context
 ```
 
-If no explicit session ID is supplied, Continuity uses `CONTINUITY_SESSION_ID` when available, otherwise generates one.
+If `--session` is omitted, Continuity uses `CONTINUITY_SESSION_ID` when present or creates a generated ID.
 
 ---
 
-## `continuity orient`
+### `continuity orient`
 
-Print high-level project orientation:
-
-- project root,
-- branch,
-- HEAD,
-- latest handoff,
-- recent durable memories,
-- optional adapter availability.
+Show the current project identity and high-value continuity state.
 
 ```bash
 continuity orient
 ```
 
-This is one of the best commands to run immediately after `start`.
+Output includes:
+
+- detected project root;
+- branch;
+- HEAD;
+- latest handoff when available;
+- recent durable memories;
+- optional adapter detection.
+
+Use this near the beginning of a session.
 
 ---
 
-## `continuity remember`
+### `continuity remember`
 
-Save a durable memory.
+Save durable project knowledge.
 
 ```bash
-continuity remember TITLE [CONTENT]   [--kind KIND]   [--topic TOPIC_KEY]   [--session SESSION_ID]   [--pin]
+continuity remember TITLE [CONTENT] \
+  [--kind KIND] \
+  [--topic TOPIC_KEY] \
+  [--session SESSION_ID] \
+  [--pin]
 ```
 
-If `CONTENT` is omitted, content can be read from stdin:
+Example:
 
 ```bash
-cat decision.md | continuity remember   "Authentication design"   --kind architecture   --topic architecture/auth
+continuity remember \
+  "Chose Postgres advisory locks" \
+  "**What**: Use transaction-scoped advisory locks for settlement.
+**Why**: Settlement workers can race across processes.
+**Where**: settlement/worker.py
+**Learned**: Lock key must be stable across retries." \
+  --kind architecture \
+  --topic settlement/concurrency
+```
+
+If content is omitted, Continuity reads it from stdin:
+
+```bash
+cat decision.md | continuity remember "Settlement concurrency" --kind decision
+```
+
+#### Suggested `--kind` values
+
+The CLI accepts a string rather than a closed enum, but these conventions work well:
+
+```text
+decision
+architecture
+bugfix
+discovery
+pattern
+config
+preference
+constraint
 ```
 
 ---
 
-## `continuity recall`
+### `continuity recall`
 
-Search project memory.
+Search durable memory using FTS5.
 
 ```bash
 continuity recall [QUERY] [--limit N]
@@ -1011,30 +624,38 @@ continuity recall [QUERY] [--limit N]
 Examples:
 
 ```bash
-continuity recall "auth"
-continuity recall "migration rollback" --limit 15
-continuity recall
+continuity recall "authentication"
+continuity recall "retry policy" --limit 12
 ```
 
-An empty query returns recent project memory ordered with pinned items first.
+An empty query returns recent memories.
+
+Search results are historical evidence, not current source truth.
 
 ---
 
-## `continuity index`
+### `continuity index`
 
-Rebuild the built-in project structural index.
+Rebuild the project's local structural index.
 
 ```bash
 continuity index
 ```
 
-Run it initially and after meaningful structural code changes.
+The command prints counts for indexed files, symbols, and edges.
+
+Run it:
+
+- after initial installation;
+- after meaningful source restructuring;
+- before creating an architecture-heavy handoff;
+- when structural search appears stale.
 
 ---
 
-## `continuity find`
+### `continuity find`
 
-Search indexed symbols and paths.
+Find indexed symbols or symbol-associated paths.
 
 ```bash
 continuity find TERM [--limit N]
@@ -1043,14 +664,14 @@ continuity find TERM [--limit N]
 Example:
 
 ```bash
-continuity find DatabaseManager --limit 25
+continuity find "SessionManager"
 ```
 
 ---
 
-## `continuity graph`
+### `continuity graph`
 
-Show indexed relationships involving a node/path fragment.
+Show import relationships neighboring a node/path/module substring.
 
 ```bash
 continuity graph NODE [--limit N]
@@ -1059,12 +680,18 @@ continuity graph NODE [--limit N]
 Example:
 
 ```bash
-continuity graph database
+continuity graph "auth"
+```
+
+Output format:
+
+```text
+src/file.py -[imports]-> package.module (src/file.py:12)
 ```
 
 ---
 
-## `continuity query`
+### `continuity query`
 
 Ask a structural question.
 
@@ -1075,234 +702,503 @@ continuity query "QUESTION" [--limit N]
 Example:
 
 ```bash
-continuity query "where is request authentication enforced?"
+continuity query "where is token refresh implemented?"
 ```
 
-The command can delegate to Graft/Graphify when available, otherwise it uses local indexed data.
+Resolution order:
+
+1. Graft, when the `graft` executable is available;
+2. Graphify, when `graphify` is available and `graphify-out/graph.json` exists;
+3. Continuity's built-in structural index.
+
+The adapters are optional. Continuity remains functional without them.
 
 ---
 
-## `continuity checkpoint`
+### `continuity checkpoint`
 
-Persist a successor-ready handoff.
+Create a successor-ready handoff.
 
 ```bash
-continuity checkpoint   [--session SESSION_ID]   [--host HOST]   [--goal TEXT]   [--instructions TEXT]   [--discoveries TEXT]   [--accomplished TEXT]   [--next-steps TEXT]   [--relevant-files TEXT]   [--verification TEXT]
+continuity checkpoint \
+  [--session SESSION_ID] \
+  [--host HOST] \
+  [--goal TEXT] \
+  [--instructions TEXT] \
+  [--discoveries TEXT] \
+  [--accomplished TEXT] \
+  [--next-steps TEXT] \
+  [--relevant-files TEXT] \
+  [--verification TEXT]
 ```
 
-All semantic fields are optional at the parser level, but useful handoffs should populate the fields that matter.
+Recommended example:
+
+```bash
+continuity checkpoint \
+  --host claude \
+  --goal "Replace synchronous export path with queued jobs" \
+  --instructions "Keep current API response schema stable" \
+  --discoveries "Large exports time out behind the reverse proxy" \
+  --accomplished "Added queue model, worker, and unit tests" \
+  --next-steps "Add migration; run integration suite; verify cancellation" \
+  --relevant-files "src/export/jobs.py src/export/worker.py tests/export/" \
+  --verification "New unit tests pass; migration not tested"
+```
+
+A strong checkpoint tells the successor not only **what happened**, but also **what is still uncertain**.
 
 ---
 
-## `continuity resume`
+### `continuity resume`
 
-Print the newest handoff for the current project.
+Print the latest project handoff in full.
 
 ```bash
 continuity resume
 ```
 
-If no handoff exists, Continuity reports that explicitly.
+Use after a session transition, context reset, or handoff.
 
 ---
 
-## `continuity install`
+### `continuity install`
 
-Install repository integration.
+Install host-specific project integration.
 
 ```bash
 continuity install --agents claude,codex
 ```
 
-Other examples:
+Examples:
 
 ```bash
 continuity install --agents claude
 continuity install --agents codex
+continuity install --agents claude,codex
 ```
 
 ---
 
-## `continuity doctor`
+### `continuity doctor`
 
-Inspect the current Continuity environment.
+Inspect the active project and installation.
 
 ```bash
 continuity doctor
 ```
 
-Checks include:
+It reports:
 
-- Python version,
-- resolved project,
-- database path,
-- FTS5 availability,
-- Graft availability,
-- Graphify availability,
-- Claude skill wiring,
-- Codex skill wiring,
+- Python version;
+- detected project;
+- database path;
+- SQLite FTS5 availability;
+- Graft detection;
+- Graphify detection;
+- Claude skill installation;
+- Codex skill installation;
 - `AGENTS.md` presence.
+
+Use it as the first troubleshooting command.
 
 ---
 
-## `continuity hook`
+### `continuity hook`
 
-Internal lifecycle entry point used by host integration:
+Internal lifecycle entrypoint used by host integrations.
 
 ```bash
 continuity hook --host claude
 continuity hook --host codex
 ```
 
-Most users should not need to invoke this command manually.
+Most users should not call this manually.
 
 ---
 
-# Automatic continuity
+## Memory model
 
-Host hooks can automate parts of the continuity lifecycle.
+Continuity's memory model follows one rule:
 
-Continuity currently aims to automate what can be automated **reliably**:
+> **Persist conclusions and durable context, not the entire path taken to reach them.**
 
-- session registration,
-- awareness that prior handoff state exists,
-- restoration instructions at session opening,
-- checkpoint reminders before compaction,
-- checkpoint reminders at stop/end events.
+### Strong memory
 
-There is an important limitation:
-
-> A lifecycle hook cannot reliably reconstruct the agent's full semantic task state solely from process metadata.
-
-Therefore hooks do **not** fabricate a complete checkpoint.
-
-The semantic handoff must still represent what the working agent actually knows:
-
-- what it was trying to do,
-- what it learned,
-- what it completed,
-- what remains,
-- what was verified.
-
-This is a deliberate integrity boundary.
-
----
-
-# Architecture
-
-```mermaid
-flowchart TD
-    A[Agent Session] --> B[/continuity protocol/]
-
-    B --> C[Session Layer]
-    B --> D[Durable Memory]
-    B --> E[Structural Context]
-    B --> F[Git / Source Truth]
-
-    C --> C1[Session registration]
-    C --> C2[Semantic checkpoint]
-    C --> C3[Successor recovery]
-
-    D --> D1[(SQLite)]
-    D1 --> D2[FTS5 search]
-    D1 --> D3[Stable topic keys]
-
-    E --> E1[Built-in index]
-    E --> E2[Graft adapter]
-    E --> E3[Graphify adapter]
-
-    F --> F1[Branch]
-    F --> F2[HEAD]
-    F --> F3[Working tree]
-    F --> F4[Diffstat]
-
-    C2 --> G[Verified Handoff]
-    F --> G
-    D --> G
-
-    G --> H[Next Session]
+```markdown
+**What**: Payment retries use provider Retry-After, otherwise exponential backoff.
+**Why**: Avoid provider throttling and retry storms.
+**Where**: src/payments/retry.py
+**Learned**: Retry-After can be an HTTP date, not only integer seconds.
 ```
+
+### Weak memory
+
+```text
+We looked at a bunch of files and then tried several things.
+```
+
+### Topic keys
+
+Use topic keys when a fact can evolve:
+
+```text
+architecture/auth-model
+billing/retry-policy
+config/test-runner
+deployment/runtime
+ui/design-system
+```
+
+Use a new memory without a topic key for distinct historical events that should coexist.
+
+### Pinning
+
+Use `--pin` for especially important project constraints:
+
+```bash
+continuity remember \
+  "Never break v1 response schema" \
+  "Public clients still consume v1; additive changes only." \
+  --kind constraint \
+  --topic api/v1-compatibility \
+  --pin
+```
+
+Pinned memories are prioritized in retrieval ordering.
+
+---
+
+## Handoff protocol
+
+A Continuity handoff should let a competent successor resume without replaying the entire previous session.
+
+### Minimum useful handoff
+
+At minimum, capture:
+
+1. **Goal** — what the session was trying to accomplish.
+2. **Instructions / constraints** — requirements that must survive.
+3. **Discoveries** — non-obvious facts discovered during work.
+4. **Accomplished** — completed work, with enough specificity to verify it.
+5. **Next steps** — ordered unresolved work.
+6. **Relevant files** — files the successor should inspect first.
+7. **Verification** — tests/checks actually run and anything still unverified.
+
+Continuity adds Git evidence mechanically.
+
+### Successor checklist
+
+Before editing:
+
+1. restore the latest handoff;
+2. confirm the project root;
+3. compare current branch and HEAD with the handoff;
+4. inspect working-tree changes;
+5. verify relevant files still exist and match expectations;
+6. surface any mismatch;
+7. continue from the first unresolved action.
+
+This prevents a stale summary from silently overriding a changed repository.
 
 ---
 
 ## Project identity
 
-Continuity first resolves the canonical project root.
+Continuity resolves the current project as:
 
-When Git is available and the directory belongs to a repository:
+1. the Git repository toplevel when available;
+2. otherwise the resolved working directory.
+
+The project key is derived from the canonical root and configured `remote.origin.url`.
+
+That means memories, sessions, handoffs, symbols, and edges are project-scoped rather than mixed globally.
+
+---
+
+## Storage layout
+
+### User-level durable database
+
+```text
+~/.continuity/
+└── continuity.db
+```
+
+The database contains:
+
+- projects;
+- sessions;
+- durable memories;
+- FTS5 index;
+- handoff payloads;
+- indexed files;
+- symbols;
+- structural edges.
+
+### Repository-local handoff mirror
+
+```text
+<project>/.continuity/
+├── .gitignore
+├── LATEST.md
+├── LATEST.json
+└── handoffs/
+```
+
+The repository mirror is there for inspectability and local recovery. The installer configures it so generated continuity state is not committed by default.
+
+---
+
+## Optional adapters
+
+Continuity is designed to stand alone, but it can use specialized structural systems when they are already installed.
+
+### Graft
+
+Repository: [trailhq/Graft](https://github.com/trailhq/Graft)
+
+When `graft` is available, `continuity query` tries Graft first for code-oriented structural retrieval.
+
+Continuity does not require Graft and does not vendor it.
+
+### Graphify
+
+Repository: [Graphify-Labs/graphify](https://github.com/Graphify-Labs/graphify)
+
+When `graphify` is available **and** the current repository contains:
+
+```text
+graphify-out/graph.json
+```
+
+Continuity can use `graphify query` for graph-first retrieval.
+
+Again, Graphify is optional.
+
+---
+
+## Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                         CODING AGENT                            │
+│             Claude Code · Codex · shell-capable agent          │
+└──────────────┬──────────────────┬──────────────────┬────────────┘
+               │                  │                  │
+               ▼                  ▼                  ▼
+        ┌────────────┐      ┌─────────────┐    ┌──────────────┐
+        │  SESSION   │      │   MEMORY    │    │  STRUCTURE   │
+        │ lifecycle  │      │ SQLite/FTS5 │    │ local index  │
+        └──────┬─────┘      └──────┬──────┘    └──────┬───────┘
+               │                   │                   │
+               │                   │              ┌────┴─────┐
+               │                   │              │ adapters │
+               │                   │              │Graft/Graphify
+               │                   │              └────┬─────┘
+               └──────────────┬────┴───────────────────┘
+                              ▼
+                     ┌─────────────────┐
+                     │    HANDOFF      │
+                     │ semantic state  │
+                     │ + Git evidence  │
+                     └────────┬────────┘
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │ NEXT SESSION    │
+                     │ restore/verify  │
+                     └─────────────────┘
+```
+
+### Authority hierarchy
+
+When two sources disagree, use this order:
+
+1. **Current source and Git state**
+2. **Fresh structural evidence**
+3. **Durable project memory**
+4. **Historical handoff prose**
+
+The point of continuity is to reduce rediscovery, not freeze the repository in the past.
+
+For a deeper explanation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+---
+
+## Security and privacy
+
+Continuity is local-first.
+
+Core operation does not require:
+
+- an external API;
+- cloud storage;
+- telemetry service;
+- vector database;
+- hosted memory server.
+
+Security guidelines:
+
+- **Do not store secrets** in `continuity remember`.
+- Do not persist API keys, credentials, auth cookies, private keys, or tokens.
+- Treat handoffs as project metadata that may contain sensitive implementation context.
+- The user-level SQLite database inherits the security of the local user account and filesystem.
+- Review host configuration changes when installing into shared machines or shared repositories.
+- Current source remains authoritative; memory is not an execution policy.
+
+---
+
+## What Continuity does not claim
+
+Continuity deliberately avoids several misleading claims.
+
+It does **not** claim:
+
+- perfect memory;
+- model consciousness or identity persistence;
+- lossless replay of every prior token;
+- automatic creation of a new chat/session on every host;
+- that historical memory is more authoritative than current code;
+- that a hook can infer semantic task state without the agent writing a checkpoint;
+- that the built-in index is a full semantic code intelligence engine.
+
+It provides a practical, inspectable approximation of continuity from durable state.
+
+---
+
+## Troubleshooting
+
+### `continuity: command not found`
+
+Check installation:
+
+```bash
+python3 -m pip show continuity-ai
+python3 -m continuity --help
+```
+
+If the module command works but `continuity` does not, your Python scripts directory is probably not on `PATH`.
+
+---
+
+### FTS5 reports unavailable
+
+Run:
+
+```bash
+continuity doctor
+```
+
+Continuity uses Python's SQLite build. Most standard Python distributions include FTS5, but some custom/minimal SQLite builds may not.
+
+Memory search has a LIKE-based fallback for query failures, but full-text relevance requires FTS5.
+
+---
+
+### Structural search returns nothing
+
+Refresh the index:
+
+```bash
+continuity index
+```
+
+Then inspect a known symbol:
+
+```bash
+continuity find "KnownSymbol"
+```
+
+Remember that the built-in index is intentionally conservative. Install/use Graft or Graphify if you need richer code-graph semantics.
+
+---
+
+### No previous handoff appears
+
+Check:
+
+```bash
+continuity orient
+continuity resume
+```
+
+If the result says no handoff exists, a semantic checkpoint was not recorded for that project yet.
+
+---
+
+### Claude/Codex integration does not appear active
+
+Run:
+
+```bash
+continuity doctor
+```
+
+Then rerun installation from the project:
+
+```bash
+continuity install --agents claude,codex
+```
+
+Restart the coding agent after changing host configuration.
+
+---
+
+### Wrong project detected
+
+Inspect the root:
 
 ```bash
 git rev-parse --show-toplevel
+continuity doctor
 ```
 
-provides the root.
+Or explicitly target the intended project:
 
-The project key is derived from:
-
-- canonical root path,
-- configured `remote.origin.url` when available.
-
-This key scopes:
-
-- sessions,
-- memories,
-- handoffs,
-- file index,
-- symbols,
-- graph edges.
+```bash
+continuity --path /absolute/path/to/project orient
+```
 
 ---
 
-## SQLite store
+## Development
 
-Default database:
+Clone and install editable:
 
-```text
-~/.continuity/continuity.db
+```bash
+git clone https://github.com/kingju1c3/continuity.git
+cd continuity
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
-The store contains logical data for:
+Run the test suite:
 
-```text
-projects
-sessions
-memories
-memories_fts
-handoffs
-files
-symbols
-edges
+```bash
+python -m unittest discover -s tests -v
 ```
 
-SQLite WAL mode is enabled.
+Compile-check the package:
 
-FTS5 provides searchable memory without requiring an external vector database.
+```bash
+python -m compileall -q continuity
+```
+
+CLI smoke test:
+
+```bash
+python -m continuity --path . index
+python -m continuity --path . doctor
+```
+
+CI currently exercises supported Python versions through GitHub Actions.
 
 ---
 
-## Source authority
-
-Continuity follows this precedence:
-
-```text
-CURRENT SOURCE / GIT
-        >
-DERIVED STRUCTURAL INDEX
-        >
-DURABLE HISTORICAL MEMORY
-        >
-SESSION NARRATIVE
-```
-
-The point is not that lower layers are unimportant.
-
-The point is that they answer different questions and can become stale.
-
----
-
-# File layout
-
-Repository:
+## Repository layout
 
 ```text
 continuity/
@@ -1338,455 +1234,96 @@ continuity/
 └── pyproject.toml
 ```
 
-Runtime project-local state:
+---
 
-```text
-your-project/
-└── .continuity/
-    ├── .gitignore
-    ├── LATEST.md
-    ├── LATEST.json
-    └── handoffs/
-```
+## Design lineage
 
-Global local database:
+Continuity synthesizes architectural ideas from several strong projects while remaining independently implemented.
 
-```text
-~/.continuity/
-└── continuity.db
-```
+| Project | Idea Continuity draws from |
+| --- | --- |
+| [Second Brain](https://github.com/henrydaum/second-brain) | local-first modular agent architecture and separated capabilities |
+| [Graft](https://github.com/trailhq/Graft) | compact codebase orientation and host-aware integration |
+| [Graphify](https://github.com/Graphify-Labs/graphify) | graph-first structural exploration |
+| [session-handoff](https://github.com/kingju1c3/session-handoff) | explicit predecessor/successor contracts and evidence-backed transfer |
+| [Engram](https://github.com/Gentleman-Programming/engram) | curated persistent memory, SQLite/FTS5, stable topic keys |
+
+The organizing principle is simple:
+
+> **Memory answers what we learned. Structure answers where it lives. Git answers what is true now. Handoff answers what comes next.**
+
+See [docs/SOURCES.md](docs/SOURCES.md) for attribution and synthesis notes.
 
 ---
 
-# Optional adapters
+## FAQ
 
-## Graft
+### Is Continuity a vector database?
 
-If the `graft` executable is present, Continuity can use it for structural queries.
+No. The core memory layer uses SQLite + FTS5. The built-in structure layer stores explicit symbols and import edges.
 
-The current adapter attempts:
+### Does it send my code to a cloud service?
 
-```bash
-graft ask "<question>"
-```
+Not for core operation. Optional external tools you independently install may have their own behavior and policies.
 
-and falls back if Graft does not return a usable answer.
+### Does it work without Graft or Graphify?
 
-Project:
+Yes. Both are optional adapters.
 
-https://github.com/trailhq/Graft
+### Does it replace Git?
 
----
+No. Git is part of the verification layer. Continuity complements Git with semantic session state and durable project memory.
 
-## Graphify
+### Does it replace an agent's native memory?
 
-If the `graphify` executable exists and the project contains:
+No. It gives the project an explicit, local, inspectable continuity substrate that does not depend on a single model provider's memory behavior.
 
-```text
-graphify-out/graph.json
-```
+### Can I use it with another coding agent?
 
-Continuity can attempt:
+Yes, manually, as long as that environment can execute shell commands. Automatic lifecycle wiring is currently implemented for Claude Code and Codex.
 
-```bash
-graphify query "<question>"
-```
+### Will it automatically create a new Claude/Codex session before context runs out?
 
-Project:
+Not universally. Continuity can react to lifecycle events exposed by a host and can preserve/restore handoff state. Programmatic creation of a brand-new chat/session requires a supported host control surface and is not claimed by the portable core.
 
-https://github.com/Graphify-Labs/graphify
+### Why not store the full transcript?
+
+Because transcript volume and durable knowledge are different problems. Continuity optimizes for future retrieval and verification, not archival completeness.
 
 ---
 
-# Claude Code integration
+## Contributing
 
-Install:
+Contributions that preserve the project's core principles are welcome:
 
-```bash
-continuity install --agents claude
-```
+- local-first by default;
+- explicit project boundaries;
+- current source outranks memory;
+- fail visibly instead of fabricating continuity;
+- prefer small, inspectable durable state over transcript accumulation;
+- keep host-specific integrations isolated from the core runtime.
 
-Continuity writes its own skill file instead of replacing your general project instructions.
-
-Expected project integration:
-
-```text
-.claude/
-├── settings.json
-└── skills/
-    └── continuity/
-        └── SKILL.md
-```
-
-The installer augments lifecycle configuration for supported events.
-
-Existing JSON configuration is retained where it can be parsed safely.
-
-See [docs/HOSTS.md](docs/HOSTS.md).
-
----
-
-# Codex integration
-
-Install:
-
-```bash
-continuity install --agents codex
-```
-
-Project integration:
-
-```text
-.agents/
-└── skills/
-    └── continuity/
-        └── SKILL.md
-```
-
-Continuity also adds a marker-fenced section to:
-
-```text
-AGENTS.md
-```
-
-so it can update only its own section on future installs.
-
-When `~/.codex` exists, Continuity also attempts to preserve unrelated hook configuration while adding Continuity lifecycle entries to:
-
-```text
-~/.codex/hooks.json
-```
-
-If that file is unparseable or structurally incompatible, Continuity avoids blindly destroying the configuration.
-
----
-
-# Privacy and security
-
-Continuity is designed to be local-first.
-
-## What stays local by default
-
-- memories,
-- sessions,
-- handoffs,
-- structural index,
-- Git snapshots.
-
-The core runtime does not require a remote memory service.
-
-## Do not save secrets
-
-Do not intentionally store:
-
-- passwords,
-- private keys,
-- API keys,
-- auth tokens,
-- connection secrets,
-- raw confidential transcripts.
-
-Continuity is a context system, not a secret manager.
-
-## Optional adapters have their own behavior
-
-If you install or use Graft, Graphify, Claude Code, Codex, or another external tool, that tool has its own data-handling model.
-
-Continuity's local-first guarantee applies to Continuity's own core storage.
-
----
-
-# What Continuity does not claim
-
-Continuity does **not** claim:
-
-- literal process continuity between LLM sessions,
-- persistent hidden model state,
-- perfect semantic memory,
-- automatic correctness of saved memories,
-- that stale handoffs outrank current source,
-- that every coding host exposes an API to programmatically open a brand-new chat,
-- that hooks alone can infer the full state of an unfinished task.
-
-What it provides is a durable, inspectable continuity substrate that makes session boundaries much less destructive.
-
----
-
-# Troubleshooting
-
-## `continuity: command not found`
-
-Verify installation:
-
-```bash
-python3 -m pip show continuity-ai
-```
-
-Try:
-
-```bash
-python3 -m continuity --help
-```
-
-If that works, the Python scripts directory may not be on your shell `PATH`.
-
----
-
-## Wrong Python version
-
-Continuity requires Python 3.11+.
-
-```bash
-python3 --version
-```
-
-Install or select a newer interpreter, then reinstall Continuity.
-
----
-
-## `sqlite_fts5` is false
-
-Run:
-
-```bash
-continuity doctor
-```
-
-Continuity's memory search expects SQLite FTS5 support.
-
-Most modern Python distributions ship SQLite with FTS5 enabled, but custom/system builds can differ.
-
----
-
-## No previous handoff
-
-```text
-No previous handoff recorded.
-```
-
-This means the current project has no stored handoff yet.
-
-Create one:
-
-```bash
-continuity checkpoint   --host manual   --goal "Current project goal"   --accomplished "What is already done"   --next-steps "What should happen next"
-```
-
----
-
-## Recall returns nothing
-
-Possibilities:
-
-1. no memory has been saved for this project;
-2. the query terms do not match;
-3. the information exists only in source, not memory;
-4. you are in a different project root.
-
-Try:
-
-```bash
-continuity orient
-continuity recall
-```
-
-Then verify the resolved project.
-
----
-
-## Structural query returns no result
-
-Rebuild:
-
-```bash
-continuity index
-```
-
-Then try:
-
-```bash
-continuity find <symbol>
-continuity graph <term>
-```
-
-For richer structural reasoning, optionally install Graft or Graphify.
-
----
-
-## Claude/Codex skill not detected
-
-Run:
-
-```bash
-continuity install --agents claude,codex
-continuity doctor
-```
-
-Then inspect the project:
-
-```text
-.claude/skills/continuity/SKILL.md
-.agents/skills/continuity/SKILL.md
-```
-
----
-
-## Project is resolving to the wrong directory
-
-Use an explicit path:
-
-```bash
-continuity --path /absolute/path/to/project orient
-```
-
-Remember: `--path` is a global option and must come before the command.
-
----
-
-## A handoff is stale
-
-This is not necessarily an error.
-
-A handoff represents state at a point in time.
-
-Compare:
-
-- checkpoint branch,
-- checkpoint HEAD,
-- current branch,
-- current HEAD,
-- current working tree.
-
-Current source and Git state win.
-
----
-
-# Development
-
-Clone:
-
-```bash
-git clone https://github.com/kingju1c3/continuity.git
-cd continuity
-```
-
-Create a virtual environment:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Install editable:
-
-```bash
-python -m pip install -e .
-```
-
-Run tests:
+For code changes:
 
 ```bash
 python -m unittest discover -s tests -v
-```
-
-Compile-check:
-
-```bash
 python -m compileall -q continuity
 ```
 
-Run a CLI smoke test:
-
-```bash
-python -m continuity --path . index
-python -m continuity --path . doctor
-```
-
-The repository includes a GitHub Actions test workflow covering supported Python versions.
+before opening a pull request.
 
 ---
 
-# Source synthesis
-
-Continuity was designed by synthesizing complementary ideas from several open-source projects rather than simply embedding one of them.
-
-| Project | Concepts Continuity draws from |
-|---|---|
-| [Second Brain](https://github.com/henrydaum/second-brain) | local-first agent runtime, modular capabilities, event/task separation |
-| [Graft](https://github.com/trailhq/Graft) | codebase orientation, compact structural context, host-aware installation |
-| [Graphify](https://github.com/Graphify-Labs/graphify) | graph-first exploration, relationship queries, source-vs-derived distinction |
-| [session-handoff](https://github.com/kingju1c3/session-handoff) | predecessor/successor protocol, pre-loss checkpointing, identity and Git verification |
-| [Engram](https://github.com/Gentleman-Programming/engram) | SQLite + FTS5 memory, curated observations, stable topic keys, session summaries |
-
-Continuity independently implements its combined architecture.
-
-See [docs/SOURCES.md](docs/SOURCES.md) for details and attribution.
-
----
-
-# Philosophy
-
-The goal is not to make an LLM claim that it “remembers everything.”
-
-The goal is to make a new session able to answer, with evidence:
-
-- **What project am I in?**
-- **What was the previous session trying to accomplish?**
-- **What has actually changed?**
-- **What decisions have already been made?**
-- **What non-obvious things have already been learned?**
-- **Where in the codebase should I look?**
-- **What remains unresolved?**
-- **What has and has not been verified?**
-
-That is the useful form of continuity.
-
----
-
-# Contributing
-
-Issues and pull requests are welcome.
-
-High-value contribution areas include:
-
-- additional host integrations,
-- stronger language-specific indexing,
-- safer lifecycle automation,
-- better stale-state detection,
-- richer handoff verification,
-- graph/query improvements,
-- import resolution,
-- migration/versioning support,
-- additional tests and platform coverage.
-
-When contributing, preserve the core invariants:
-
-1. source truth outranks memory;
-2. cross-project restoration must not happen silently;
-3. memory should remain curated;
-4. destructive host configuration edits should be avoided;
-5. automation must not claim guarantees the host cannot provide.
-
----
-
-# License
+## License
 
 Continuity is released under the [MIT License](LICENSE).
 
 ---
 
-<div align="center">
+<p align="center">
+  <strong>Same project. New session. Keep building.</strong>
+</p>
 
-### Same context. Further together.
-
-**Continuity — persistent memory, structural understanding, and verified handoffs for coding agents.**
-
-[Back to top](#continuity)
-
-</div>
+<p align="center">
+  Built for the gap between “the model knew this” and “the project can prove it.”
+</p>
