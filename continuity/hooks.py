@@ -5,6 +5,15 @@ import os
 import sys
 from pathlib import Path
 
+from .boundary import (
+    automatic_boundary_handoff,
+    get_arm,
+    inherit_pending_successor,
+    launch_claude_successor,
+    set_arm_status,
+    stage_codex_successor,
+    stage_manual_successor,
+)
 from .context import build_context_pack, mechanical_freeze
 from .project import identity
 from .store import LeaseConflict, Store
@@ -30,7 +39,7 @@ def _enabled(root: Path) -> bool:
     return (root / ".continuity" / "enabled.json").is_file()
 
 
-def _emit(event_name: str, additional_context: str, *, system_message: str | None = None) -> None:
+def _emit_context(event_name: str, additional_context: str, *, system_message: str | None = None) -> None:
     payload: dict = {
         "hookSpecificOutput": {
             "hookEventName": event_name,
@@ -42,8 +51,28 @@ def _emit(event_name: str, additional_context: str, *, system_message: str | Non
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
-def _emit_block(reason: str) -> None:
-    sys.stdout.write(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+def _alert_and_block(host: str, reason: str) -> None:
+    if host == "codex":
+        payload = {
+            "continue": False,
+            "stopReason": reason,
+            "systemMessage": reason,
+            "terminalSequence": "\u0007",
+        }
+    else:
+        payload = {
+            "decision": "block",
+            "reason": reason,
+            "terminalSequence": "\u0007",
+        }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+
+
+def _block_transferred(host: str, reason: str) -> None:
+    if host == "codex":
+        sys.stdout.write(json.dumps({"continue": False, "stopReason": reason, "systemMessage": reason}))
+    else:
+        sys.stdout.write(json.dumps({"decision": "block", "reason": reason}))
 
 
 def _edit_path(event: dict, root: Path) -> str | None:
@@ -78,6 +107,153 @@ def _freeze(store: Store, ident, host: str, sid: str | None, event_name: str, ev
     return payload
 
 
+def _session_start(store: Store, ident, host: str, sid: str | None, event: dict) -> int:
+    if not sid:
+        print("continuity: SessionStart missing session_id; refusing lease mutation", file=sys.stderr)
+        return 0
+
+    store.start_session(
+        sid,
+        ident.key,
+        host,
+        str(ident.root),
+        {"event": "SessionStart", "source": event.get("source")},
+    )
+
+    inherited = inherit_pending_successor(store, ident, host=host, session_id=sid, event=event)
+    conflict = None
+    try:
+        store.acquire_lease(ident.key, sid, host)
+    except LeaseConflict as exc:
+        conflict = str(exc)
+
+    arm = inherited or get_arm(store, ident.key, sid)
+    if conflict:
+        _emit_context(
+            "SessionStart",
+            "LEASE CONFLICT: " + conflict + ". Do not modify project state until ownership is reconciled.",
+            system_message="Continuity detected a session ownership conflict.",
+        )
+        return 0
+
+    # Normal sessions remain silent. Only armed/inherited sessions receive continuity context.
+    if arm and arm.get("status") == "armed":
+        context = build_context_pack(
+            store,
+            ident,
+            prompt="",
+            max_chars=9000,
+            include_handoff=True,
+            memory_limit=8,
+        )
+        prefix = [
+            "Continuity is ARMED for this session and will remain passive until a compaction/transfer boundary.",
+            f"Continuity session id: {sid}",
+            f"Session source: {event.get('source') or 'unknown'}",
+        ]
+        if inherited:
+            prefix.append("This is the designated successor session; predecessor state has been inherited.")
+        _emit_context(
+            "SessionStart",
+            "\n".join(prefix) + "\n\n" + context,
+            system_message="Continuity restored the armed session handoff.",
+        )
+    return 0
+
+
+def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) -> int:
+    if not sid:
+        return 0
+    arm = get_arm(store, ident.key, sid)
+    if not arm or arm.get("status") != "armed":
+        return 0
+
+    _freeze(store, ident, host, sid, "PreCompact", event)
+    handoff_id, handoff_path, _ = automatic_boundary_handoff(
+        store,
+        ident,
+        host=host,
+        session_id=sid,
+        arm=arm,
+        event=event,
+        boundary="PreCompact",
+    )
+    set_arm_status(
+        store,
+        ident.key,
+        sid,
+        "handoff_pending",
+        handoff_id=handoff_id,
+        handoff_path=str(handoff_path),
+    )
+
+    auto = bool(arm.get("auto_successor", True))
+    if host == "claude" and auto:
+        transfer = launch_claude_successor(
+            store,
+            ident,
+            predecessor_session=sid,
+            arm=arm,
+            handoff_id=handoff_id,
+            handoff_path=handoff_path,
+        )
+        if transfer.get("ok"):
+            reason = (
+                "Continuity handoff boundary reached: compaction is about to occur. "
+                "A detailed handoff was captured and a fresh Claude successor session was started in the background. "
+                f"Successor name: {transfer.get('successor_name')}. "
+                f"Attach with: claude --resume {transfer.get('successor_name')}. "
+                "This predecessor is now transferred; continue in the successor."
+            )
+        else:
+            set_arm_status(store, ident.key, sid, "armed", launch_error=transfer.get("reason"))
+            reason = (
+                "Continuity handoff boundary reached: compaction is about to occur. "
+                f"The detailed handoff was captured at {handoff_path}, but automatic Claude successor launch failed: "
+                f"{transfer.get('reason')}. Start a fresh Claude session in this project and invoke /continuity."
+            )
+        _alert_and_block(host, reason)
+        return 0
+
+    if host == "codex":
+        transfer = stage_codex_successor(
+            store,
+            ident,
+            predecessor_session=sid,
+            arm=arm,
+            handoff_id=handoff_id,
+            handoff_path=handoff_path,
+        )
+        reason = (
+            "Continuity handoff boundary reached: compaction is about to occur. "
+            "A detailed handoff was captured and a fresh Codex successor is staged. "
+            "Codex hooks cannot safely open an interactive TUI from this no-terminal hook. "
+            f"Start the fresh session with: {transfer.get('command')}. "
+            "The next fresh Codex session will inherit the staged handoff automatically."
+        )
+        _alert_and_block(host, reason)
+        return 0
+
+    command = f'cd "{ident.root}" && claude' if host == "claude" else f'cd "{ident.root}"'
+    transfer = stage_manual_successor(
+        store,
+        ident,
+        host=host,
+        predecessor_session=sid,
+        arm=arm,
+        handoff_id=handoff_id,
+        handoff_path=handoff_path,
+        command=command,
+    )
+    reason = (
+        "Continuity handoff boundary reached: compaction is about to occur. "
+        f"A detailed handoff was captured at {handoff_path}. "
+        f"Start a fresh successor session from the project: {transfer.get('command')}."
+    )
+    _alert_and_block(host, reason)
+    return 0
+
+
 def run_hook(host: str) -> int:
     event = _read_event()
     if event is None:
@@ -103,112 +279,40 @@ def run_hook(host: str) -> int:
         store.ensure_project(ident.key, str(ident.root))
 
         if event_name == "SessionStart":
-            if not sid:
-                print("continuity: SessionStart missing session_id; refusing lease mutation", file=sys.stderr)
-                return 0
-            store.start_session(
-                sid,
-                ident.key,
-                host,
-                str(ident.root),
-                {"event": event_name, "source": event.get("source")},
-            )
-            conflict = None
-            try:
-                store.acquire_lease(ident.key, sid, host)
-            except LeaseConflict as exc:
-                conflict = str(exc)
-            context = build_context_pack(
-                store, ident, prompt="", max_chars=8500, include_handoff=True, memory_limit=8
-            )
-            prefix = [
-                f"Continuity session id: {sid}",
-                f"Session source: {event.get('source') or 'unknown'}",
-            ]
-            if conflict:
-                prefix.append(
-                    "LEASE CONFLICT: " + conflict +
-                    ". Do not assume ownership; reconcile the active session before destructive work."
-                )
-            _emit(
-                "SessionStart",
-                "\n".join(prefix) + "\n\n" + context,
-                system_message="Continuity restored project context.",
-            )
-            return 0
+            return _session_start(store, ident, host, sid, event)
+
+        arm = get_arm(store, ident.key, sid)
 
         if sid:
             store.touch_lease(ident.key, sid)
 
         if event_name == "UserPromptSubmit":
-            prompt = event.get("prompt")
-            if not isinstance(prompt, str) or len(prompt.strip()) < 3:
-                return 0
-            context = build_context_pack(
-                store,
-                ident,
-                prompt=prompt,
-                max_chars=5000,
-                include_handoff=False,
-                memory_limit=5,
-                structural_limit=6,
-            )
-            _emit("UserPromptSubmit", context)
+            if arm and arm.get("status") == "transferred":
+                _block_transferred(
+                    host,
+                    "Continuity already transferred this predecessor session. Continue in the fresh successor session.",
+                )
             return 0
 
         if event_name == "PostToolUse":
-            tool_name = str(event.get("tool_name") or "")
-            edit_tools = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"}
-            shell_tools = {"Bash", "Shell", "shell"}
-            if tool_name in edit_tools | shell_tools:
-                path = _edit_path(event, ident.root)
-                store.mark_index_dirty(ident.key, path)
-                if path:
-                    _emit(
-                        "PostToolUse",
-                        f"Continuity marked the structural index stale after editing {path}. "
-                        "A semantic checkpoint should be written before this work is handed off.",
-                    )
+            if arm and arm.get("status") == "armed":
+                tool_name = str(event.get("tool_name") or "")
+                edit_tools = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"}
+                shell_tools = {"Bash", "PowerShell", "Shell", "shell"}
+                if tool_name in edit_tools | shell_tools:
+                    store.mark_index_dirty(ident.key, _edit_path(event, ident.root))
             return 0
 
         if event_name == "PreCompact":
-            _freeze(store, ident, host, sid, "PreCompact", event)
-            idx = store.index_state(ident.key)
-            trigger = str(event.get("trigger") or "")
-            if host == "claude" and trigger == "manual" and idx.get("dirty"):
-                _emit_block(
-                    "Continuity detected uncheckpointed project changes. "
-                    "Create a semantic continuity checkpoint first, then run /compact again."
-                )
-            return 0
+            return _precompact(store, ident, host, sid, event)
 
         if event_name == "PostCompact":
-            _freeze(store, ident, host, sid, "PostCompact", event)
+            if arm and arm.get("status") in {"armed", "handoff_pending"}:
+                _freeze(store, ident, host, sid, "PostCompact", event)
             return 0
 
         if event_name == "Stop":
-            idx = store.index_state(ident.key)
-            dirty_at = idx.get("dirty_at") if idx.get("dirty") else None
-            handoff_at = store.latest_handoff_time(ident.key, sid) if sid else None
-            handoff_is_stale = bool(
-                dirty_at
-                and (
-                    handoff_at is None
-                    or (handoff_at * 1_000_000_000) < int(dirty_at)
-                )
-            )
-            if sid and handoff_is_stale:
-                marker_key = f"stop-feedback:{sid}"
-                prior = store.get_state(ident.key, marker_key)
-                if prior != dirty_at:
-                    store.set_state(ident.key, marker_key, dirty_at)
-                    _emit(
-                        "Stop",
-                        "Continuity detected project changes newer than this session's latest semantic handoff. "
-                        "Before ending this turn, run continuity checkpoint with the goal, constraints, "
-                        "discoveries, accomplished work, exact next steps, relevant files, and verification. "
-                        "The checkpoint command refreshes the structural index and binds the handoff to the active session.",
-                    )
+            # Passive mode intentionally does nothing at ordinary turn boundaries.
             return 0
 
         if event_name == "SessionEnd":
@@ -216,6 +320,8 @@ def run_hook(host: str) -> int:
             if sid:
                 store.end_session(sid)
                 store.release_lease(ident.key, sid)
+                if arm and arm.get("status") == "armed":
+                    set_arm_status(store, ident.key, sid, "disarmed", ended=True)
             return 0
 
         return 0
