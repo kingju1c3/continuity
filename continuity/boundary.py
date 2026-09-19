@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -93,6 +95,27 @@ def _extract_strings(value, out: list[str], depth: int = 0) -> None:
                 _extract_strings(value[key], out, depth + 1)
 
 
+_SECRET_PATTERNS = [
+    (re.compile(r"\\bsk-[A-Za-z0-9_-]{16,}\\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\\b(?:ghp|github_pat)_[A-Za-z0-9_]{12,}\\b"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\\bAKIA[0-9A-Z]{16}\\b"), "[REDACTED_AWS_KEY]"),
+    (re.compile(r"(?i)\\bBearer\\s+[A-Za-z0-9._~+/-]{16,}=*"), "Bearer [REDACTED_TOKEN]"),
+    (
+        re.compile(r"(?i)(password|passwd|api[_-]?key|secret|token)(\\s*[:=]\\s*)[^\\s,;]{6,}"),
+        r"\\1\\2[REDACTED]",
+    ),
+]
+
+
+def _redact_sensitive(text: str) -> tuple[str, bool]:
+    changed = False
+    for pattern, replacement in _SECRET_PATTERNS:
+        new = pattern.sub(replacement, text)
+        changed = changed or new != text
+        text = new
+    return text, changed
+
+
 def transcript_tail(path_value: object) -> dict:
     if not isinstance(path_value, str) or not path_value.strip():
         return {"available": False, "reason": "host transcript path unavailable"}
@@ -119,12 +142,17 @@ def transcript_tail(path_value: object) -> dict:
             break
     if not extracted:
         return {"available": False, "reason": "transcript tail contained no parseable structured text", "bytes_read": len(raw)}
-    joined = "\n".join(extracted)
+    joined = "\n".join(extracted)[-MAX_TRANSCRIPT_CHARS:]
+    joined, redacted = _redact_sensitive(joined)
     return {
         "available": True,
         "bytes_read": len(raw),
-        "text": joined[-MAX_TRANSCRIPT_CHARS:],
-        "warning": "Best-effort host transcript evidence; format is not treated as a stable API.",
+        "text": joined,
+        "redacted": redacted,
+        "warning": (
+            "Best-effort host transcript evidence; format is not treated as a stable API. "
+            "Common secret patterns are redacted, but this is not a substitute for avoiding secrets in prompts."
+        ),
     }
 
 
@@ -295,7 +323,7 @@ def launch_codex_successor(store: Store, ident, *, predecessor_session: str, arm
         staged = stage_manual_successor(
             store, ident, host="codex", predecessor_session=predecessor_session,
             arm=arm, handoff_id=handoff_id, handoff_path=handoff_path,
-            command=f'cd "{ident.root}" && codex',
+            command=f"cd {shlex.quote(str(ident.root))} && codex",
         )
         staged.update({"automatic": False, "reason": "codex executable not found"})
         return staged
