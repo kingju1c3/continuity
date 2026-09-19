@@ -33,6 +33,7 @@ jobs:
           assert (root / "protocol" / "successor-transfer.md").is_file()
           assert (root / "schemas" / "checkpoint.schema.json").is_file()
           assert (root / "schemas" / "arm.schema.json").is_file()
+          assert (root / "agents" / "openai.yaml").is_file()
           PY
       - name: CLI smoke test
         run: |
