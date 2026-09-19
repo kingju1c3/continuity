@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -26,6 +27,19 @@ class InstallError(RuntimeError):
     pass
 
 
+def _assert_safe_local_target(root: Path, path: Path) -> None:
+    root = root.resolve()
+    try:
+        rel = path.absolute().relative_to(root)
+    except ValueError as exc:
+        raise InstallError(f"refusing project-local write outside project root: {path}") from exc
+    current = root
+    for part in rel.parts:
+        current = current / part
+        if current.exists() and current.is_symlink():
+            raise InstallError(f"refusing to follow symlink for project-local Continuity path: {current}")
+
+
 def _read_json_object(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -43,8 +57,9 @@ def _backup(root: Path, path: Path) -> Path | None:
         return None
     bdir = root / ".continuity" / "backups"
     bdir.mkdir(parents=True, exist_ok=True)
-    stamp = int(time.time())
-    target = bdir / f"{path.name}.{stamp}.bak"
+    stamp = time.time_ns()
+    tag = hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()[:10]
+    target = bdir / f"{path.name}.{tag}.{stamp}.bak"
     shutil.copy2(path, target)
     return target
 
@@ -199,6 +214,14 @@ def _enable(root: Path) -> Path:
 
 def install_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> list[str]:
     root = root.resolve()
+    local_targets = [
+        root / ".continuity",
+        root / ".claude",
+        root / ".agents",
+        root / "AGENTS.md",
+    ]
+    for target in local_targets:
+        _assert_safe_local_target(root, target)
     plan: list[str] = [str(root / ".continuity" / "enabled.json")]
 
     claude_settings = root / ".claude" / "settings.json"
@@ -268,6 +291,8 @@ def install_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> lis
 
 def uninstall_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> list[str]:
     root = root.resolve()
+    for target in (root / ".continuity", root / ".claude", root / ".agents", root / "AGENTS.md"):
+        _assert_safe_local_target(root, target)
     plan: list[str] = []
     if "claude" in agents:
         plan.extend(
