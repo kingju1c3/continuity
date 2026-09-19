@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Continuity Semantic Checkpoint",
+  "type": "object",
+  "required": ["version", "kind", "created_at", "host", "root", "git"],
+  "properties": {
+    "version": {"type": "integer", "minimum": 2},
+    "kind": {"const": "semantic"},
+    "created_at": {"type": "integer"},
+    "session_id": {"type": ["string", "null"]},
+    "host": {"type": "string"},
+    "root": {"type": "string"},
+    "goal": {"type": "string"},
+    "instructions": {"type": "string"},
+    "discoveries": {"type": "string"},
+    "accomplished": {"type": "string"},
+    "next_steps": {"type": "string"},
+    "relevant_files": {"type": "string"},
+    "verification": {"type": "string"},
+    "git": {"type": "object"}
+  },
+  "additionalProperties": true
+}
