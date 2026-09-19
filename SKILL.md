@@ -54,6 +54,15 @@ SUCCESSOR VERIFIES SOURCE + RESUMES
 
 The skill must not continuously interrupt the session, repeatedly inject memory, or create a checkpoint after every turn.
 
+## Host invocation syntax
+
+Use the host's native explicit skill syntax:
+
+- **Claude Code:** `/continuity`
+- **Codex:** `$continuity`
+
+Current Codex skill documentation defines explicit skill invocation with `$<skill-name>`. Do not depend on deprecated custom-prompt slash aliases to fake `/continuity` in Codex. The protocol and runtime remain the same after either host-native invocation.
+
 ## Invocation contract
 
 When this skill is invoked, **the first operational action** is to arm the exact current session:
