@@ -230,8 +230,13 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
         store.set_state(ident.key, "successor_pending", pending)
         return {"ok": False, "reason": str(exc)}
 
-    pending.update({"status": "launched", "pid": proc.pid})
-    store.set_state(ident.key, "successor_pending", pending)
+    current = store.get_state(ident.key, "successor_pending")
+    if isinstance(current, dict) and current.get("status") == "consumed":
+        current["pid"] = proc.pid
+        store.set_state(ident.key, "successor_pending", current)
+    else:
+        pending.update({"status": "launched", "pid": proc.pid})
+        store.set_state(ident.key, "successor_pending", pending)
     set_arm_status(store, ident.key, predecessor_session, "transferred", successor_name=name)
     return {"ok": True, "successor_name": name, "pid": proc.pid}
 
