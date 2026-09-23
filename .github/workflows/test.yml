@@ -25,9 +25,13 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import sysconfig
           import continuity
+          from continuity.install import _skill_text
           root = Path(continuity.__file__).resolve().parent
-          assert (root / "SKILL.md").is_file()
+          packaged_skill = Path(sysconfig.get_path("data")) / "share" / "continuity" / "SKILL.md"
+          assert packaged_skill.is_file()
+          assert "# /continuity" in _skill_text()
           assert (root / "protocol" / "session-open.md").is_file()
           assert (root / "protocol" / "passive-mode.md").is_file()
           assert (root / "protocol" / "successor-transfer.md").is_file()
