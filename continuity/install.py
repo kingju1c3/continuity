@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import sys
+import sysconfig
 import time
 from pathlib import Path
 
@@ -83,10 +84,25 @@ def _remove_block_text(old: str) -> str:
 
 
 def _skill_text() -> str:
-    p = Path(__file__).resolve().parent / "SKILL.md"
-    if p.exists():
-        return p.read_text(encoding="utf-8")
-    raise InstallError("packaged continuity/SKILL.md is missing")
+    # SKILL.md is canonical at the repository top level so skill registries can
+    # discover it directly. Source/editable installs read that file in place;
+    # built wheels install the same file under the interpreter data directory.
+    candidates = [
+        Path(__file__).resolve().parent.parent / "SKILL.md",
+        Path(sysconfig.get_path("data")) / "share" / "continuity" / "SKILL.md",
+        Path(sys.prefix) / "share" / "continuity" / "SKILL.md",
+    ]
+    seen: set[Path] = set()
+    for p in candidates:
+        p = p.resolve()
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.is_file():
+            return p.read_text(encoding="utf-8")
+    raise InstallError(
+        "top-level SKILL.md is missing from the source checkout and installed package data"
+    )
 
 
 def _install_skill_bundle(target: Path) -> None:
