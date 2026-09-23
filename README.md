@@ -1394,7 +1394,6 @@ continuity/
 │   ├── install.py
 │   ├── project.py
 │   ├── store.py
-│   ├── SKILL.md
 │   ├── protocol/
 │   │   ├── passive-mode.md
 │   │   ├── compaction.md
@@ -1426,6 +1425,7 @@ continuity/
 │   └── test_store.py
 ├── LICENSE
 ├── README.md
+├── SKILL.md
 └── pyproject.toml
 ```
 
