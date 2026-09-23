@@ -19,4 +19,4 @@ continuity = "continuity.cli:main"
 include = ["continuity*"]
 
 [tool.setuptools.package-data]
-continuity = ["SKILL.md", "protocol/*.md", "schemas/*.json", "agents/*.yaml"]
+continuity = ["protocol/*.md", "schemas/*.json", "agents/*.yaml"]\n\n[tool.setuptools.data-files]\n"share/continuity" = ["SKILL.md"]
