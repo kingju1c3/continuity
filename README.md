@@ -1426,7 +1426,6 @@ continuity/
 │   └── test_store.py
 ├── LICENSE
 ├── README.md
-├── SKILL.md
 └── pyproject.toml
 ```
 
