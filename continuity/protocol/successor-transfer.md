@@ -77,3 +77,8 @@ Arm state survives an ordinary SessionEnd/resume. The lease is released on exit 
 Every successor must verify root, branch, HEAD, worktree, and relevant files before continuing.
 
 A handoff is historical evidence, not current authority.
+
+
+## Worktree successor and session chain (v0.4)
+
+At the PreCompact boundary the Claude successor is started in a **new git worktree** (`<project>-continuity/<label-slug>-<N>-<M>`, branch `continuity/<label-slug>-<N>-<M>`) created from the predecessor's HEAD, with the predecessor's uncommitted work applied from the lossless patch and its untracked files copied. Sessions in one chain are labelled `<label> session 1.0`, `1.1`, `1.2`, …; the label comes from `continuity arm --label` (default: the project folder name) and the successor inherits it with the next number. The bootstrap prompt tells the successor it is picking up exactly where the named predecessor left off. Without a Git repository the successor starts in the project root, and the alert says so.

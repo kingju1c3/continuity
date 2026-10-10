@@ -1,6 +1,6 @@
 ---
 name: continuity
-description: "Passive session continuity for coding agents. Invoke once to arm the current session; Continuity stays quiet until the host reaches the reliable pre-compaction boundary, then alerts the user, captures a detailed verified handoff, and transfers work to a fresh successor session when the host supports safe launch."
+description: "Passive session continuity for coding agents. Invoke once to arm the current session; Continuity stays quiet until the host reaches the reliable pre-compaction boundary, then alerts the user, captures a detailed lossless handoff, and starts a fresh successor session in a new git worktree, labelled <name> session 1.1, 1.2, 1.3…, that is told it is picking up where the last session left off."
 hooks:
   UserPromptSubmit:
     - hooks:
@@ -45,9 +45,12 @@ HOST SIGNALS PRECOMPACT
     ↓
 ALERT USER BEFORE COMPACTION
     ↓
-CAPTURE DETAILED HANDOFF
+CAPTURE DETAILED, LOSSLESS HANDOFF (incl. uncommitted work)
     ↓
-TRANSFER TO FRESH SUCCESSOR
+START FRESH SUCCESSOR IN A NEW GIT WORKTREE
+labelled "<name> session 1.1" (then 1.2, 1.3 …)
+    ↓
+SUCCESSOR IS TOLD IT CONTINUES "<name> session 1.0"
     ↓
 SUCCESSOR VERIFIES SOURCE + RESUMES
 ```
@@ -71,10 +74,11 @@ When this skill is invoked, **the first operational action** is to arm the exact
 continuity arm \
   --host auto \
   --goal "<current user objective in one concise sentence>" \
-  --instructions "<critical constraints that must survive the handoff>"
+  --instructions "<critical constraints that must survive the handoff>" \
+  --label "<short name for this line of work, e.g. SiteBooked>"
 ```
 
-Do this before substantive new work.
+Do this before substantive new work. `--label` names the session chain: this session is **`<label> session 1.0`**, its successors **`<label> session 1.1`**, **`1.2`**, **`1.3`** and so on. Without `--label` the project folder name is used. A successor inherits the label and the next number automatically; never re-label it by hand.
 
 If the `continuity` console command is unavailable, read `.continuity/enabled.json` and use the recorded `python` interpreter to invoke the same runtime:
 
@@ -171,6 +175,20 @@ and stored in the Continuity database.
 
 Read `continuity/protocol/checkpoint-handoff.md`.
 
+## Session chain and worktree successor
+
+Before compaction (at the PreCompact boundary), Continuity always:
+
+1. **Captures a detailed, lossless handoff.** On top of goal, instructions, Git branch/HEAD, working tree, diffstat, changed files, index, durable memories and transcript tail, it stores the **work in progress**: a full binary patch of every uncommitted tracked change against HEAD (`.continuity/handoffs/<stamp>-<session>.patch`), the list of untracked files, and the recent commits. Nothing in the predecessor's tree is staged, stashed or committed.
+2. **Creates a new git worktree for the successor** at `<project>-continuity/<label-slug>-<N>-<M>` (next to the project), on branch `continuity/<label-slug>-<N>-<M>`, from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
+3. **Starts the successor in that worktree**, named **`<label> session <N>.<M+1>`** (Claude Code: `claude --bg --name "<label> session 1.1"`), with a bootstrap prompt that says, in substance:
+
+   > You are `<label> session 1.1`. You are picking up exactly where `<label> session 1.0` (session id …) left off: it reached its context limit and handed its work to you just before compaction. Continue its goal; do not start over. Goal: … You are in a new git worktree at … on branch …; the predecessor's uncommitted changes were applied (or: how to apply them). Read the handoff fully, run `continuity resume` and `continuity orient`, verify, then tell the user in one line that `<label> session 1.1` is continuing `<label> session 1.0`'s work, and report readiness.
+
+4. **Tells the user** in the boundary alert: the successor's label, its worktree path and branch, whether the uncommitted work was applied, and how to attach (`claude --resume "<label> session 1.1"` or `claude agents`).
+
+If the project isn't a Git repository with at least one commit, or the worktree can't be created, the successor starts in the project root instead and the alert and prompt say why. If the patch doesn't apply cleanly, the successor is told the exact `git apply` command for the saved patch. Never claim a worktree, an applied patch or a launched successor that the runtime did not report.
+
 ## Successor behavior
 
 ### Claude Code
@@ -183,21 +201,22 @@ When all of these are true:
 - the `claude` executable is available;
 - the environment is not marked remote;
 
-Continuity attempts to launch a **fresh named background Claude session** at the boundary.
+Continuity attempts to launch a **fresh named background Claude session in a new git worktree** at the boundary (see *Session chain and worktree successor*).
 
 The successor receives a bootstrap prompt instructing it to:
 
 1. invoke `/continuity`;
-2. read `.continuity/LATEST.md`;
-3. run `continuity resume`;
-4. run `continuity orient`;
-5. verify project root, branch, HEAD, working tree, and relevant source;
-6. report readiness before modifying files.
+2. know that it is `<label> session <N>.<M+1>` continuing `<label> session <N>.<M>`;
+3. read the handoff (`.continuity/LATEST.md` in its worktree);
+4. run `continuity resume`;
+5. run `continuity orient`;
+6. verify project root, branch, HEAD, working tree, and relevant source;
+7. tell the user it is continuing the predecessor's work, and report readiness before modifying files.
 
 The predecessor alert includes the successor name and the command to attach:
 
 ```bash
-claude --resume <successor-name>
+claude --resume "<label> session 1.1"
 ```
 
 If background launch fails, Continuity preserves the handoff and restores predecessor ownership rather than pretending a successor exists.
@@ -421,7 +440,7 @@ continuity uninstall --agents claude,codex
 
 ## CLI map
 
-- `arm` — activate passive boundary continuity for exact current session.
+- `arm` — activate passive boundary continuity for exact current session (`--label` names the session chain).
 - `disarm` — disable it.
 - `status` — inspect lease, arm state, pending successor, handoff, index.
 - `start` — manual session registration.

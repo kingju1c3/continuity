@@ -97,6 +97,19 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## Worktree successor and session chain — v0.4
+
+Before compaction, Continuity now starts the successor in a **new git worktree** and tells it plainly that it is picking up where the last session left off.
+
+- **Lossless handoff.** Besides goal, constraints, Git state, index, memories and transcript tail, the boundary handoff stores a full binary patch of every uncommitted change, the untracked-file list and recent commits. Nothing in your tree is staged, stashed or committed.
+- **New worktree.** `<project>-continuity/<label>-1-1` on branch `continuity/<label>-1-1`, from your HEAD, with the patch applied and untracked files copied. Your own tree is untouched; merge the branch back when done.
+- **Session chain labels.** `continuity arm --label "SiteBooked"` makes this session `SiteBooked session 1.0`; successors are `SiteBooked session 1.1`, `1.2`, `1.3` … (default label: the project folder name).
+- **Explicit hand-over.** The successor's first prompt: "You are SiteBooked session 1.1. You are picking up exactly where SiteBooked session 1.0 left off…", followed by the goal, the worktree, the handoff path and the verification steps.
+
+Attach with `claude --resume "SiteBooked session 1.1"` (or `claude agents`). Not a Git repository? The successor starts in the project root and the alert says so.
+
+For the Claude app and cloud sessions (no local runtime or PreCompact hook), use the companion skill in [`continuity-cloud/`](continuity-cloud/SKILL.md).
+
 ## Premium continuity runtime — v0.3
 
 Continuity v0.3 changes the operating model from **active per-turn assistance** to **arm once, stay passive, transfer at the compaction boundary**.

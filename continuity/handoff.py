@@ -47,6 +47,7 @@ def render_markdown(p: dict) -> str:
     text = f"""# Continuity Handoff
 
 - Created: {p.get('created_at')}
+- Session label: {p.get('session_label') or '(none)'}
 - Kind: {p.get('kind') or 'semantic'}
 - Host: {p.get('host')}
 - Session: {p.get('session_id') or '(unknown)'}
@@ -93,6 +94,14 @@ def render_markdown(p: dict) -> str:
             text += "\n### Recent Durable Memory\n"
             for item in memories:
                 text += f"- [{item.get('kind')}] {item.get('title')} ({item.get('topic_key') or '-'})\n"
+        wip = boundary.get("work_in_progress") or {}
+        if wip.get("available"):
+            text += "\n### Work In Progress (lossless)\n"
+            text += f"- Uncommitted tracked changes: {wip.get('patch_bytes', 0)} bytes" + (f", full binary patch at `{wip.get('patch_path')}`" if wip.get("patch_path") else " (none)") + "\n"
+            untracked = wip.get("untracked_files") or []
+            text += f"- Untracked files ({len(untracked)}): " + (", ".join(untracked[:50]) or "none") + ("…" if len(untracked) > 50 else "") + "\n"
+            if wip.get("recent_commits"):
+                text += "\nRecent commits:\n```\n" + str(wip["recent_commits"]) + "\n```\n"
         transcript = boundary.get("transcript_tail") or {}
         text += "\n### Transcript Tail\n"
         if transcript.get("available"):
@@ -120,7 +129,11 @@ def write_checkpoint(root: Path, payload: dict) -> Path:
 def validate_handoff(root: Path, payload: dict) -> list[str]:
     warnings: list[str] = []
     target_root = Path(str(payload.get("root") or ".")).expanduser().resolve()
-    if str(root.resolve()) != str(target_root):
+    successor_roots = {str(x) for x in payload.get("successor_roots") or []}
+    in_successor_worktree = str(root.resolve()) in successor_roots
+    if in_successor_worktree:
+        warnings.append(f"running in the successor worktree {root.resolve()} (handoff captured in {payload.get('root')}); branch differs by design")
+    elif str(root.resolve()) != str(target_root):
         warnings.append(
             f"project root mismatch: handoff={payload.get('root')} current={root.resolve()}"
         )
@@ -128,7 +141,7 @@ def validate_handoff(root: Path, payload: dict) -> list[str]:
     old = payload.get("git") or {}
     current = git_snapshot(root)
 
-    if old.get("branch") and current.get("branch") and old["branch"] != current["branch"]:
+    if old.get("branch") and current.get("branch") and old["branch"] != current["branch"] and not in_successor_worktree:
         warnings.append(
             f"branch changed: handoff={old['branch']} current={current['branch']}"
         )

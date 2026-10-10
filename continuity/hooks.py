@@ -203,9 +203,11 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         if transfer.get("ok"):
             reason = (
                 "Continuity handoff boundary reached: compaction is about to occur. "
-                "A detailed handoff was captured and a fresh Claude successor session was started in the background. "
-                f"Successor name: {transfer.get('successor_name')}. "
-                f"Attach with: claude --resume {transfer.get('successor_name')}. "
+                "A detailed handoff was captured and a fresh Claude successor session was started in the background"
+                + (f", in its own git worktree at {transfer.get('worktree')} (branch {transfer.get('worktree_branch')}; {transfer.get('worktree_note')})" if transfer.get("worktree") else f" in the project root ({transfer.get('worktree_note')})")
+                + ". It has been told it is picking up where this session left off. "
+                f"Successor: {transfer.get('successor_name')}. "
+                f"Attach with: claude --resume \"{transfer.get('successor_name')}\" (or claude agents). "
                 "This predecessor is now transferred; continue in the successor."
             )
         else:

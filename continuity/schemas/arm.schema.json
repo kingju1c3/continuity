@@ -16,7 +16,9 @@
     "armed_at": {"type": "integer"},
     "inherited_from": {"type": ["string", "null"]},
     "handoff_id": {"type": "integer"},
-    "handoff_path": {"type": "string"}
+    "handoff_path": {"type": "string"},
+    "label": {"type": "string", "description": "Session chain name; sessions are labelled \"<label> session <generation>\"."},
+    "generation": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$", "description": "1.0 for the first session, then 1.1, 1.2, ..."}
   },
   "additionalProperties": true
 }

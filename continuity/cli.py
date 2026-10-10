@@ -8,7 +8,7 @@ import time
 import uuid
 
 from .adapters import detect, structural_query
-from .boundary import arm_session, disarm_session, get_arm, pending_successor
+from .boundary import arm_session, default_label, disarm_session, get_arm, pending_successor, session_label
 from .context import query_terms
 from .handoff import checkpoint_payload, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
@@ -154,7 +154,11 @@ def cmd_arm(a) -> int:
         if prior:
             instructions = prior + (("\n" + instructions) if instructions and instructions not in prior else "")
     inherited_from = None
+    label = getattr(a, "label", None) or (str(existing_arm.get("label") or "") if existing_arm else "") or default_label(ident.root)
+    generation = str(existing_arm.get("generation") or "1.0") if existing_arm else "1.0"
     if pending and pending.get("host") == host:
+        label = str(pending.get("label") or label)
+        generation = str(pending.get("generation") or generation)
         goal = str(pending.get("goal") or goal)
         prior_instructions = str(pending.get("instructions") or "")
         if prior_instructions:
@@ -170,6 +174,8 @@ def cmd_arm(a) -> int:
         instructions=instructions,
         auto_successor=not a.no_auto_successor,
         inherited_from=inherited_from,
+        label=label,
+        generation=generation,
     )
     if pending and pending.get("host") == host:
         pending.update(
@@ -181,7 +187,7 @@ def cmd_arm(a) -> int:
         )
         st.set_state(ident.key, "successor_pending", pending)
     print(
-        "Continuity armed. It will remain passive during ordinary turns and trigger at the "
+        f"Continuity armed as {session_label(label, generation)}. It will remain passive during ordinary turns and trigger at the "
         "host PreCompact boundary before compaction.\n"
         + json.dumps(state, indent=2, sort_keys=True)
     )
@@ -505,6 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--goal")
     s.add_argument("--instructions")
     s.add_argument("--no-auto-successor", action="store_true")
+    s.add_argument("--label", help='Name for the session chain, e.g. "SiteBooked". Sessions are labelled "<label> session 1.0", then 1.1, 1.2 ...')
     s.set_defaults(fn=cmd_arm)
 
     s = sub.add_parser("disarm")
