@@ -95,7 +95,9 @@ Then tell the user, briefly, that Continuity is armed and will remain passive un
 
 Do **not** keep invoking the skill manually each turn. The host hooks remain registered for the session where supported, and the runtime arm state is durable.
 
-If arming fails because no exact host session identity exists, report the failure instead of inventing a session ID. Run:
+### Session identity
+
+`arm` uses the first exact identity it finds: `--session`, the project's active lease owner, `CONTINUITY_SESSION_ID`, or the `CLAUDE_CODE_SESSION_ID` that Claude Code exports to every shell command it runs. It never invents one. If arming still fails for lack of an identity, report the failure. Run:
 
 ```bash
 continuity doctor
@@ -103,6 +105,20 @@ continuity status
 ```
 
 and repair host integration if necessary.
+
+### Verify the boundary is live (do not skip)
+
+Arming records state. It does **not** prove the PreCompact hook will fire in this session. Right after arming:
+
+1. Run `continuity status` and confirm that `session` is this session and `armed.status` is `armed`.
+2. The PreCompact transfer runs only if **this skill's `hooks:` frontmatter is loaded in this session**. That holds when the invoked copy of the skill carries the hooks (the project or user install written by `continuity install`) and the hooks existed when the session started. It does **not** hold when:
+   - the session started before `continuity install`, or
+   - the invoked copy has no hook frontmatter (for example, a cloud or claude.ai skills mirror).
+3. If the hooks may not be live, say so plainly. Write an explicit `continuity checkpoint` right away as the fallback, so a successor has a handoff either way. Tell the user the automatic transfer will be live in the next session that starts in this project and invokes `/continuity`. Never claim the automatic boundary transfer is armed when it cannot be verified.
+
+### Keep installed copies out of commits
+
+`continuity install` writes a skill copy under `.claude/skills/continuity/` (and `.agents/skills/continuity/` for Codex). When that copy is untracked and not already ignored, install adds it to the repo-local `.git/info/exclude`, so a habitual `git add -A` can't commit it. A copy the project tracks on purpose is left alone. `.continuity/` ignores itself.
 
 ## Passive mode
 

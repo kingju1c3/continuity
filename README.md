@@ -1535,3 +1535,12 @@ Continuity is released under the [MIT License](LICENSE).
 <p align="center">
   Built for the gap between “the model knew this” and “the project can prove it.”
 </p>
+
+## v0.4.1: identity and safety fixes from real use
+
+- `arm` and `start` pick up the session ID Claude Code exports (`CLAUDE_CODE_SESSION_ID`), so arming from a shell no longer fails with "no exact session identity". `CONTINUITY_SESSION_ID` still wins, and no ID is ever invented.
+- `status` reports the arm state of the lease owner, else of the host-exported session (or of `--session`), and shows which session it looked at. Before, it showed `armed: null` for a session armed without a lease.
+- `install` keeps untracked skill copies out of commits through `.git/info/exclude`. Tracked copies and non-git directories are untouched.
+- The skill now requires verifying that the PreCompact boundary is actually live, with an explicit checkpoint as the fallback, and forbids claiming an unverifiable automatic transfer.
+- Test fix: the worktree-successor test compares resolved paths (macOS `/var` → `/private/var`).
+
