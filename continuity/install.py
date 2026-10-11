@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import sysconfig
 import time
@@ -322,7 +323,44 @@ def install_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> lis
     c = root / ".continuity" / ".gitignore"
     c.parent.mkdir(parents=True, exist_ok=True)
     c.write_text("*\n!.gitignore\n", encoding="utf-8")
+    plan.extend(_exclude_untracked(root, [".claude/skills/continuity/", ".agents/skills/continuity/"]))
     return plan
+
+
+def _exclude_untracked(root: Path, rels: list[str]) -> list[str]:
+    """Keep Continuity-installed skill copies out of commits without editing
+    a tracked .gitignore: append each path that exists, is untracked and not
+    already ignored to the repo-local `.git/info/exclude`. A path the project
+    deliberately tracks is left alone. No-op outside a git work tree."""
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+
+    try:
+        if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+            return []
+        exclude_rel = git("rev-parse", "--git-path", "info/exclude").stdout.strip()
+    except OSError:
+        return []
+    if not exclude_rel:
+        return []
+    exclude = Path(exclude_rel)
+    if not exclude.is_absolute():
+        exclude = root / exclude
+    added: list[str] = []
+    for rel in rels:
+        if not (root / rel).exists():
+            continue
+        if git("ls-files", "--error-unmatch", rel).returncode == 0:
+            continue  # tracked on purpose
+        if git("check-ignore", "-q", rel).returncode == 0:
+            continue  # already ignored
+        added.append(rel)
+    if added:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        old = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        lines = ["# continuity (installed skill copies; local only)", *added]
+        exclude.write_text(old + ("" if old.endswith("\n") or not old else "\n") + "\n".join(lines) + "\n", encoding="utf-8")
+    return [f"{exclude} (+{rel})" for rel in added]
 
 
 def uninstall_repo(root: Path, agents: list[str], *, dry_run: bool = False) -> list[str]:

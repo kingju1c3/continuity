@@ -74,7 +74,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
             name = argv[argv.index("--name") + 1]
             self.assertEqual(name, "SiteBooked session 1.1")
             wt = Path(base) / "shop-continuity" / "sitebooked-1-1"
-            self.assertEqual(Path(cwd), wt)
+            self.assertEqual(Path(cwd).resolve(), wt.resolve())  # macOS: /var -> /private/var
             self.assertIn(str(wt), payload["reason"])
             self.assertIn("SiteBooked session 1.1", payload["reason"])
             prompt = argv[-1]

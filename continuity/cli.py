@@ -34,6 +34,22 @@ def _ensure_index(ident, st: Store) -> dict:
     return {"refreshed": False, **state}
 
 
+def _env_session() -> tuple[str | None, str | None]:
+    """The exact current session the host exports to child processes.
+
+    CONTINUITY_SESSION_ID (explicit) wins; otherwise Claude Code exports
+    CLAUDE_CODE_SESSION_ID to every shell command it runs. Returns
+    (session_id, host-or-None). Never invents an ID.
+    """
+    explicit = os.getenv("CONTINUITY_SESSION_ID")
+    if explicit:
+        return explicit, None
+    claude = os.getenv("CLAUDE_CODE_SESSION_ID")
+    if claude:
+        return claude, "claude"
+    return None, None
+
+
 def _active_session(st: Store, project_key: str) -> tuple[str | None, str | None]:
     lease = st.active_lease(project_key)
     if not lease:
@@ -43,7 +59,7 @@ def _active_session(st: Store, project_key: str) -> tuple[str | None, str | None
 
 def cmd_start(a) -> int:
     ident, st = _ctx(a.path)
-    sid = a.session or os.getenv("CONTINUITY_SESSION_ID") or f"{a.host}-{uuid.uuid4()}"
+    sid = a.session or _env_session()[0] or f"{a.host}-{uuid.uuid4()}"
     st.start_session(sid, ident.key, a.host, str(ident.root), {"pid": os.getpid(), "manual": True})
     try:
         st.acquire_lease(ident.key, sid, a.host)
@@ -118,18 +134,20 @@ def cmd_recover(a) -> int:
 def cmd_arm(a) -> int:
     ident, st = _ctx(a.path)
     active_sid, active_host = _active_session(st, ident.key)
-    sid = a.session or active_sid
+    env_sid, env_host = _env_session()
+    sid = a.session or active_sid or env_sid
     if not sid:
         print(
             "Continuity cannot arm without an exact session identity. "
-            "Install/repair host hooks or pass --session explicitly.",
+            "Install/repair host hooks, run inside a host that exports its session id "
+            "(Claude Code: CLAUDE_CODE_SESSION_ID), or pass --session explicitly.",
             file=sys.stderr,
         )
         st.close()
         return 2
     host = a.host
     if host == "auto":
-        host = active_host or "manual"
+        host = active_host or (env_host if sid == env_sid else None) or "manual"
     if active_host and host != active_host:
         print(
             f"Continuity refuses host mismatch: active lease host is {active_host}, requested {host}.",
@@ -401,13 +419,16 @@ def cmd_status(a) -> int:
     lease = st.active_lease(ident.key)
     handoff = st.latest_handoff(ident.key)
     freeze = st.latest_freeze(ident.key)
-    active_arm = get_arm(st, ident.key, str(lease["session_id"])) if lease else None
+    env_sid, _ = _env_session()
+    status_sid = getattr(a, "session", None) or (str(lease["session_id"]) if lease else None) or env_sid
+    active_arm = get_arm(st, ident.key, status_sid) if status_sid else None
     result = {
         "project": str(ident.root),
         "branch": ident.branch,
         "head": ident.git_head,
         "enabled": (ident.root / ".continuity" / "enabled.json").exists(),
         "lease": dict(lease) if lease else None,
+        "session": status_sid,
         "armed": active_arm,
         "successor_pending": st.get_state(ident.key, "successor_pending"),
         "index": st.index_state(ident.key),
@@ -581,6 +602,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_orient)
 
     s = sub.add_parser("status")
+    s.add_argument("--session", help="show the arm state of this session (default: lease owner, else the host-exported session)")
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("doctor")
