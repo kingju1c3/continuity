@@ -95,6 +95,8 @@ Then tell the user, briefly, that Continuity is armed and will remain passive un
 
 Do **not** keep invoking the skill manually each turn. The host hooks remain registered for the session where supported, and the runtime arm state is durable.
 
+In Claude Code (terminal or the desktop app) arming works even when no SessionStart hook ran: the runtime takes the exact session id Claude Code exports as `CLAUDE_CODE_SESSION_ID` (the same id every hook receives), takes the project lease, and writes `.continuity/enabled.json` plus a `.continuity/.gitignore` so the skill's hooks act on this project and handoffs never get committed. Arming is the opt-in; nothing else enables a project silently.
+
 If arming fails because no exact host session identity exists, report the failure instead of inventing a session ID. Run:
 
 ```bash
@@ -180,12 +182,14 @@ Read `continuity/protocol/checkpoint-handoff.md`.
 Before compaction (at the PreCompact boundary), Continuity always:
 
 1. **Captures a detailed, lossless handoff.** On top of goal, instructions, Git branch/HEAD, working tree, diffstat, changed files, index, durable memories and transcript tail, it stores the **work in progress**: a full binary patch of every uncommitted tracked change against HEAD (`.continuity/handoffs/<stamp>-<session>.patch`), the list of untracked files, and the recent commits. Nothing in the predecessor's tree is staged, stashed or committed.
-2. **Creates a new git worktree for the successor** at `<project>-continuity/<label-slug>-<N>-<M>` (next to the project), on branch `continuity/<label-slug>-<N>-<M>`, from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
+2. **Creates a new git worktree for the successor** at `<main checkout>/.claude/worktrees/continuity-<label-slug>-<N>-<M>` (where Claude Code and the desktop app keep worktrees; a chain of successors stays side by side, never nested; the folder is added to `.git/info/exclude` if not already ignored), on branch `continuity/<label-slug>-<N>-<M>`, from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
 3. **Starts the successor in that worktree**, named **`<label> session <N>.<M+1>`** (Claude Code: `claude --bg --name "<label> session 1.1"`), with a bootstrap prompt that says, in substance:
 
    > You are `<label> session 1.1`. You are picking up exactly where `<label> session 1.0` (session id …) left off: it reached its context limit and handed its work to you just before compaction. Continue its goal; do not start over. Goal: … You are in a new git worktree at … on branch …; the predecessor's uncommitted changes were applied (or: how to apply them). Read the handoff fully, run `continuity resume` and `continuity orient`, verify, then tell the user in one line that `<label> session 1.1` is continuing `<label> session 1.0`'s work, and report readiness.
 
 4. **Tells the user** in the boundary alert: the successor's label, its worktree path and branch, whether the uncommitted work was applied, and how to attach (`claude --resume "<label> session 1.1"` or `claude agents`).
+
+**Workspace trust.** `claude --bg` refuses to start in a workspace the user has never trusted. A worktree inherits trust from its repository, so this works for any repo the user has opened in Claude before; in a never-opened repo the launch fails with Claude's own message. Continuity confirms the launch from `claude --bg`'s output (`backgrounded · <id>`); if that line is missing it reports the failure verbatim, keeps the handoff and the worktree, and restores the predecessor's lease. It never announces a successor that did not start.
 
 If the project isn't a Git repository with at least one commit, or the worktree can't be created, the successor starts in the project root instead and the alert and prompt say why. If the patch doesn't apply cleanly, the successor is told the exact `git apply` command for the saved patch. Never claim a worktree, an applied patch or a launched successor that the runtime did not report.
 

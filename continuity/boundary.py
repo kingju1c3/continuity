@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from .handoff import checkpoint_payload, write_checkpoint
 from .indexer import build_index
@@ -268,6 +269,23 @@ def capture_work_in_progress(root: Path, created_at: int, session_id: str) -> di
     }
 
 
+def _exclude_locally(root: Path, pattern: str) -> None:
+    """Keep the nested worktree out of the predecessor's `git status` without touching tracked files."""
+    if subprocess.run(["git", "check-ignore", "-q", pattern + "x"], cwd=str(root), capture_output=True).returncode == 0:
+        return
+    common = (_git_bytes(root, "rev-parse", "--git-common-dir") or b"").decode().strip()
+    if not common:
+        return
+    exclude = (root / common).resolve() / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if pattern not in text.splitlines():
+            exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + pattern + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def prepare_successor_worktree(ident, *, label: str, generation: str, wip: dict) -> dict:
     """A fresh git worktree for the successor at the predecessor's HEAD, with its uncommitted work carried over."""
     root = ident.root
@@ -275,11 +293,17 @@ def prepare_successor_worktree(ident, *, label: str, generation: str, wip: dict)
     if not head:
         return {"ok": False, "reason": "not a git repository with commits; successor starts in the project root"}
     slug = f"{_slug(label)}-{generation.replace('.', '-')}"
-    path = root.parent / f"{root.name}-continuity" / slug
+    # Inside the project, where Claude Code and the desktop app keep worktrees: the new directory inherits
+    # the project's workspace trust, without which `claude --bg` refuses to start the successor.
+    # Sibling of other worktrees under the MAIN checkout, so a chain of successors never nests.
+    common = (_git_bytes(root, "rev-parse", "--path-format=absolute", "--git-common-dir") or b"").decode().strip()
+    main = Path(common).parent if common.endswith(".git") else root
+    path = main / ".claude" / "worktrees" / f"continuity-{slug}"
     branch = f"continuity/{slug}"
     if path.exists():
         return {"ok": False, "reason": f"worktree path already exists: {path}"}
     path.parent.mkdir(parents=True, exist_ok=True)
+    _exclude_locally(main, ".claude/worktrees/")
     if _git_bytes(root, "worktree", "add", "-b", branch, str(path), head) is None:
         return {"ok": False, "reason": f"git worktree add failed for {path}"}
     result = {"ok": True, "path": str(path), "branch": branch, "base": head, "wip": "none", "untracked_copied": 0, "untracked_skipped": []}
@@ -315,15 +339,23 @@ def prepare_successor_worktree(ident, *, label: str, generation: str, wip: dict)
     return result
 
 
-def _spawn_background(argv: list[str], cwd: Path):
-    return subprocess.Popen(
-        argv,
-        cwd=str(cwd),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+def _spawn_background(argv: list[str], cwd: Path, timeout: float = 15.0):
+    """Run `claude --bg …` and confirm it actually backgrounded a session.
+
+    `claude --bg` returns once the session is handed to the background service, so a zero exit with a
+    "backgrounded" line is the real launch signal. Anything else (an untrusted workspace, a missing login,
+    a timeout) raises OSError with Claude's own message, and the caller restores the predecessor's lease
+    instead of announcing a successor that never started."""
+    try:
+        done = subprocess.run(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, start_new_session=True)
+    except subprocess.TimeoutExpired as exc:
+        raise OSError(f"claude --bg did not confirm a launch within {timeout:.0f}s") from exc
+    out = (done.stdout or "") + (done.stderr or "")
+    m = re.search(r"backgrounded\s*\S\s*([0-9a-f]{6,})", out)
+    if done.returncode != 0 or not m:
+        raise OSError("claude --bg failed: " + (" ".join(out.split())[:300] or f"exit {done.returncode}"))
+    return SimpleNamespace(pid=m.group(1))
 
 
 def launch_claude_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
@@ -379,6 +411,11 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
     store.set_state(ident.key, "successor_pending", pending)
     if succ_key != ident.key:
         store.set_state(succ_key, "successor_pending", pending)
+        # `continuity resume` in the worktree looks up handoffs by the worktree's own project key.
+        latest = store.latest_handoff(ident.key)
+        if latest:
+            store.ensure_project(succ_key, str(cwd))
+            store.add_handoff(succ_key, predecessor_session, {k: v for k, v in latest.items() if not k.startswith("_")})
     store.release_lease(ident.key, predecessor_session)
 
     try:

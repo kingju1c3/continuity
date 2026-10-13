@@ -73,8 +73,8 @@ class WorktreeSuccessorTests(unittest.TestCase):
             argv, cwd = popen.call_args.args
             name = argv[argv.index("--name") + 1]
             self.assertEqual(name, "SiteBooked session 1.1")
-            wt = Path(base) / "shop-continuity" / "sitebooked-1-1"
-            self.assertEqual(Path(cwd), wt)
+            wt = root / ".claude" / "worktrees" / "continuity-sitebooked-1-1"
+            self.assertEqual(Path(cwd).resolve(), wt.resolve())
             self.assertIn(str(wt), payload["reason"])
             self.assertIn("SiteBooked session 1.1", payload["reason"])
             prompt = argv[-1]
@@ -98,6 +98,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
 
             st = Store.default()
             self.assertEqual(get_arm(st, identity(root).key, "s1")["status"], "transferred")
+            self.assertIsNotNone(st.latest_handoff(identity(wt).key))  # `continuity resume` works in the worktree
             st.close()
 
             # The successor's own SessionStart (in the worktree, with its name) inherits the chain as 1.1 ...
@@ -131,3 +132,18 @@ class WorktreeSuccessorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpawnBackgroundTests(unittest.TestCase):
+    def test_confirms_a_real_backgrounded_session(self):
+        from continuity.boundary import _spawn_background
+        with TemporaryDirectory() as d:
+            got = _spawn_background(["sh", "-c", "echo 'backgrounded · 11844f29 · demo session 1.1'"], Path(d))
+            self.assertEqual(got.pid, "11844f29")
+
+    def test_untrusted_workspace_is_a_failure_not_a_launch(self):
+        from continuity.boundary import _spawn_background
+        with TemporaryDirectory() as d:
+            with self.assertRaises(OSError) as ctx:
+                _spawn_background(["sh", "-c", "echo 'Workspace not trusted. Run claude once' >&2; exit 1"], Path(d))
+            self.assertIn("Workspace not trusted", str(ctx.exception))

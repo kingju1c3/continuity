@@ -487,11 +487,11 @@ class Store:
                 ],
             )
             self.db.executemany(
-                "INSERT INTO symbols(project_key,path,symbol,kind,line) VALUES(?,?,?,?,?)",
+                "INSERT OR IGNORE INTO symbols(project_key,path,symbol,kind,line) VALUES(?,?,?,?,?)",
                 [(project_key, x["path"], x["symbol"], x["kind"], x["line"]) for x in symbols],
             )
             self.db.executemany(
-                "INSERT INTO edges(project_key,src,dst,kind,evidence) VALUES(?,?,?,?,?)",
+                "INSERT OR IGNORE INTO edges(project_key,src,dst,kind,evidence) VALUES(?,?,?,?,?)",
                 [(project_key, x["src"], x["dst"], x["kind"], x["evidence"]) for x in edges],
             )
         self.mark_index_fresh(project_key, files=len(files), symbols=len(symbols), edges=len(edges))

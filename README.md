@@ -102,13 +102,25 @@ Continuity addresses those failures by giving each kind of state a different lif
 Before compaction, Continuity now starts the successor in a **new git worktree** and tells it plainly that it is picking up where the last session left off.
 
 - **Lossless handoff.** Besides goal, constraints, Git state, index, memories and transcript tail, the boundary handoff stores a full binary patch of every uncommitted change, the untracked-file list and recent commits. Nothing in your tree is staged, stashed or committed.
-- **New worktree.** `<project>-continuity/<label>-1-1` on branch `continuity/<label>-1-1`, from your HEAD, with the patch applied and untracked files copied. Your own tree is untouched; merge the branch back when done.
+- **New worktree.** `<main checkout>/.claude/worktrees/continuity-<label>-1-1` (since v0.4.1) on branch `continuity/<label>-1-1`, from your HEAD, with the patch applied and untracked files copied. Your own tree is untouched; merge the branch back when done.
 - **Session chain labels.** `continuity arm --label "SiteBooked"` makes this session `SiteBooked session 1.0`; successors are `SiteBooked session 1.1`, `1.2`, `1.3` … (default label: the project folder name).
 - **Explicit hand-over.** The successor's first prompt: "You are SiteBooked session 1.1. You are picking up exactly where SiteBooked session 1.0 left off…", followed by the goal, the worktree, the handoff path and the verification steps.
 
 Attach with `claude --resume "SiteBooked session 1.1"` (or `claude agents`). Not a Git repository? The successor starts in the project root and the alert says so.
 
 For the Claude app and cloud sessions (no local runtime or PreCompact hook), use the companion skill in [`continuity-cloud/`](continuity-cloud/SKILL.md).
+
+## Fixes that make the worktree successor actually start — v0.4.1
+
+Found by running a real end-to-end PreCompact transfer on macOS with Claude Code 2.1.294 and the desktop app:
+
+- **The successor never started.** `claude --bg` refuses an untrusted workspace, and a worktree created next to the project (`<project>-continuity/…`) is untrusted. Worktrees now live in `<main checkout>/.claude/worktrees/`, where they inherit the repository's trust. They are added to `.git/info/exclude` if not already ignored, and a chain of successors sits side by side instead of nesting.
+- **The failed launch was reported as a success.** The runtime counted a `Popen` as a launch. It now waits for `claude --bg` to print `backgrounded · <id>`. Anything else is reported verbatim, the handoff and worktree are kept, and the predecessor keeps its lease.
+- **Arming failed without a SessionStart hook** (skill-only installs, the desktop app). `arm` now uses the exact `CLAUDE_CODE_SESSION_ID` that Claude Code exports, takes the lease, and enables the project (`enabled.json` plus a self-ignoring `.continuity/.gitignore`). Before, every hook no-op'd and PreCompact never transferred.
+- **`continuity resume` in the successor worktree found no handoff.** The handoff is now also recorded under the worktree's own project key.
+- **`checkpoint` crashed** with `UNIQUE constraint failed: edges…` when one source line produced the same import edge twice. Index rows are now inserted idempotently.
+- **Two checkpoints in the same second overwrote each other's file.** The second one now gets its own `-2` file.
+- **`continuity-cloud` copied no untracked files on macOS.** `cp --parents` is GNU-only. It now uses a portable `tar --null -T -` pipe.
 
 ## Premium continuity runtime — v0.3
 

@@ -112,11 +112,25 @@ def render_markdown(p: dict) -> str:
     return text
 
 
+def ensure_state_dir(root: Path) -> Path:
+    """Create .continuity/ and keep it out of Git: handoffs hold transcript tails and must never be committed."""
+    d = root / ".continuity"
+    d.mkdir(parents=True, exist_ok=True)
+    ignore = d / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+    return d
+
+
 def write_checkpoint(root: Path, payload: dict) -> Path:
-    d = root / ".continuity" / "handoffs"
+    d = ensure_state_dir(root) / "handoffs"
     d.mkdir(parents=True, exist_ok=True)
     sid = (payload.get("session_id") or "session").replace("/", "-")[:80]
     path = d / f"{int(payload['created_at'])}-{sid}.md"
+    n = 1
+    while path.exists():  # two checkpoints in one second must not overwrite each other
+        n += 1
+        path = d / f"{int(payload['created_at'])}-{sid}-{n}.md"
     text = render_markdown(payload)
     path.write_text(text, encoding="utf-8")
     (root / ".continuity" / "LATEST.md").write_text(text, encoding="utf-8")

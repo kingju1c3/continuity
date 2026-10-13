@@ -86,3 +86,32 @@ class ArmCliTests(unittest.TestCase):
                 st = Store.default()
                 self.assertEqual(get_arm(st, identity(root).key, "s1")["status"], "disarmed")
                 st.close()
+
+
+class DesktopArmTests(unittest.TestCase):
+    def test_arm_without_lease_uses_claude_code_session_id_and_enables_project(self):
+        # Claude desktop / skill-only installs: no SessionStart lease, no enabled marker.
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            args = Namespace(path=str(root), session=None, host="auto", goal="g", instructions="i",
+                             no_auto_successor=False, label=None)
+            env = {"HOME": home, "CLAUDE_CODE_SESSION_ID": "desk-1"}
+            with patch.dict(os.environ, env), redirect_stdout(io.StringIO()):
+                rc = cmd_arm(args)
+            self.assertEqual(rc, 0)
+            self.assertTrue((root / ".continuity" / "enabled.json").is_file())
+            self.assertEqual((root / ".continuity" / ".gitignore").read_text(), "*\n")
+            with patch.dict(os.environ, env):
+                st = Store.default()
+                self.assertEqual(st.active_lease(identity(root).key)["session_id"], "desk-1")
+                self.assertEqual(get_arm(st, identity(root).key, "desk-1")["status"], "armed")
+                st.close()
+
+    def test_arm_without_lease_or_host_id_still_refuses(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            args = Namespace(path=project, session=None, host="auto", goal="g", instructions="i",
+                             no_auto_successor=False, label=None)
+            env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
+            env["HOME"] = home
+            with patch.dict(os.environ, env, clear=True), redirect_stderr(io.StringIO()):
+                self.assertEqual(cmd_arm(args), 2)

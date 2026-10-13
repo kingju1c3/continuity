@@ -11,7 +11,7 @@ EXT_LANG = {
     ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin", ".rb": "ruby", ".php": "php",
     ".md": "markdown", ".toml": "toml", ".yaml": "yaml", ".yml": "yaml", ".json": "json",
 }
-IGNORE = {".git", ".continuity", "node_modules", ".venv", "venv", "dist", "build", "target", "__pycache__", ".next", ".cache"}
+IGNORE = {".git", ".continuity", "node_modules", ".venv", "venv", "dist", "build", "target", "__pycache__", ".next", ".cache", "worktrees"}
 SYMBOL_RE = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|struct|enum|fn)\s+([A-Za-z_$][\w$]*)", re.M)
 IMPORT_RE = re.compile(r"(?:from\s+['\"]([^'\"]+)['\"]|require\(['\"]([^'\"]+)['\"]\)|^\s*import\s+([\w./-]+)|^\s*use\s+([\w:]+))", re.M)
 

@@ -10,7 +10,7 @@ import uuid
 from .adapters import detect, structural_query
 from .boundary import arm_session, default_label, disarm_session, get_arm, pending_successor, session_label
 from .context import query_terms
-from .handoff import checkpoint_payload, render_markdown, validate_handoff, write_checkpoint
+from .handoff import checkpoint_payload, ensure_state_dir, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
 from .indexer import build_index
 from .install import InstallError, install_repo, uninstall_repo
@@ -119,6 +119,18 @@ def cmd_arm(a) -> int:
     ident, st = _ctx(a.path)
     active_sid, active_host = _active_session(st, ident.key)
     sid = a.session or active_sid
+    if not sid and a.host in {"auto", "claude"} and os.getenv("CLAUDE_CODE_SESSION_ID"):
+        # Claude Code (CLI and desktop app) exports the exact session id hooks receive; use it when
+        # no SessionStart hook registered a lease (skill-only installs, desktop worktree sessions).
+        sid, host_env = os.environ["CLAUDE_CODE_SESSION_ID"], "claude"
+        st.start_session(sid, ident.key, host_env, str(ident.root), {"pid": os.getpid(), "source": "CLAUDE_CODE_SESSION_ID"})
+        try:
+            st.acquire_lease(ident.key, sid, host_env)
+        except LeaseConflict as exc:
+            print(f"LEASE CONFLICT: {exc}", file=sys.stderr)
+            st.close()
+            return 3
+        active_sid, active_host = sid, host_env
     if not sid:
         print(
             "Continuity cannot arm without an exact session identity. "
@@ -165,6 +177,11 @@ def cmd_arm(a) -> int:
             instructions = prior_instructions + (("\n" + instructions) if instructions else "")
         inherited_from = str(pending.get("predecessor_session") or "") or None
 
+    if not (ident.root / ".continuity" / "enabled.json").is_file():
+        # Arming is the opt-in: without the marker every hook no-ops and PreCompact never transfers.
+        from .install import _enable
+        ensure_state_dir(ident.root)
+        _enable(ident.root)
     state = arm_session(
         st,
         ident.key,

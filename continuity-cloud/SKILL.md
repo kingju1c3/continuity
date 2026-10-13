@@ -11,7 +11,7 @@ It cannot capture at the exact compaction instant: there is no hook. It transfer
 
 ## On invocation
 
-1. Check for the runtime in this session's own shell (`command -v continuity`, `.continuity/enabled.json`). If it is present AND the host exposes a session ID, tell the user to use `/continuity` instead and stop. A CLI installed on a linked remote computer does not count: hooks and session identity belong to the host running this conversation. Never invent a session ID.
+1. Check for the runtime in this session's own shell (`command -v continuity`). If it is present AND the host exposes an exact session id (Claude Code, terminal or desktop app, exports `CLAUDE_CODE_SESSION_ID`), tell the user to use `/continuity` instead and stop: it arms without any prior install and hands over at the real PreCompact hook. A CLI installed on a linked remote computer does not count: hooks and session identity belong to the host running this conversation. Never invent a session ID.
 2. Tell the user in one line that cloud mode is active: there is no compaction hook here, so handoffs are written at milestones and the hand-over to a new session happens before compaction, not at it.
 3. **Work out this session's label.** Sessions in one line of work form a chain: **`<Name> session 1.0`**, then **`1.1`**, **`1.2`**, **`1.3`** … If the session was started by a predecessor, its first message names it ("You are SiteBooked session 1.2 …"): keep that label. Otherwise this is `<Name> session 1.0`, where `<Name>` is the project or topic (ask only if it's genuinely unclear). State the label in that same line.
 4. Find the latest existing handoff. If a Project is attached, search its docs for `Handoff`; otherwise check the working directory. Read it and note its version.
@@ -36,18 +36,23 @@ Do all of it in one go, in this order, and report each step's real result.
 2. **Preserve all work in progress on a new worktree branch** (Git projects). Never stage, stash, commit or reset in the current tree:
    ```bash
    N="<name-slug>-1-2"                                  # next label, dots → dashes
-   git worktree add -b "continuity/$N" "../$(basename "$PWD")-continuity/$N" HEAD
+   MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"   # main checkout, so worktrees never nest
+   W="$MAIN/.claude/worktrees/continuity-$N"
+   git check-ignore -q "$MAIN/.claude/worktrees/x" || echo ".claude/worktrees/" >> "$(git rev-parse --git-common-dir)/info/exclude"
+   git worktree add -b "continuity/$N" "$W" HEAD
    git diff --binary HEAD > "/tmp/$N.patch"            # every uncommitted tracked change
-   git -C "../$(basename "$PWD")-continuity/$N" apply --binary "/tmp/$N.patch"
-   git ls-files --others --exclude-standard -z | xargs -0 -I{} cp --parents {} "../$(basename "$PWD")-continuity/$N/"   # untracked files
+   git -C "$W" apply --binary "/tmp/$N.patch"
+   git ls-files --others --exclude-standard -z | tar --null -T - -cf - | tar -xf - -C "$W"   # untracked files (portable: GNU and BSD/macOS)
+   git -C "$W" status --short                           # show the user what was carried over
    # put the handoff doc in the worktree too, then:
-   git -C "../$(basename "$PWD")-continuity/$N" add -A
-   git -C "../$(basename "$PWD")-continuity/$N" commit -m "continuity: work in progress handed to <Name> session 1.2"
-   git -C "../$(basename "$PWD")-continuity/$N" push -u origin "continuity/$N"
+   git -C "$W" add -A
+   git -C "$W" commit -m "continuity: work in progress handed to <Name> session 1.2"
+   git -C "$W" push -u origin "continuity/$N"
    ```
    A cloud session is a fresh checkout: anything not pushed is lost. If pushing isn't allowed, say so and attach the patch and handoff as files instead. Skip secrets and files that look like credentials, and name what you skipped.
 3. **Start the new session** labelled `<Name> session 1.2`:
    - If a session-creation tool exists (e.g. `create_session` in Claude Code on the web), create it on the same repository at branch `continuity/<name-slug>-1-2`, with title `<Name> session 1.2` and the bootstrap prompt below. Report the new session's ID or link exactly as the tool returned it.
+   - In the Claude desktop app's Code tab without the runtime, use the app's background-task tool if present (`spawn_task`): it opens a new session in its own fresh worktree from the base branch, so the bootstrap prompt must tell it to `git fetch` and check out `continuity/<name-slug>-1-2` (or apply the saved patch). Report the task id the tool returned.
    - If no such tool exists (Claude app chats), give the user the bootstrap prompt in a copyable block and ask them to start a new chat (same Project, if any) and paste it. Suggest naming that chat `<Name> session 1.2`.
    - Never say a session was started unless the tool returned it.
 4. **Bootstrap prompt** for the new session (fill in every field):
