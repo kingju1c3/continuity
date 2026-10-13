@@ -49,3 +49,15 @@ class PremiumContinuityTests(unittest.TestCase):
             (root / "a.txt").write_text("two")
             warnings = validate_handoff(root, handoff)
             self.assertTrue(any("working-tree status differs" in w for w in warnings))
+
+
+class SkillFrontmatterTests(unittest.TestCase):
+    def test_description_is_valid_for_claude_ai_upload(self):
+        # claude.ai rejects descriptions containing anything that looks like an XML tag (e.g. "<name>").
+        import re
+        text = (Path(__file__).resolve().parent.parent / "SKILL.md").read_text(encoding="utf-8")
+        front = text.split("---", 2)[1]
+        m = re.search(r'^description: "((?:[^"\\]|\\.)*)"\s*$', front, re.M)
+        self.assertIsNotNone(m, "description must be one double-quoted line with no bare inner double quotes")
+        self.assertNotRegex(m.group(1), r"<[^>]*>")
+        self.assertLessEqual(len(m.group(1)), 1024)

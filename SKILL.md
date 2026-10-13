@@ -1,6 +1,6 @@
 ---
 name: continuity
-description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled <name> session 1.1, 1.2… Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and hands over to a new labelled session before compaction, with work in progress pushed to a worktree branch. Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
+description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled 'Project session 1.1', '1.2'… Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and hands over to a new labelled session before compaction, with work in progress pushed to a worktree branch. Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
 hooks:
   UserPromptSubmit:
     - hooks:
