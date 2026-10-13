@@ -108,7 +108,13 @@ Before compaction, Continuity now starts the successor in a **new git worktree**
 
 Attach with `claude --resume "SiteBooked session 1.1"` (or `claude agents`). Not a Git repository? The successor starts in the project root and the alert says so.
 
-For the Claude app and cloud sessions (no local runtime or PreCompact hook), use the companion skill in [`continuity-cloud/`](continuity-cloud/SKILL.md).
+One skill covers both environments. `/continuity` picks **local mode** when the runtime and a Claude Code session id are present on this machine, and **cloud mode** otherwise (Claude Code on the web, cloud workspaces, the Claude app). Cloud mode has no hook, so it hands over before compaction, with work in progress pushed to a worktree branch. See *Cloud mode* in [`SKILL.md`](SKILL.md). The separate `continuity-cloud` skill was merged into it in v0.5.
+
+## One skill for local and cloud — v0.5
+
+- `continuity-cloud` is merged into `/continuity`. The skill checks its own shell first, then runs **local mode** (runtime, exact session id, real PreCompact hook, worktree successor) or **cloud mode** (milestone handoffs and an early hand-over to a new labelled session on a pushed worktree branch).
+- The skill's hooks do nothing when the runtime isn't installed, so cloud sessions get no "command not found" noise. Installed copies still pin the runtime's own Python.
+- If you installed `continuity-cloud` separately, delete it; `/continuity` replaces it.
 
 ## Fixes that make the worktree successor actually start — v0.4.1
 

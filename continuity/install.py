@@ -114,7 +114,7 @@ def _install_skill_bundle(target: Path) -> None:
     hook_command = f'\"{sys.executable}\" -m continuity hook --host claude'
     yaml_hook_command = hook_command.replace("'", "''")
     skill = skill.replace(
-        'command: "continuity hook --host claude"',
+        'command: "if command -v continuity >/dev/null 2>&1; then continuity hook --host claude; fi"',
         f"command: '{yaml_hook_command}'",
     )
     (target / "SKILL.md").write_text(skill, encoding="utf-8")
