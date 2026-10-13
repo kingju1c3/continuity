@@ -103,10 +103,10 @@ Before compaction, Continuity now starts the successor in a **new git worktree**
 
 - **Lossless handoff.** Besides goal, constraints, Git state, index, memories and transcript tail, the boundary handoff stores a full binary patch of every uncommitted change, the untracked-file list and recent commits. Nothing in your tree is staged, stashed or committed.
 - **New worktree.** `<main checkout>/.claude/worktrees/continuity-<label>-1-1` (since v0.4.1) on branch `continuity/<label>-1-1`, from your HEAD, with the patch applied and untracked files copied. Your own tree is untouched; merge the branch back when done.
-- **Session chain labels.** `continuity arm --label "SiteBooked"` makes this session `SiteBooked session 1.0`; successors are `SiteBooked session 1.1`, `1.2`, `1.3` … (default label: the project folder name).
-- **Explicit hand-over.** The successor's first prompt: "You are SiteBooked session 1.1. You are picking up exactly where SiteBooked session 1.0 left off…", followed by the goal, the worktree, the handoff path and the verification steps.
+- **Session chain labels.** `continuity arm --label "SiteBooked"` makes this session `Session SiteBooked 1.0`; successors are `Session SiteBooked 1.1`, `1.2`, `1.3` … (default label: the project folder name). Identifiers are unique per project: a number issued under a label is never reused, so a second `FE` chain (or `FE` armed again later) continues at the next free number instead of a second `1.0`.
+- **Explicit hand-over.** The successor's first prompt: "You are Session SiteBooked 1.1. You are picking up exactly where Session SiteBooked 1.0 left off…", followed by the goal, the worktree, the handoff path and the verification steps.
 
-Attach with `claude --resume "SiteBooked session 1.1"` (or `claude agents`). Not a Git repository? The successor starts in the project root and the alert says so.
+Attach with `claude --resume "Session SiteBooked 1.1"` (or `claude agents`). Not a Git repository? The successor starts in the project root and the alert says so.
 
 One skill covers both environments. `/continuity` picks **local mode** when the runtime and a Claude Code session id are present on this machine, and **cloud mode** otherwise (Claude Code on the web, cloud workspaces, the Claude app). Cloud mode has no hook, so it hands over before compaction, with work in progress pushed to a worktree branch. See *Cloud mode* in [`SKILL.md`](SKILL.md). The separate `continuity-cloud` skill was merged into it in v0.5.
 

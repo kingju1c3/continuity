@@ -22,7 +22,7 @@ def git(root, *args):
 
 class WorktreeSuccessorTests(unittest.TestCase):
     """At the compaction boundary the successor starts in a new git worktree with the predecessor's
-    uncommitted work, is labelled "<label> session N.M+1", and is told it continues the predecessor."""
+    uncommitted work, is labelled "Session <label> N.M+1", and is told it continues the predecessor."""
 
     def run_event(self, root: Path, event: dict):
         event = {"cwd": str(root), **event}
@@ -72,13 +72,13 @@ class WorktreeSuccessorTests(unittest.TestCase):
             self.assertEqual(payload["decision"], "block")
             argv, cwd = popen.call_args.args
             name = argv[argv.index("--name") + 1]
-            self.assertEqual(name, "SiteBooked session 1.1")
+            self.assertEqual(name, "Session SiteBooked 1.1")
             wt = root / ".claude" / "worktrees" / "continuity-sitebooked-1-1"
             self.assertEqual(Path(cwd).resolve(), wt.resolve())
             self.assertIn(str(wt), payload["reason"])
-            self.assertIn("SiteBooked session 1.1", payload["reason"])
+            self.assertIn("Session SiteBooked 1.1", payload["reason"])
             prompt = argv[-1]
-            self.assertIn("You are SiteBooked session 1.1. You are picking up exactly where SiteBooked session 1.0 (session id s1) left off", prompt)
+            self.assertIn("You are Session SiteBooked 1.1. You are picking up exactly where Session SiteBooked 1.0 (session id s1) left off", prompt)
             self.assertIn("Goal: ship the booking chat", prompt)
             self.assertIn("uncommitted changes: applied", prompt)
 
@@ -89,7 +89,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
             branch = subprocess.run(["git", "-C", str(wt), "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
             self.assertEqual(branch, "continuity/sitebooked-1-1")
             latest = (wt / ".continuity" / "LATEST.md").read_text()
-            self.assertIn("Session label: SiteBooked session 1.0", latest)
+            self.assertIn("Session label: Session SiteBooked 1.0", latest)
             self.assertIn("Work In Progress (lossless)", latest)
             self.assertIn("notes.md", latest)
             data = json.loads((wt / ".continuity" / "LATEST.json").read_text())
@@ -111,8 +111,8 @@ class WorktreeSuccessorTests(unittest.TestCase):
             # ... and its own boundary hands off to 1.2.
             payload, popen = self.precompact(wt, "s2")
             argv, cwd = popen.call_args.args
-            self.assertEqual(argv[argv.index("--name") + 1], "SiteBooked session 1.2")
-            self.assertIn("picking up exactly where SiteBooked session 1.1", argv[-1])
+            self.assertEqual(argv[argv.index("--name") + 1], "Session SiteBooked 1.2")
+            self.assertIn("picking up exactly where Session SiteBooked 1.1", argv[-1])
 
     def test_not_a_git_repo_falls_back_to_project_root(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project, patch.dict(os.environ, {"HOME": home, "CLAUDE_CODE_REMOTE": ""}):
@@ -126,7 +126,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
             payload, popen = self.precompact(root, "s1")
             argv, cwd = popen.call_args.args
             self.assertEqual(Path(cwd), root.resolve())
-            self.assertIn(f"{root.resolve().name} session 1.1", payload["reason"])
+            self.assertIn(f"Session {root.resolve().name} 1.1", payload["reason"])
             self.assertIn("No separate worktree was created", argv[-1])
 
 
@@ -138,7 +138,7 @@ class SpawnBackgroundTests(unittest.TestCase):
     def test_confirms_a_real_backgrounded_session(self):
         from continuity.boundary import _spawn_background
         with TemporaryDirectory() as d:
-            got = _spawn_background(["sh", "-c", "echo 'backgrounded · 11844f29 · demo session 1.1'"], Path(d))
+            got = _spawn_background(["sh", "-c", "echo 'backgrounded · 11844f29 · Session demo 1.1'"], Path(d))
             self.assertEqual(got.pid, "11844f29")
 
     def test_untrusted_workspace_is_a_failure_not_a_launch(self):

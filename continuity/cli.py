@@ -8,7 +8,7 @@ import time
 import uuid
 
 from .adapters import detect, structural_query
-from .boundary import arm_session, default_label, disarm_session, get_arm, pending_successor, session_label
+from .boundary import arm_session, claim_generation, default_label, disarm_session, get_arm, pending_successor, session_label
 from .context import query_terms
 from .handoff import checkpoint_payload, ensure_state_dir, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
@@ -176,6 +176,10 @@ def cmd_arm(a) -> int:
         if prior_instructions:
             instructions = prior_instructions + (("\n" + instructions) if instructions else "")
         inherited_from = str(pending.get("predecessor_session") or "") or None
+    elif not existing_arm:
+        # A new instance (this session id never armed): never reuse a number
+        # already issued under this label. A re-arm keeps its own number.
+        generation = claim_generation(st, ident.key, label, generation)
 
     if not (ident.root / ".continuity" / "enabled.json").is_file():
         # Arming is the opt-in: without the marker every hook no-ops and PreCompact never transfers.
@@ -528,7 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--goal")
     s.add_argument("--instructions")
     s.add_argument("--no-auto-successor", action="store_true")
-    s.add_argument("--label", help='Name for the session chain, e.g. "SiteBooked". Sessions are labelled "<label> session 1.0", then 1.1, 1.2 ...')
+    s.add_argument("--label", help='Name for the session chain, e.g. "SiteBooked". Sessions are labelled "Session <label> 1.0", then 1.1, 1.2 ...')
     s.set_defaults(fn=cmd_arm)
 
     s = sub.add_parser("disarm")

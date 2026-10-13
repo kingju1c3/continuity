@@ -26,7 +26,7 @@ def arm_key(session_id: str) -> str:
     return f"armed:{session_id}"
 
 
-# ---- session chain labels: "<label> session 1.0", then 1.1, 1.2, 1.3 ... ----
+# ---- session chain labels: "Session <label> 1.0", then 1.1, 1.2, 1.3 ... ----
 def default_label(root: Path) -> str:
     return Path(root).name or "Project"
 
@@ -39,8 +39,33 @@ def next_generation(generation: str | None) -> str:
         return "1.1"
 
 
+def _gen_key(generation: str) -> tuple[int, int]:
+    major, _, minor = str(generation).partition(".")
+    try:
+        return int(major), int(minor or 0)
+    except ValueError:
+        return 1, 0
+
+
+def claim_generation(store: Store, project_key: str, label: str, wanted: str) -> str:
+    """Issue a number never used before for this label in this project.
+
+    Every instance gets its own identifier in sequential order ("Session FE 1.2",
+    then 1.3, 1.4 ...), so two chains under one label, or a chain re-armed later,
+    can never share a name. Returns `wanted` unless an equal or later number was
+    already issued, in which case the next one after the last issued.
+    """
+    key = f"label_seq:{label.strip().lower()}"
+    last = str((store.get_state(project_key, key) or {}).get("generation") or "")
+    issued = wanted if not last or _gen_key(wanted) > _gen_key(last) else next_generation(last)
+    # ponytail: read-then-write; two arms in the same millisecond could race. Add a
+    # BEGIN IMMEDIATE transaction if parallel arming under one label becomes real.
+    store.set_state(project_key, key, {"generation": issued, "issued_at": int(time.time())})
+    return issued
+
+
 def session_label(label: str, generation: str) -> str:
-    return f"{label} session {generation}"
+    return f"Session {label} {generation}"
 
 
 def _slug(text: str) -> str:
@@ -367,7 +392,7 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
 
     label = str(arm.get("label") or default_label(ident.root))
     prev_gen = str(arm.get("generation") or "1.0")
-    generation = next_generation(prev_gen)
+    generation = claim_generation(store, ident.key, label, next_generation(prev_gen))
     name = session_label(label, generation)
     previous = session_label(label, prev_gen)
     latest_json = ident.root / ".continuity" / "LATEST.json"

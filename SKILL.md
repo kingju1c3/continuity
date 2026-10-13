@@ -1,6 +1,6 @@
 ---
 name: continuity
-description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled 'Project session 1.1', '1.2'… Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and hands over to a new labelled session before compaction, with work in progress pushed to a worktree branch. Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
+description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled with a unique sequential identifier ('Session FE 1.1', '1.2'…) Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and hands over to a new labelled session before compaction, with work in progress pushed to a worktree branch. Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
 hooks:
   UserPromptSubmit:
     - hooks:
@@ -48,9 +48,9 @@ ALERT USER BEFORE COMPACTION
 CAPTURE DETAILED, LOSSLESS HANDOFF (incl. uncommitted work)
     ↓
 START FRESH SUCCESSOR IN A NEW GIT WORKTREE
-labelled "<name> session 1.1" (then 1.2, 1.3 …)
+labelled "Session <name> 1.1" (then 1.2, 1.3 …)
     ↓
-SUCCESSOR IS TOLD IT CONTINUES "<name> session 1.0"
+SUCCESSOR IS TOLD IT CONTINUES "Session <name> 1.0"
     ↓
 SUCCESSOR VERIFIES SOURCE + RESUMES
 ```
@@ -91,7 +91,7 @@ continuity arm \
   --label "<short name for this line of work, e.g. SiteBooked>"
 ```
 
-Do this before substantive new work. `--label` names the session chain: this session is **`<label> session 1.0`**, its successors **`<label> session 1.1`**, **`1.2`**, **`1.3`** and so on. Without `--label` the project folder name is used. A successor inherits the label and the next number automatically; never re-label it by hand.
+Do this before substantive new work. `--label` names the session chain: this session is **`Session <label> 1.0`**, its successors **`Session <label> 1.1`**, **`1.2`**, **`1.3`** and so on. Without `--label` the project folder name is used. A successor inherits the label and the next number automatically; never re-label it by hand. Every instance gets a unique identifier in sequential order: a number issued under a label is never reused in this project, so a second chain armed as `FE`, or `FE` armed again later, continues at the next free number (`Session FE 1.3`, `1.4` …), never a second `1.0`.
 
 If the `continuity` console command is unavailable, read `.continuity/enabled.json` and use the recorded `python` interpreter to invoke the same runtime:
 
@@ -196,11 +196,11 @@ Before compaction (at the PreCompact boundary), Continuity always:
 
 1. **Captures a detailed, lossless handoff.** On top of goal, instructions, Git branch/HEAD, working tree, diffstat, changed files, index, durable memories and transcript tail, it stores the **work in progress**: a full binary patch of every uncommitted tracked change against HEAD (`.continuity/handoffs/<stamp>-<session>.patch`), the list of untracked files, and the recent commits. Nothing in the predecessor's tree is staged, stashed or committed.
 2. **Creates a new git worktree for the successor** at `<main checkout>/.claude/worktrees/continuity-<label-slug>-<N>-<M>` (where Claude Code and the desktop app keep worktrees; a chain of successors stays side by side, never nested; the folder is added to `.git/info/exclude` if not already ignored), on branch `continuity/<label-slug>-<N>-<M>`, from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
-3. **Starts the successor in that worktree**, named **`<label> session <N>.<M+1>`** (Claude Code: `claude --bg --name "<label> session 1.1"`), with a bootstrap prompt that says, in substance:
+3. **Starts the successor in that worktree**, named **`Session <label> <N>.<M+1>`** (Claude Code: `claude --bg --name "Session <label> 1.1"`), with a bootstrap prompt that says, in substance:
 
-   > You are `<label> session 1.1`. You are picking up exactly where `<label> session 1.0` (session id …) left off: it reached its context limit and handed its work to you just before compaction. Continue its goal; do not start over. Goal: … You are in a new git worktree at … on branch …; the predecessor's uncommitted changes were applied (or: how to apply them). Read the handoff fully, run `continuity resume` and `continuity orient`, verify, then tell the user in one line that `<label> session 1.1` is continuing `<label> session 1.0`'s work, and report readiness.
+   > You are `Session <label> 1.1`. You are picking up exactly where `Session <label> 1.0` (session id …) left off: it reached its context limit and handed its work to you just before compaction. Continue its goal; do not start over. Goal: … You are in a new git worktree at … on branch …; the predecessor's uncommitted changes were applied (or: how to apply them). Read the handoff fully, run `continuity resume` and `continuity orient`, verify, then tell the user in one line that `Session <label> 1.1` is continuing `Session <label> 1.0`'s work, and report readiness.
 
-4. **Tells the user** in the boundary alert: the successor's label, its worktree path and branch, whether the uncommitted work was applied, and how to attach (`claude --resume "<label> session 1.1"` or `claude agents`).
+4. **Tells the user** in the boundary alert: the successor's label, its worktree path and branch, whether the uncommitted work was applied, and how to attach (`claude --resume "Session <label> 1.1"` or `claude agents`).
 
 **Workspace trust.** `claude --bg` refuses to start in a workspace the user has never trusted. A worktree inherits trust from its repository, so this works for any repo the user has opened in Claude before; in a never-opened repo the launch fails with Claude's own message. Continuity confirms the launch from `claude --bg`'s output (`backgrounded · <id>`); if that line is missing it reports the failure verbatim, keeps the handoff and the worktree, and restores the predecessor's lease. It never announces a successor that did not start.
 
@@ -223,7 +223,7 @@ Continuity attempts to launch a **fresh named background Claude session in a new
 The successor receives a bootstrap prompt instructing it to:
 
 1. invoke `/continuity`;
-2. know that it is `<label> session <N>.<M+1>` continuing `<label> session <N>.<M>`;
+2. know that it is `Session <label> <N>.<M+1>` continuing `Session <label> <N>.<M>`;
 3. read the handoff (`.continuity/LATEST.md` in its worktree);
 4. run `continuity resume`;
 5. run `continuity orient`;
@@ -233,7 +233,7 @@ The successor receives a bootstrap prompt instructing it to:
 The predecessor alert includes the successor name and the command to attach:
 
 ```bash
-claude --resume "<label> session 1.1"
+claude --resume "Session <label> 1.1"
 ```
 
 If background launch fails, Continuity preserves the handoff and restores predecessor ownership rather than pretending a successor exists.
@@ -502,7 +502,7 @@ It cannot capture at the exact compaction instant: there is no hook. It transfer
 
 1. Check for the runtime in this session's own shell (`command -v continuity`). If it is present AND the host exposes an exact session id (Claude Code, terminal or desktop app, exports `CLAUDE_CODE_SESSION_ID`), tell the user to use `/continuity` instead and stop: it arms without any prior install and hands over at the real PreCompact hook. A CLI installed on a linked remote computer does not count: hooks and session identity belong to the host running this conversation. Never invent a session ID.
 2. Tell the user in one line that cloud mode is active: there is no compaction hook here, so handoffs are written at milestones and the hand-over to a new session happens before compaction, not at it.
-3. **Work out this session's label.** Sessions in one line of work form a chain: **`<Name> session 1.0`**, then **`1.1`**, **`1.2`**, **`1.3`** … If the session was started by a predecessor, its first message names it ("You are SiteBooked session 1.2 …"): keep that label. Otherwise this is `<Name> session 1.0`, where `<Name>` is the project or topic (ask only if it's genuinely unclear). State the label in that same line.
+3. **Work out this session's label.** Sessions in one line of work form a chain: **`Session <Name> 1.0`**, then **`1.1`**, **`1.2`**, **`1.3`** … If the session was started by a predecessor, its first message names it ("You are Session SiteBooked 1.2 …"): keep that label. Otherwise it is a new instance: `<Name>` is the project or topic (ask only if it's genuinely unclear), and its number is the next one never used before under that name. Check the existing handoffs and session or chat titles for `Session <Name> …`, and take the number after the highest one found (`Session <Name> 1.0` only if none exists). Identifiers are never reused, so two sessions never share one. State the label in that same line.
 4. Find the latest existing handoff. If a Project is attached, search its docs for `Handoff`; otherwise check the working directory. Read it and note its version.
 5. Verify it against live state (Git branch/HEAD/working tree, deployed version, open PRs/CI). Surface drift.
 6. Write a fresh handoff now if none exists for the current work or the latest is stale.
@@ -521,7 +521,7 @@ No commentary on ordinary turns. Write or update the handoff only at a milestone
 
 Do all of it in one go, in this order, and report each step's real result.
 
-1. **Write the lossless handoff** (format below), labelled for both sides: "from `<Name> session 1.1` to `<Name> session 1.2`". Lossless means a fresh session could continue with no access to this conversation: every decision and its reason, every open thread, exact file paths, commands, IDs, URLs, versions, test results with numbers, what was verified versus assumed, the user's standing preferences and corrections, and the exact next action.
+1. **Write the lossless handoff** (format below), labelled for both sides: "from `Session <Name> 1.1` to `Session <Name> 1.2`". Lossless means a fresh session could continue with no access to this conversation: every decision and its reason, every open thread, exact file paths, commands, IDs, URLs, versions, test results with numbers, what was verified versus assumed, the user's standing preferences and corrections, and the exact next action.
 2. **Preserve all work in progress on a new worktree branch** (Git projects). Never stage, stash, commit or reset in the current tree:
    ```bash
    N="<name-slug>-1-2"                                  # next label, dots → dashes
@@ -535,17 +535,17 @@ Do all of it in one go, in this order, and report each step's real result.
    git -C "$W" status --short                           # show the user what was carried over
    # put the handoff doc in the worktree too, then:
    git -C "$W" add -A
-   git -C "$W" commit -m "continuity: work in progress handed to <Name> session 1.2"
+   git -C "$W" commit -m "continuity: work in progress handed to Session <Name> 1.2"
    git -C "$W" push -u origin "continuity/$N"
    ```
    A cloud session is a fresh checkout: anything not pushed is lost. If pushing isn't allowed, say so and attach the patch and handoff as files instead. Skip secrets and files that look like credentials, and name what you skipped.
-3. **Start the new session** labelled `<Name> session 1.2`:
-   - If a session-creation tool exists (e.g. `create_session` in Claude Code on the web), create it on the same repository at branch `continuity/<name-slug>-1-2`, with title `<Name> session 1.2` and the bootstrap prompt below. Report the new session's ID or link exactly as the tool returned it.
+3. **Start the new session** labelled `Session <Name> 1.2`:
+   - If a session-creation tool exists (e.g. `create_session` in Claude Code on the web), create it on the same repository at branch `continuity/<name-slug>-1-2`, with title `Session <Name> 1.2` and the bootstrap prompt below. Report the new session's ID or link exactly as the tool returned it.
    - In the Claude desktop app's Code tab without the runtime, use the app's background-task tool if present (`spawn_task`): it opens a new session in its own fresh worktree from the base branch, so the bootstrap prompt must tell it to `git fetch` and check out `continuity/<name-slug>-1-2` (or apply the saved patch). Report the task id the tool returned.
-   - If no such tool exists (Claude app chats), give the user the bootstrap prompt in a copyable block and ask them to start a new chat (same Project, if any) and paste it. Suggest naming that chat `<Name> session 1.2`.
+   - If no such tool exists (Claude app chats), give the user the bootstrap prompt in a copyable block and ask them to start a new chat (same Project, if any) and paste it. Suggest naming that chat `Session <Name> 1.2`.
    - Never say a session was started unless the tool returned it.
 4. **Bootstrap prompt** for the new session (fill in every field):
-   > You are **<Name> session 1.2**. You are picking up exactly where **<Name> session 1.1** left off: it reached its context limit and handed its work to you before compaction. Continue its goal; do not start over. Goal: … Handoff: `<path or doc name>` (read it fully). Code: branch `continuity/<name-slug>-1-2` (the previous session's uncommitted work is committed there; the original branch was `<branch>` at `<HEAD>`). Invoke `/continuity` (it will pick cloud mode), verify the handoff against live state, then tell the user in one line that <Name> session 1.2 is continuing session 1.1's work, and report readiness before changing anything.
+   > You are **Session <Name> 1.2**. You are picking up exactly where **Session <Name> 1.1** left off: it reached its context limit and handed its work to you before compaction. Continue its goal; do not start over. Goal: … Handoff: `<path or doc name>` (read it fully). Code: branch `continuity/<name-slug>-1-2` (the previous session's uncommitted work is committed there; the original branch was `<branch>` at `<HEAD>`). Invoke `/continuity` (it will pick cloud mode), verify the handoff against live state, then tell the user in one line that Session <Name> 1.2 is continuing session 1.1's work, and report readiness before changing anything.
 5. **Close out here.** Tell the user in one or two lines: the new session's label (and link/ID if created), the branch holding the work, the handoff's name, and that further work should happen in the new session. Don't keep editing in the predecessor after the hand-over.
 
 ### Handoff format
@@ -554,7 +554,7 @@ Filename: `<Project>-<Topic>-Handoff-<YYYY-MM-DD>-v<N>.md`, incrementing N from 
 
 Required sections:
 
-- **Session:** this session's label and, at a hand-over, the successor's label ("<Name> session 1.1 → 1.2").
+- **Session:** this session's label and, at a hand-over, the successor's label ("Session <Name> 1.1 → 1.2").
 - **Supersedes:** exact name of the prior handoff, or "none".
 - **Continuity mode:** cloud, and why `/continuity` was unavailable.
 - **Goal and done condition.**
@@ -577,13 +577,13 @@ Never include credentials, tokens, private keys, or raw transcripts.
 
 A fresh session resumes by:
 
-1. noting its label from the bootstrap prompt (`<Name> session 1.2`) and telling the user it is continuing the named predecessor's work;
+1. noting its label from the bootstrap prompt (`Session <Name> 1.2`) and telling the user it is continuing the named predecessor's work;
 2. reading the latest handoff fully;
 3. verifying project root, branch, HEAD, working tree, and live systems against it;
 4. surfacing drift;
 5. reporting readiness before modifying anything.
 
-When it later hands over, the next session is `<Name> session 1.3`, and so on.
+When it later hands over, the next session is `Session <Name> 1.3`, and so on.
 
 Authority order: current source + Git state > fresh live-system evidence > durable memory > handoff doc > summaries.
 
