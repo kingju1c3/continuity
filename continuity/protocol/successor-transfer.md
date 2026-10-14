@@ -4,19 +4,20 @@ The objective is a **fresh context** that resumes from durable evidence rather t
 
 ## Claude Code
 
-When a local Claude executable is available and automatic successor launch is enabled, Continuity launches a named background session:
+By default (v0.8) the successor is a **visible sidebar clone**. Continuity prepares the worktree, carries the work over, writes the handoff, releases the predecessor's lease, and returns a `start` block:
 
-```text
-claude --bg --name <continuity-name> <bootstrap prompt>
+```json
+{"tool": "mcp__ccd_session__start_session",
+ "args": {"initiation": "user_asked", "title": "Session <label> <next>", "context": "fresh",
+          "cwd": "<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>",
+          "use_worktree": false, "prompt": "<bootstrap prompt>", "background": "..."}}
 ```
+
+The agent makes that call in the Claude desktop app. `permission_mode`, `model` and `effort` are left out on purpose so the successor inherits the predecessor's. The successor's title matches `successor_name`, so its SessionStart hook inherits the chain. In a plain terminal the user opens the folder and pastes the prompt.
 
 The bootstrap prompt invokes /continuity and requires verification before file edits.
 
-The predecessor receives the attach command:
-
-```bash
-claude --resume <continuity-name>
-```
+Opt-in only (`continuity arm --background-successor`): the old background launch, `claude --bg --name <continuity-name> <bootstrap prompt>`, attached with `claude --resume <continuity-name>`. Background sessions don't appear in the desktop app's sidebar or on the phone.
 
 A pending successor record binds predecessor session, successor name, handoff ID/path, goal/instructions, and creation time.
 

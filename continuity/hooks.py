@@ -15,6 +15,7 @@ from .boundary import (
     handoff_due,
     inherit_pending_successor,
     launch_claude_successor,
+    visible_start_instructions,
     next_generation,
     session_label,
     set_arm_status,
@@ -201,8 +202,11 @@ def _early_warning(store: Store, ident, host: str, sid: str | None, arm: dict | 
         "failed attempts, verified vs. assumed state with exact SHAs/paths/commands/IDs/URLs/test counts, and the single next action.\n"
         "4. Run: continuity handover --handoff-file .continuity/HANDOFF.md\n"
         "   It creates the successor worktree in THIS environment (<main checkout>/.claude/worktrees/), carries over every "
-        "uncommitted and untracked change, and starts the successor there with claude --bg.\n"
-        "5. Report the command's real output (worktree path, branch, successor name), then stop working in this session."
+        "uncommitted and untracked change, and prints a `start` block and a `next` instruction.\n"
+        "5. Start the successor VISIBLY, as its `next` says: in the Claude desktop app call mcp__ccd_session__start_session "
+        "with the printed `start.args` (a sidebar session in the new worktree, with this session's permissions and settings). "
+        "Never `claude --bg`. In a terminal, give the user the folder and the prompt instead.\n"
+        "6. Report the real result (worktree path, branch, successor name, session id), then stop working in this session."
     )
     _emit_context(event_name, agent_msg, system_message=user_msg)
     return True
@@ -244,7 +248,14 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
             handoff_id=handoff_id,
             handoff_path=handoff_path,
         )
-        if transfer.get("ok"):
+        if transfer.get("ok") and transfer.get("visible"):
+            reason = (
+                "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
+                f"A detailed handoff was captured and a new git worktree was created for {transfer.get('successor_name')} "
+                + (f"at {transfer.get('worktree')} (branch {transfer.get('worktree_branch')}; {transfer.get('worktree_note')}). " if transfer.get("worktree") else f"in the project root ({transfer.get('worktree_note')}). ")
+                + visible_start_instructions(transfer)
+            )
+        elif transfer.get("ok"):
             reason = (
                 "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
                 "A detailed handoff was captured, a new git worktree was created as the handoff, and a fresh Claude successor session was started in the background"

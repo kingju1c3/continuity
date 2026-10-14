@@ -63,10 +63,11 @@ The skill must not continuously interrupt the session, repeatedly inject memory,
 
 1. **Hand over BEFORE compaction, never after.** The successor worktree is created and the successor started while this session still holds its full context. A hand-over after compaction works from a lossy summary; it is a recovery, not continuity.
 2. **Alert the user first, in plain words.** The first line the user sees is: `⚠️ Compaction is imminent. I'm creating a new git worktree (continuity/<slug>-session-<next>) in this same checkout and handing the work to Session <Name> <next>.` Then do it, in the same turn, without waiting for a reply.
-3. **Same environment, same folders.** The successor's worktree is `<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>`, created by this session, in the environment it is running in (same machine or container, same main checkout). The successor is started in that folder. Never a fresh clone, a temp dir, another machine or another container, except as an announced fallback when no same-environment launch exists.
+3. **Same environment, same folders, same permissions: a clone of the predecessor.** The PREDECESSOR creates the successor's worktree itself, in the exact same folder and environment it is running in: `<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>`, on the same machine or container, inside the same main checkout, next to its own worktree. The successor runs with the same permissions, permission mode, settings, environment variables, tools, MCP servers, plugins, skills, hooks and folder access as the predecessor, as its clone. Only the context is fresh. The successor is started in that folder. Never a fresh clone, a temp dir, another machine or another container, except as an announced fallback when no same-environment launch exists.
 4. **Lossless.** The handoff lets a session with no access to this conversation continue without asking anything. It contains the goal and done condition; the user's instructions and standing preferences, quoted; every decision with its reason; every open thread; failed attempts and why they failed; verified vs. assumed state with exact SHAs, paths, commands, IDs, URLs and test counts; and the single next action. Every uncommitted and untracked change goes into the worktree. Nothing is summarised away to save space.
 5. **Report only what happened.** Name the worktree path, branch, successor label and launch id exactly as the runtime or tool returned them. Never announce a worktree, an applied patch or a started session that was not confirmed.
 6. **One owner.** After the hand-over, this session stops working and points the user at the successor.
+7. **The successor is a visible sidebar clone, created automatically.** Since v0.8 the runtime never starts `claude --bg` unless the session was armed with `--background-successor`. `continuity handover` (and the PreCompact backstop) prepares the clone: the worktree, the carried-over work and the handoff. It then prints a `start` block and a `next` instruction. In the Claude desktop app you then **call `mcp__ccd_session__start_session` with exactly the printed `start.args`**: `initiation: "user_asked"` (arming /continuity is the user's standing request for the successor), `title: "Session <label> <next>"`, `context: "fresh"`, `cwd: <the new worktree>`, `use_worktree: false`, and the bootstrap `prompt`. **Do not pass `permission_mode`, `model` or `effort`**, so the app gives the successor this session's own permissions and settings. The successor then appears in the app's sidebar (and on the user's phone) in the new worktree, as a clone. Report the session id the tool returns. Only when that tool doesn't exist (a plain terminal) do you give the user the folder and a copy-paste start message instead. A background session does not appear in the sidebar and can't be reached from the phone; on 2026-10-14 a lead session ran for hours that the user could not talk to. If a background successor exists anyway (an older runtime, or `--background-successor`), say so in the same turn and stop it (`claude stop <id>`) or tell the user how to reach it (`claude attach <id>`, then `/remote-control`). Never leave two owners running.
 
 ## Pick the mode first (one skill, two modes)
 
@@ -158,8 +159,8 @@ When you (the agent) receive `CONTINUITY: COMPACTION IS IMMINENT`, do exactly th
 1. Put the alert to the user as the first line of your reply (Hard rule 2).
 2. Finish or safely pause the step in flight. Never leave a half-written file or a half-pushed branch.
 3. Write the lossless handoff to `.continuity/HANDOFF.md` (format: **Handoff format** under Cloud mode, which applies in both modes; Hard rule 4).
-4. Run `continuity handover --handoff-file .continuity/HANDOFF.md`. It embeds your narrative at the top of the handoff, captures the work in progress, creates the successor worktree in this checkout, applies the uncommitted changes, copies the untracked files, and starts the successor there with `claude --bg`.
-5. Report its real output (worktree, branch, successor name), then stop working in this session.
+4. Run `continuity handover --handoff-file .continuity/HANDOFF.md`. It embeds your narrative at the top of the handoff, captures the work in progress, creates the successor worktree in this same checkout and environment (Hard rule 3), applies the uncommitted changes and copies the untracked files, releases this session's lease, and prints a `start` block plus a `next` instruction. It does **not** start a background session (v0.8; Hard rule 7).
+5. **Create the sidebar clone now**: call `mcp__ccd_session__start_session` with the printed `start.args`, unchanged (no `permission_mode`, `model` or `effort`; Hard rule 7). In a plain terminal, give the user the folder and the prompt as a copy-paste block instead. Report the real state (worktree, branch, successor name, the session id the tool returned), then stop working in this session.
 
 If `continuity handover` reports a launch failure, the handoff and worktree stay on disk and the session stays armed. Tell the user the exact reason and the folder to start `Session <Name> <next>` in.
 
@@ -223,13 +224,13 @@ Before compaction (at `continuity handover`, or at the PreCompact boundary as ba
 
 1. **Captures a detailed, lossless handoff.** On top of goal, instructions, Git branch/HEAD, working tree, diffstat, changed files, index, durable memories and transcript tail, it stores the **work in progress**: a full binary patch of every uncommitted tracked change against HEAD (`.continuity/handoffs/<stamp>-<session>.patch`), the list of untracked files, and the recent commits. Nothing in the predecessor's tree is staged, stashed or committed.
 2. **Creates a new git worktree for the successor** at `<main checkout>/.claude/worktrees/continuity-<label-slug>-session-<N>.<M+1>` (where Claude Code and the desktop app keep worktrees; a chain of successors stays side by side, never nested; the folder is added to `.git/info/exclude` if not already ignored), in the same environment as the predecessor (same machine, same main checkout; never a fresh clone or another machine), on branch `continuity/<label-slug>-session-<N>.<M+1>` (the successor's own version, written with its dot: `continuity/sitebooked-session-1.1`, then `-session-1.2`, `-session-1.3`), from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
-3. **Starts the successor in that worktree**, named **`Session <label> <N>.<M+1>`** (Claude Code: `claude --bg --name "Session <label> 1.1"`), with a bootstrap prompt that says, in substance:
+3. **Hands the agent the start of the successor as a sidebar clone** (Hard rules 3 and 7), named **`Session <label> <N>.<M+1>`**: the `start` block is a ready `mcp__ccd_session__start_session` call (cwd = the worktree, `use_worktree: false`, permission mode and settings inherited). The agent makes that call, so the successor appears in the desktop app's sidebar with the same permissions, permission mode, settings, env, tools, MCP servers, plugins, skills and folder access. Never as a background `claude --bg` session unless the session was armed with `--background-successor`. In a plain terminal the user opens the worktree folder and pastes the bootstrap prompt, which says, in substance:
 
    > You are `Session <label> 1.1`. You are picking up exactly where `Session <label> 1.0` (session id …) left off: it reached its context limit and handed its work to you just before compaction. Continue its goal; do not start over. Goal: … You are in a new git worktree at … on branch …; the predecessor's uncommitted changes were applied (or: how to apply them). Read the handoff fully, run `continuity resume` and `continuity orient`, verify, then tell the user in one line that `Session <label> 1.1` is continuing `Session <label> 1.0`'s work, and report readiness.
 
-4. **Tells the user** in the boundary alert: the successor's label, its worktree path and branch, whether the uncommitted work was applied, and how to attach (`claude --resume "Session <label> 1.1"` or `claude agents`).
+4. **Tells the user** in the boundary alert: the successor's label, its worktree path and branch, whether the uncommitted work was applied, and that it now appears in the sidebar (or which folder to open).
 
-**Workspace trust.** `claude --bg` refuses to start in a workspace the user has never trusted. A worktree inherits trust from its repository, so this works for any repo the user has opened in Claude before; in a never-opened repo the launch fails with Claude's own message. Continuity confirms the launch from `claude --bg`'s output (`backgrounded · <id>`); if that line is missing it reports the failure verbatim, keeps the handoff and the worktree, and restores the predecessor's lease. It never announces a successor that did not start.
+**Workspace trust (background mode only).** `claude --bg` refuses to start in a workspace the user has never trusted. A worktree inherits trust from its repository, so this works for any repo the user has opened in Claude before; in a never-opened repo the launch fails with Claude's own message. Continuity confirms the launch from `claude --bg`'s output (`backgrounded · <id>`); if that line is missing it reports the failure verbatim, keeps the handoff and the worktree, and restores the predecessor's lease. It never announces a successor that did not start.
 
 If the project isn't a Git repository with at least one commit, or the worktree can't be created, the successor starts in the project root instead and the alert and prompt say why. If the patch doesn't apply cleanly, the successor is told the exact `git apply` command for the saved patch. Never claim a worktree, an applied patch or a launched successor that the runtime did not report.
 
@@ -242,10 +243,8 @@ When all of these are true:
 - current host is local Claude Code;
 - Continuity is armed;
 - automatic successor is enabled;
-- the `claude` executable is available;
-- the environment is not marked remote;
 
-Continuity attempts to launch a **fresh named background Claude session in a new git worktree** at the boundary (see *Session chain and worktree successor*).
+Continuity creates the successor's **new git worktree in the same checkout and environment** at the boundary (see *Session chain and worktree successor*). The successor is a **visible sidebar clone** the user can reach from the desktop app and phone (Hard rule 7): the runtime prepares it and the agent starts it with `mcp__ccd_session__start_session`. The successor's own hooks recognise it by its title and inherit the chain (label, next number, goal, instructions, successor mode). `--background-successor` restores the old `claude --bg` launch for users who want it; it needs the `claude` executable and a non-remote environment.
 
 The successor receives a bootstrap prompt instructing it to:
 
@@ -257,13 +256,7 @@ The successor receives a bootstrap prompt instructing it to:
 6. verify project root, branch, HEAD, working tree, and relevant source;
 7. tell the user it is continuing the predecessor's work, and report readiness before modifying files.
 
-The predecessor alert includes the successor name and the command to attach:
-
-```bash
-claude --resume "Session <label> 1.1"
-```
-
-If background launch fails, Continuity preserves the handoff and restores predecessor ownership rather than pretending a successor exists.
+In background mode only, the predecessor alert includes the attach command (`claude --resume "Session <label> 1.1"`). If a background launch fails, Continuity preserves the handoff and restores predecessor ownership rather than pretending a successor exists.
 
 ### Codex
 
@@ -331,6 +324,14 @@ continuity status
 ```bash
 continuity disarm
 ```
+
+### Opt back into a background successor (not recommended)
+
+```bash
+continuity arm --host auto --goal "..." --background-successor
+```
+
+The successor then starts with `claude --bg`: it is hidden from the desktop app's sidebar and the phone until someone runs `claude attach <id>`.
 
 ### Arm without automatic successor launch
 
@@ -611,7 +612,7 @@ Do all of it in one go, in this order, and report each step's real result.
    ```
    A cloud session is a fresh checkout: anything not pushed is lost. If pushing isn't allowed, say so and attach the patch and handoff as files instead. Skip secrets and files that look like credentials, and name what you skipped.
 3. **Start the new session** labelled `Session <Name> 1.2`, **in this environment, in the worktree folder `$W`** (see *Same environment, same folders*):
-   - If the `claude` CLI exists in this environment, launch the successor here, from the worktree: `cd "$W" && claude --bg --name "Session <Name> 1.2" "<bootstrap prompt>"`. Confirm the launch from its output (`backgrounded · <id>`) and report that id. This is the default.
+   - Default: the successor runs **visibly, in this environment, in `$W`, with the same permissions and settings as this session** (Hard rules 3 and 7). When `mcp__ccd_session__start_session` exists (the Claude desktop app), call it yourself: `initiation: "user_asked"`, `title: "Session <Name> 1.2"`, `context: "fresh"`, `cwd: "$W"`, `use_worktree: false`, the bootstrap `prompt`, a short `background`, and no `permission_mode`/`model`/`effort` so it inherits this session's. It then shows in the sidebar as a clone. Otherwise give the user the folder path and the bootstrap prompt to paste into a new session opened on `$W`. Do **not** use `claude --bg` unless the user explicitly asks for a background session. A background session is invisible to the desktop app and the user's phone.
    - Only if no same-environment launch is possible, fall back to the options below, and tell the user it is a fallback that runs in a different environment, fetching branch `continuity/<name-slug>-session-1.2`:
    - If a session-creation tool exists (e.g. `create_session` in Claude Code on the web), create it on the same repository at branch `continuity/<name-slug>-session-1.2`, with title `Session <Name> 1.2` and the bootstrap prompt below. Report the new session's ID or link exactly as the tool returned it.
    - In the Claude desktop app's Code tab without the runtime, use the app's background-task tool if present (`spawn_task`): it opens a new session in its own fresh worktree from the base branch, so the bootstrap prompt must tell it to `git fetch` and check out `continuity/<name-slug>-session-1.2` (or apply the saved patch). Report the task id the tool returned.

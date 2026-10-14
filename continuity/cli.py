@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from .adapters import detect, structural_query
-from .boundary import arm_session, automatic_boundary_handoff, claim_generation, default_label, disarm_session, get_arm, launch_claude_successor, pending_successor, session_label, set_arm_status
+from .boundary import visible_start_instructions, arm_session, automatic_boundary_handoff, claim_generation, default_label, disarm_session, get_arm, launch_claude_successor, pending_successor, session_label, set_arm_status
 from .context import query_terms
 from .handoff import checkpoint_payload, ensure_state_dir, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
@@ -199,6 +199,7 @@ def cmd_arm(a) -> int:
         goal=goal,
         instructions=instructions,
         auto_successor=not a.no_auto_successor,
+        background_successor=bool(getattr(a, "background_successor", False)),
         inherited_from=inherited_from,
         label=label,
         generation=generation,
@@ -251,6 +252,8 @@ def cmd_handover(a) -> int:
     if not transfer.get("ok"):
         # Keep the PreCompact backstop armed; the handoff and its patch are already on disk.
         set_arm_status(st, ident.key, sid, "armed", launch_error=transfer.get("reason"))
+    if transfer.get("visible"):
+        transfer["next"] = visible_start_instructions(transfer)
     print(json.dumps({"handoff": str(path), **transfer}, indent=2, default=str))
     st.close()
     return 0 if transfer.get("ok") else 1
@@ -572,6 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--goal")
     s.add_argument("--instructions")
     s.add_argument("--no-auto-successor", action="store_true")
+    s.add_argument("--background-successor", action="store_true",
+                   help="Start the successor with `claude --bg` (hidden from the desktop app and phone). Default: a visible sidebar session")
     s.add_argument("--generation", help='This session\'s number when continuing a chain started elsewhere, e.g. "1.2"')
     s.add_argument("--context-window", type=int, help="Host context window in tokens (default: env CONTINUITY_CONTEXT_WINDOW, else a model-based guess)")
     s.add_argument("--handoff-at", type=float, help="Hand over when measured context reaches this fraction of the window (default 0.75)")

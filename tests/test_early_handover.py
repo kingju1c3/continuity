@@ -39,7 +39,8 @@ class EarlyHandoverTests(unittest.TestCase):
             ident = identity(root)
             st.ensure_project(ident.key, str(ident.root))
             st.acquire_lease(ident.key, sid, "claude")
-            arm_session(st, ident.key, sid, "claude", goal="ship it", label="FE", generation="1.1")
+            arm_session(st, ident.key, sid, "claude", goal="ship it", label="FE", generation="1.1",
+                        background_successor=arm_extra.pop("background_successor", True))
             if arm_extra:
                 from continuity.boundary import set_arm_status
                 set_arm_status(st, ident.key, sid, "armed", **arm_extra)

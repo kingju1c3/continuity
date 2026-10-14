@@ -27,7 +27,7 @@ class HookTests(unittest.TestCase):
             code = run_hook(host)
         return code, out.getvalue(), err.getvalue()
 
-    def arm(self, root: Path, home: str, sid="s1", host="claude", auto=True):
+    def arm(self, root: Path, home: str, sid="s1", host="claude", auto=True, background=True):
         with patch.dict(os.environ, {"HOME": home}):
             st = Store.default()
             ident = identity(root)
@@ -39,6 +39,7 @@ class HookTests(unittest.TestCase):
                 goal="finish the current feature",
                 instructions="preserve current behavior",
                 auto_successor=auto,
+                background_successor=background,
             )
             st.close()
 
@@ -163,6 +164,32 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(get_arm(st, ident.key, "s1")["status"], "transferred")
                 pending = st.get_state(ident.key, "successor_pending")
                 self.assertEqual(pending["status"], "launched")
+                self.assertIsNone(st.active_lease(ident.key))
+                st.close()
+
+    def test_default_successor_is_a_visible_sidebar_clone_not_claude_bg(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            self.enabled_project(root)
+            with patch.dict(os.environ, {"HOME": home}):
+                self.run_event(root, {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"})
+                self.arm(root, home, background=False)
+                with patch("continuity.boundary.shutil.which", return_value=None), patch(
+                    "continuity.boundary._spawn_background") as spawn:
+                    _, out, _ = self.run_event(root, {"hook_event_name": "PreCompact", "session_id": "s1", "trigger": "auto"})
+                spawn.assert_not_called()
+                reason = json.loads(out)["reason"]
+                self.assertIn("mcp__ccd_session__start_session", reason)
+                self.assertIn('"use_worktree": false', reason)
+                self.assertNotIn("permission_mode\"", reason)
+                self.assertIn("Never use `claude --bg`", reason)
+                st = Store.default()
+                ident = identity(root)
+                self.assertEqual(get_arm(st, ident.key, "s1")["status"], "transferred")
+                pending = st.get_state(ident.key, "successor_pending")
+                self.assertEqual(pending["status"], "pending")  # the successor inherits it when it arms
+                self.assertTrue(pending["visible"])
+                self.assertEqual(pending["start"]["args"]["initiation"], "user_asked")
                 self.assertIsNone(st.active_lease(ident.key))
                 st.close()
 

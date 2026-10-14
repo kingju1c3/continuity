@@ -72,7 +72,7 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:48] or "session"
 
 
-def arm_session(store: Store, project_key: str, session_id: str, host: str, *, goal: str = "", instructions: str = "", auto_successor: bool = True, inherited_from: str | None = None, label: str = "", generation: str = "1.0") -> dict:
+def arm_session(store: Store, project_key: str, session_id: str, host: str, *, goal: str = "", instructions: str = "", auto_successor: bool = True, inherited_from: str | None = None, label: str = "", generation: str = "1.0", background_successor: bool = False) -> dict:
     state = {
         "schema": 1,
         "status": "armed",
@@ -81,6 +81,7 @@ def arm_session(store: Store, project_key: str, session_id: str, host: str, *, g
         "goal": goal,
         "instructions": instructions,
         "auto_successor": bool(auto_successor),
+        "background_successor": bool(background_successor),
         "armed_at": int(time.time()),
         "inherited_from": inherited_from,
         "label": label,
@@ -448,7 +449,9 @@ def _spawn_background(argv: list[str], cwd: Path, timeout: float = 15.0):
                               text=True, timeout=timeout, start_new_session=True)
     except subprocess.TimeoutExpired as exc:
         raise OSError(f"claude --bg did not confirm a launch within {timeout:.0f}s") from exc
-    out = (done.stdout or "") + (done.stderr or "")
+    # Strip ANSI colour codes: `claude --bg` colours its "backgrounded · <id>" line, which once made a real
+    # launch read as a failure and handed the lease back to the predecessor while the successor ran.
+    out = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", (done.stdout or "") + (done.stderr or ""))
     m = re.search(r"backgrounded\s*\S\s*([0-9a-f]{6,})", out)
     if done.returncode != 0 or not m:
         raise OSError("claude --bg failed: " + (" ".join(out.split())[:300] or f"exit {done.returncode}"))
@@ -457,9 +460,10 @@ def _spawn_background(argv: list[str], cwd: Path, timeout: float = 15.0):
 
 def launch_claude_successor(store: Store, ident, *, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path) -> dict:
     exe = shutil.which("claude")
-    if not exe:
+    background = bool(arm.get("background_successor"))
+    if background and not exe:
         return {"ok": False, "reason": "claude executable not found"}
-    if str(os.getenv("CLAUDE_CODE_REMOTE", "")).lower() in {"1", "true", "yes"}:
+    if background and str(os.getenv("CLAUDE_CODE_REMOTE", "")).lower() in {"1", "true", "yes"}:
         return {"ok": False, "reason": "remote Claude environment; local background launch disabled"}
 
     label = str(arm.get("label") or default_label(ident.root))
@@ -502,6 +506,7 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
         "handoff_id": handoff_id, "handoff_path": str(handoff_path),
         "goal": arm.get("goal", ""), "instructions": arm.get("instructions", ""),
         "auto_successor": bool(arm.get("auto_successor", True)), "created_at": int(time.time()),
+        "background_successor": background,
     }
     # The successor's hooks see the worktree as its own project, so the transfer is offered there as well.
     succ_key = identity(cwd).key
@@ -514,6 +519,21 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
             store.ensure_project(succ_key, str(cwd))
             store.add_handoff(succ_key, predecessor_session, {k: v for k, v in latest.items() if not k.startswith("_")})
     store.release_lease(ident.key, predecessor_session)
+
+    result = {"ok": True, "successor_name": name, "worktree": tree.get("path", ""), "worktree_branch": tree.get("branch", ""),
+              "worktree_note": tree.get("reason", "") if not tree.get("ok") else f"uncommitted changes {tree['wip']}"}
+    if not background:
+        # Default: a VISIBLE successor. A hook can't open a desktop-app session, so the runtime prepares the
+        # clone (worktree + handoff) and hands the agent the exact start call; `claude --bg` sessions don't
+        # show in the app sidebar or on the phone, which once left the user unable to reach their lead.
+        start = visible_start(name, previous, cwd, prompt)
+        # Stays "pending" so the successor inherits it when it arms; `visible` marks who starts it.
+        pending.update({"visible": True, "start": start})
+        store.set_state(ident.key, "successor_pending", pending)
+        if succ_key != ident.key:
+            store.set_state(succ_key, "successor_pending", pending)
+        set_arm_status(store, ident.key, predecessor_session, "transferred", successor_name=name)
+        return {**result, "visible": True, "start": start}
 
     try:
         proc = _spawn_background([exe, "--bg", "--name", name, prompt], cwd)
@@ -535,8 +555,41 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
         if isinstance(current, dict) and current.get("status") == "pending":
             store.set_state(succ_key, "successor_pending", {**current, "status": "launched", "pid": proc.pid})
     set_arm_status(store, ident.key, predecessor_session, "transferred", successor_name=name)
-    return {"ok": True, "successor_name": name, "pid": proc.pid, "worktree": tree.get("path", ""), "worktree_branch": tree.get("branch", ""),
-            "worktree_note": tree.get("reason", "") if not tree.get("ok") else f"uncommitted changes {tree['wip']}"}
+    return {**result, "pid": proc.pid}
+
+
+def visible_start(name: str, previous: str, cwd: Path, prompt: str) -> dict:
+    """The exact call that opens the successor as a sidebar session in the Claude desktop app: a clone of the
+    predecessor in the new worktree. permission_mode, model and effort are omitted on purpose so the app
+    gives it the predecessor's own; use_worktree=false keeps it in the prepared folder instead of a new one."""
+    return {
+        "tool": "mcp__ccd_session__start_session",
+        "args": {
+            "initiation": "user_asked",
+            "title": name,
+            "context": "fresh",
+            "cwd": str(cwd),
+            "use_worktree": False,
+            "prompt": prompt,
+            "background": (f"{name} continues {previous}, which handed over before compaction. Its lossless handoff is "
+                           f".continuity/LATEST.md in {cwd}, which also says how the predecessor's uncommitted work was carried over."),
+        },
+        "folder": str(cwd),
+    }
+
+
+def visible_start_instructions(transfer: dict) -> str:
+    """What the agent must do next when the successor is visible-by-default (shared by the hooks and the CLI)."""
+    start = transfer.get("start") or {}
+    return (
+        f"START {transfer.get('successor_name')} NOW as a visible session, in this turn. In the Claude desktop app, call "
+        f"{start.get('tool')} with exactly these arguments (do not add permission_mode, model or effort: omitting them "
+        f"makes it a clone with this session's permissions and settings): {json.dumps(start.get('args'))}. "
+        "Arming /continuity is the user's standing request for this successor. If that tool isn't available "
+        f"(terminal), tell the user to open {start.get('folder')} in the desktop app's Code tab (or run `claude` there) "
+        "and give them the prompt above as a copy-paste block. Never use `claude --bg`. Report the session id the tool "
+        "returns, then stop working in this session."
+    )
 
 
 def stage_manual_successor(store: Store, ident, *, host: str, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path, command: str) -> dict:
@@ -685,6 +738,7 @@ def inherit_pending_successor(store: Store, ident, *, host: str, session_id: str
         store, ident.key, session_id, host,
         goal=str(pending.get("goal") or ""), instructions=str(pending.get("instructions") or ""),
         auto_successor=bool(pending.get("auto_successor", True)),
+        background_successor=bool(pending.get("background_successor", False)),
         inherited_from=str(pending.get("predecessor_session") or ""),
         label=str(pending.get("label") or ""), generation=str(pending.get("generation") or "1.0"),
     )

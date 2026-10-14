@@ -97,6 +97,15 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## The successor is a visible sidebar clone — v0.8
+
+v0.7 started the successor with `claude --bg`. A background session doesn't appear in the Claude desktop app's sidebar or on the phone, so on 2026-10-14 a team lead ran for hours that its user couldn't reach. v0.8:
+
+- **No more `claude --bg` by default.** `continuity handover` and the PreCompact backstop prepare the clone (worktree in the same checkout, carried-over work, handoff), release the lease, and print a `start` block: a ready `mcp__ccd_session__start_session` call with `cwd` set to the new worktree, `use_worktree: false`, and no permission/model/effort override, so the successor inherits the predecessor's permissions and settings.
+- **The agent makes that call** in the desktop app, and the successor appears in the sidebar as `Session <label> <next>`. Its title matches the pending transfer, so it inherits the chain. In a plain terminal the user gets the folder and a copy-paste prompt.
+- **`--background-successor`** restores the old launch for anyone who wants it, and the choice carries down the chain.
+- **Fix:** `claude --bg` colours its `backgrounded · <id>` line. The ANSI codes made a real launch read as a failure, which handed the lease back to the predecessor while the successor ran. The output is now stripped before parsing.
+
 ## Hand over before compaction, on measured usage — v0.7
 
 v0.6 transferred at the PreCompact hook, which is the last possible moment and comes too late for the agent to write its own handoff. v0.7 hands over earlier:
