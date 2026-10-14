@@ -100,8 +100,10 @@ continuity arm \
   --goal "<current user objective in one concise sentence>" \
   --instructions "<critical constraints that must survive the handoff>" \
   --label "<short name for this line of work, e.g. SiteBooked>" \
-  [--context-window <tokens>] [--handoff-at 0.75]
+  [--context-window <tokens>] [--handoff-at 0.75] [--generation 1.2]
 ```
+
+Pass `--generation` when this session continues a chain that started elsewhere (a cloud session, a hand-started successor): it is told its label, e.g. "You are Session FE 1.2", so arm with `--label FE --generation 1.2` and its successor becomes 1.3.
 
 Pass `--context-window` when the host's real context window is known (for example `1000000` for a 1M-context model). Without it the runtime uses `CONTINUITY_CONTEXT_WINDOW` if set, otherwise 1M when the model id says `[1m]` or measured usage has already passed 200k, otherwise 200k. A window that is too small hands over early, which is the safe direction. `--handoff-at` is the fraction of the window at which the hand-over starts (default 0.75).
 

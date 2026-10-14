@@ -118,5 +118,18 @@ class EarlyHandoverTests(unittest.TestCase):
                 st.close()
 
 
+    def test_arm_generation_continues_a_chain_started_elsewhere(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project).resolve()
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            with patch.dict(os.environ, {"HOME": home, "CLAUDE_CODE_SESSION_ID": "s9"}), redirect_stdout(io.StringIO()):
+                for argv in (["arm", "--label", "FE"], ["arm", "--label", "FE", "--generation", "1.2"]):
+                    a = build_parser().parse_args(["--path", str(root), *argv])
+                    self.assertEqual(a.fn(a), 0)
+                st = Store.default()
+                self.assertEqual(get_arm(st, identity(root).key, "s9")["generation"], "1.2")
+                st.close()
+
+
 if __name__ == "__main__":
     unittest.main()

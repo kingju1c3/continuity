@@ -177,6 +177,10 @@ def cmd_arm(a) -> int:
         if prior_instructions:
             instructions = prior_instructions + (("\n" + instructions) if instructions else "")
         inherited_from = str(pending.get("predecessor_session") or "") or None
+    elif getattr(a, "generation", None):
+        # Continuing a chain that started elsewhere (a cloud session, another checkout): take the stated number,
+        # still never one already issued here.
+        generation = claim_generation(st, ident.key, label, a.generation)
     elif not existing_arm:
         # A new instance (this session id never armed): never reuse a number
         # already issued under this label. A re-arm keeps its own number.
@@ -213,7 +217,7 @@ def cmd_arm(a) -> int:
         st.set_state(ident.key, "successor_pending", pending)
     print(
         f"Continuity armed as {session_label(label, generation)}. It will remain passive during ordinary turns and trigger at the "
-        "host PreCompact boundary before compaction.\n"
+        "hand-over threshold (measured context), with the host PreCompact hook as backstop.\n"
         + json.dumps(state, indent=2, sort_keys=True)
     )
     st.close()
@@ -568,6 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--goal")
     s.add_argument("--instructions")
     s.add_argument("--no-auto-successor", action="store_true")
+    s.add_argument("--generation", help='This session\'s number when continuing a chain started elsewhere, e.g. "1.2"')
     s.add_argument("--context-window", type=int, help="Host context window in tokens (default: env CONTINUITY_CONTEXT_WINDOW, else a model-based guess)")
     s.add_argument("--handoff-at", type=float, help="Hand over when measured context reaches this fraction of the window (default 0.75)")
     s.add_argument("--label", help='Name for the session chain, e.g. "SiteBooked". Sessions are labelled "Session <label> 1.0", then 1.1, 1.2 ...')
