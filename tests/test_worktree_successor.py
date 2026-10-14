@@ -62,7 +62,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
             root = self.repo(Path(base))
             self.run_event(root, {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"})
             st = Store.default()
-            arm_session(st, identity(root).key, "s1", "claude", goal="ship the booking chat", instructions="no PRs", label="SiteBooked")
+            arm_session(st, identity(root).key, "s1", "claude", goal="ship the booking chat", instructions="no PRs", label="SiteBooked", background_successor=True)
             st.close()
             # Uncommitted work the successor must not lose: a tracked edit and a new file.
             (root / "app.py").write_text("print('v2 in progress')\n")
@@ -123,7 +123,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
             (root / ".continuity" / "enabled.json").write_text('{"schema":1,"enabled":true}')
             self.run_event(root, {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"})
             st = Store.default()
-            arm_session(st, identity(root).key, "s1", "claude", goal="g")
+            arm_session(st, identity(root).key, "s1", "claude", goal="g", background_successor=True)
             st.close()
             payload, popen = self.precompact(root, "s1")
             argv, cwd = popen.call_args.args
@@ -137,6 +137,12 @@ if __name__ == "__main__":
 
 
 class SpawnBackgroundTests(unittest.TestCase):
+    def test_coloured_backgrounded_line_is_a_launch(self):
+        from continuity.boundary import _spawn_background
+        with TemporaryDirectory() as d:
+            got = _spawn_background(["sh", "-c", "printf 'backgrounded \\033[2m·\033[0m \\033[1m766c5fba\\033[0m · Session H 1.5\\n'"], Path(d))
+        self.assertEqual(got.pid, "766c5fba")
+
     def test_confirms_a_real_backgrounded_session(self):
         from continuity.boundary import _spawn_background
         with TemporaryDirectory() as d:

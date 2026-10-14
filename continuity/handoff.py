@@ -44,6 +44,9 @@ def render_markdown(p: dict) -> str:
     def s(k: str) -> str:
         return str(p.get(k) or "(none recorded)")
 
+    agent = ""
+    if str(p.get("agent_handoff") or "").strip():
+        agent = "## Agent Handoff (lossless narrative, written by the predecessor before compaction)\n\n" + str(p["agent_handoff"]).strip() + "\n\n"
     text = f"""# Continuity Handoff
 
 - Created: {p.get('created_at')}
@@ -55,7 +58,7 @@ def render_markdown(p: dict) -> str:
 - Branch: {git.get('branch') or '(detached/unknown)'}
 - HEAD: {git.get('head') or '(unknown)'}
 
-## Goal
+{agent}## Goal
 {s('goal')}
 
 ## Instructions / Constraints

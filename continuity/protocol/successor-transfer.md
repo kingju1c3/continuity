@@ -4,19 +4,20 @@ The objective is a **fresh context** that resumes from durable evidence rather t
 
 ## Claude Code
 
-When a local Claude executable is available and automatic successor launch is enabled, Continuity launches a named background session:
+By default (v0.8) the successor is a **visible sidebar clone**. Continuity prepares the worktree, carries the work over, writes the handoff, releases the predecessor's lease, and returns a `start` block:
 
-```text
-claude --bg --name <continuity-name> <bootstrap prompt>
+```json
+{"tool": "mcp__ccd_session__start_session",
+ "args": {"initiation": "user_asked", "title": "Session <label> <next>", "context": "fresh",
+          "cwd": "<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>",
+          "use_worktree": false, "prompt": "<bootstrap prompt>", "background": "..."}}
 ```
+
+The agent makes that call in the Claude desktop app. `permission_mode`, `model` and `effort` are left out on purpose so the successor inherits the predecessor's. The successor's title matches `successor_name`, so its SessionStart hook inherits the chain. In a plain terminal the user opens the folder and pastes the prompt.
 
 The bootstrap prompt invokes /continuity and requires verification before file edits.
 
-The predecessor receives the attach command:
-
-```bash
-claude --resume <continuity-name>
-```
+Opt-in only (`continuity arm --background-successor`): the old background launch, `claude --bg --name <continuity-name> <bootstrap prompt>`, attached with `claude --resume <continuity-name>`. Background sessions don't appear in the desktop app's sidebar or on the phone.
 
 A pending successor record binds predecessor session, successor name, handoff ID/path, goal/instructions, and creation time.
 
@@ -82,3 +83,7 @@ A handoff is historical evidence, not current authority.
 ## Worktree successor and session chain (v0.4)
 
 At the PreCompact boundary the Claude successor is started in a **new git worktree** (`<project>-continuity/<label-slug>-<N>-<M>`, branch `continuity/<label-slug>-<N>-<M>`) created from the predecessor's HEAD, with the predecessor's uncommitted work applied from the lossless patch and its untracked files copied. Sessions in one chain are labelled `Session <label> 1.0`, `1.1`, `1.2`, …; the label comes from `continuity arm --label` (default: the project folder name) and the successor inherits it with the next number. The bootstrap prompt tells the successor it is picking up exactly where the named predecessor left off. Without a Git repository the successor starts in the project root, and the alert says so.
+
+### Same environment, same folders (v0.6.0)
+
+Worktree creation happens in the predecessor's own environment: the same machine or container, inside the same main checkout, at `<main checkout>/.claude/worktrees/continuity-<label-slug>-session-<N>.<M+1>`. Never in a fresh clone, a temporary directory or another container. The successor is launched there too, so it inherits the checkout, installed dependencies, caches and in-flight test output. This applies in cloud mode as well: when the `claude` CLI is present, the successor is launched with `claude --bg` from the worktree folder. A new container (`create_session`), a desktop background task (`spawn_task`) or a new chat is a fallback, used only when no same-environment launch is possible, and the user is told it is a fallback.

@@ -2,7 +2,11 @@
 
 Compaction is treated as a transfer boundary, not merely a summarization event.
 
-## Before compaction
+## Early hand-over (primary, v0.7)
+
+Before PreCompact is ever reached, the UserPromptSubmit and PostToolUse hooks measure the session's context size from its transcript. At the threshold (default 75% of the window) they alert the user ("⚠️ Compaction is imminent — creating a new git worktree … in this same checkout") and tell the agent to write `.continuity/HANDOFF.md` and run `continuity handover --handoff-file .continuity/HANDOFF.md`. That command performs steps 3–9 below with the agent's narrative embedded, creating the successor worktree in the same main checkout and starting the successor there, all before compaction. PreCompact remains the backstop.
+
+## Before compaction (backstop)
 
 For an **armed** session, PreCompact triggers this sequence:
 

@@ -97,6 +97,24 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## The successor is a visible sidebar clone — v0.8
+
+v0.7 started the successor with `claude --bg`. A background session doesn't appear in the Claude desktop app's sidebar or on the phone, so on 2026-10-14 a team lead ran for hours that its user couldn't reach. v0.8:
+
+- **No more `claude --bg` by default.** `continuity handover` and the PreCompact backstop prepare the clone (worktree in the same checkout, carried-over work, handoff), release the lease, and print a `start` block: a ready `mcp__ccd_session__start_session` call with `cwd` set to the new worktree, `use_worktree: false`, and no permission/model/effort override, so the successor inherits the predecessor's permissions and settings.
+- **The agent makes that call** in the desktop app, and the successor appears in the sidebar as `Session <label> <next>`. Its title matches the pending transfer, so it inherits the chain. In a plain terminal the user gets the folder and a copy-paste prompt.
+- **`--background-successor`** restores the old launch for anyone who wants it, and the choice carries down the chain.
+- **Fix:** `claude --bg` colours its `backgrounded · <id>` line. The ANSI codes made a real launch read as a failure, which handed the lease back to the predecessor while the successor ran. The output is now stripped before parsing.
+
+## Hand over before compaction, on measured usage — v0.7
+
+v0.6 transferred at the PreCompact hook, which is the last possible moment and comes too late for the agent to write its own handoff. v0.7 hands over earlier:
+
+- **Measured trigger.** On each user prompt and each edit/shell tool call, the hook reads the session transcript and measures the context size (the prompt tokens of the last main-thread turn). At 75% of the window (`continuity arm --context-window N --handoff-at 0.75`, or `CONTINUITY_CONTEXT_WINDOW`) it shows the user **"⚠️ Compaction is imminent — … creating a new git worktree … in this same checkout"** and tells the agent to hand over now.
+- **`continuity handover --handoff-file .continuity/HANDOFF.md`.** The agent writes the lossless narrative (decisions and reasons, open threads, verified vs. assumed state, next action), and the command embeds it at the top of the handoff, captures every uncommitted and untracked change, creates the successor worktree at `<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>`, and starts the successor there with `claude --bg`. All of that happens before compaction.
+- **PreCompact stays as the backstop.** If the early trigger never fired (unreadable transcript, a window set too large), the hook still transfers mechanically before compaction.
+- **Hard rules** at the top of `SKILL.md`: hand over before compaction; alert the user first; same environment and same folders; lossless; report only what happened; one owner.
+
 ## Compaction alert and versioned worktree branches — v0.6
 
 Found in a real cloud session (KJN FE). It compacted without a hand-over because the cloud rule said only "when the conversation has grown long".
