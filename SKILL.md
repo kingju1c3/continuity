@@ -1,6 +1,6 @@
 ---
 name: continuity
-description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled with a unique sequential identifier ('Session FE 1.1', '1.2'…) Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and hands over to a new labelled session before compaction, with work in progress pushed to a worktree branch. Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
+description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled with a unique sequential identifier ('Session FE 1.1', '1.2'…) Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and, on concrete triggers, alerts 'Compaction is imminent' and hands over to the next sequential session (1.1, 1.2…) on a new worktree branch named for that version (e.g. continuity/fe-session-1.1). Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
 hooks:
   UserPromptSubmit:
     - hooks:
@@ -19,7 +19,7 @@ hooks:
         - type: command
           command: "if command -v continuity >/dev/null 2>&1; then continuity hook --host claude; fi"
           timeout: 25
-          statusMessage: "Continuity: compaction boundary reached — preparing successor handoff…"
+          statusMessage: "Continuity: COMPACTION IMMINENT — creating the successor worktree as the handoff…"
   PostCompact:
     - matcher: "manual|auto"
       hooks:
@@ -146,7 +146,7 @@ When an armed session reaches PreCompact, Continuity must alert the user before 
 
 The alert should communicate:
 
-> Continuity handoff boundary reached: compaction is about to occur. A detailed handoff is being captured and work is transferring to a fresh successor session.
+> COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. A detailed handoff was captured, a new git worktree was created as the handoff (branch `continuity/<label-slug>-session-<N>.<M+1>`), and work is transferring to the fresh successor `Session <Name> <N>.<M+1>`.
 
 Where supported, the hook also emits a terminal notification/bell.
 
@@ -195,7 +195,7 @@ Read `continuity/protocol/checkpoint-handoff.md`.
 Before compaction (at the PreCompact boundary), Continuity always:
 
 1. **Captures a detailed, lossless handoff.** On top of goal, instructions, Git branch/HEAD, working tree, diffstat, changed files, index, durable memories and transcript tail, it stores the **work in progress**: a full binary patch of every uncommitted tracked change against HEAD (`.continuity/handoffs/<stamp>-<session>.patch`), the list of untracked files, and the recent commits. Nothing in the predecessor's tree is staged, stashed or committed.
-2. **Creates a new git worktree for the successor** at `<main checkout>/.claude/worktrees/continuity-<label-slug>-<N>-<M>` (where Claude Code and the desktop app keep worktrees; a chain of successors stays side by side, never nested; the folder is added to `.git/info/exclude` if not already ignored), on branch `continuity/<label-slug>-<N>-<M>`, from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
+2. **Creates a new git worktree for the successor** at `<main checkout>/.claude/worktrees/continuity-<label-slug>-session-<N>.<M+1>` (where Claude Code and the desktop app keep worktrees; a chain of successors stays side by side, never nested; the folder is added to `.git/info/exclude` if not already ignored), on branch `continuity/<label-slug>-session-<N>.<M+1>` (the successor's own version, written with its dot: `continuity/sitebooked-session-1.1`, then `-session-1.2`, `-session-1.3`), from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
 3. **Starts the successor in that worktree**, named **`Session <label> <N>.<M+1>`** (Claude Code: `claude --bg --name "Session <label> 1.1"`), with a bootstrap prompt that says, in substance:
 
    > You are `Session <label> 1.1`. You are picking up exactly where `Session <label> 1.0` (session id …) left off: it reached its context limit and handed its work to you just before compaction. Continue its goal; do not start over. Goal: … You are in a new git worktree at … on branch …; the predecessor's uncommitted changes were applied (or: how to apply them). Read the handoff fully, run `continuity resume` and `continuity orient`, verify, then tell the user in one line that `Session <label> 1.1` is continuing `Session <label> 1.0`'s work, and report readiness.
@@ -515,7 +515,32 @@ No commentary on ordinary turns. Write or update the handoff only at a milestone
 - a discovered blocker or changed plan;
 - before the user steps away or before handing off to scheduled/unattended work;
 - when the user asks;
-- **before compaction**: when the conversation has grown long enough that fidelity is at risk (many large tool outputs, many turns, repeated reconnects, a host warning about context). Warn the user, then run the **Hand-over** below. Before degradation, never after.
+- **before compaction**: see **Pre-compaction hand-over is mandatory** below. Before degradation, never after.
+
+### Pre-compaction hand-over is mandatory
+
+A cloud host compacts without warning, so waiting for "it feels long" fails: the context is summarized and the successor never exists. Treat the hand-over as a hard rule with concrete triggers.
+
+**Triggers.** Hand over as soon as ANY of these is true. Count from invocation, or from the last hand-over:
+
+1. The host shows any notice about context, conversation length or compaction.
+2. About **120 tool calls**, or about **40 user turns**.
+3. About **25 large tool outputs** (full logs, whole files, test-suite dumps over ~200 lines each).
+4. The user says they are stepping away while long work continues (CI watching, long test runs).
+
+These numbers are conservative defaults, not measurements. The host exposes no context percentage, so never claim one. When in doubt, hand over early: a spare hand-over costs minutes, and a missed one loses the session.
+
+**Safety net (do it at invocation and at every milestone).** Commit and push work in progress so a surprise compaction loses nothing. If the project uses a feature branch, pushing it is enough. Otherwise use the successor branch `continuity/<name-slug>-session-<next>`. Update the handoff doc at the same time.
+
+**Alert first, in exactly this form, before any hand-over step:**
+
+> ⚠️ **Compaction is imminent.** I'm creating a new git worktree as the handoff: branch `continuity/<name-slug>-session-<next>` (for example `continuity/fe-session-1.1`). It holds every uncommitted change and the handoff `<handoff file name>`. **Session <Name> <next>** will continue from it. Please don't start new work in this session after this.
+
+Then run **Hand-over to a new session** below, in the same turn, without waiting for a reply.
+
+**Version labels.** The successor's version is the next sequential number after this session's: 1.0 → 1.1 → 1.2 → 1.3. The same number appears in three places: the session title (`Session FE 1.1`), the branch (`continuity/fe-session-1.1`) and the worktree folder (`.claude/worktrees/continuity-fe-session-1.1`). Never skip a number, and never reuse one (see *On invocation*, step 3).
+
+**If compaction already happened** (the conversation opens with a summary that says it was continued from an earlier, longer one): tell the user in the first line that compaction occurred before a hand-over, then run the alert and the hand-over above before taking on new work. Finishing a step already in flight (a push, a CI fix) is fine.
 
 ### Hand-over to a new session (before compaction)
 
@@ -524,7 +549,7 @@ Do all of it in one go, in this order, and report each step's real result.
 1. **Write the lossless handoff** (format below), labelled for both sides: "from `Session <Name> 1.1` to `Session <Name> 1.2`". Lossless means a fresh session could continue with no access to this conversation: every decision and its reason, every open thread, exact file paths, commands, IDs, URLs, versions, test results with numbers, what was verified versus assumed, the user's standing preferences and corrections, and the exact next action.
 2. **Preserve all work in progress on a new worktree branch** (Git projects). Never stage, stash, commit or reset in the current tree:
    ```bash
-   N="<name-slug>-1-2"                                  # next label, dots → dashes
+   N="<name-slug>-session-1.2"                          # the successor's version, dot kept: 1.1, 1.2, 1.3 …
    MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"   # main checkout, so worktrees never nest
    W="$MAIN/.claude/worktrees/continuity-$N"
    git check-ignore -q "$MAIN/.claude/worktrees/x" || echo ".claude/worktrees/" >> "$(git rev-parse --git-common-dir)/info/exclude"
@@ -540,12 +565,12 @@ Do all of it in one go, in this order, and report each step's real result.
    ```
    A cloud session is a fresh checkout: anything not pushed is lost. If pushing isn't allowed, say so and attach the patch and handoff as files instead. Skip secrets and files that look like credentials, and name what you skipped.
 3. **Start the new session** labelled `Session <Name> 1.2`:
-   - If a session-creation tool exists (e.g. `create_session` in Claude Code on the web), create it on the same repository at branch `continuity/<name-slug>-1-2`, with title `Session <Name> 1.2` and the bootstrap prompt below. Report the new session's ID or link exactly as the tool returned it.
-   - In the Claude desktop app's Code tab without the runtime, use the app's background-task tool if present (`spawn_task`): it opens a new session in its own fresh worktree from the base branch, so the bootstrap prompt must tell it to `git fetch` and check out `continuity/<name-slug>-1-2` (or apply the saved patch). Report the task id the tool returned.
+   - If a session-creation tool exists (e.g. `create_session` in Claude Code on the web), create it on the same repository at branch `continuity/<name-slug>-session-1.2`, with title `Session <Name> 1.2` and the bootstrap prompt below. Report the new session's ID or link exactly as the tool returned it.
+   - In the Claude desktop app's Code tab without the runtime, use the app's background-task tool if present (`spawn_task`): it opens a new session in its own fresh worktree from the base branch, so the bootstrap prompt must tell it to `git fetch` and check out `continuity/<name-slug>-session-1.2` (or apply the saved patch). Report the task id the tool returned.
    - If no such tool exists (Claude app chats), give the user the bootstrap prompt in a copyable block and ask them to start a new chat (same Project, if any) and paste it. Suggest naming that chat `Session <Name> 1.2`.
    - Never say a session was started unless the tool returned it.
 4. **Bootstrap prompt** for the new session (fill in every field):
-   > You are **Session <Name> 1.2**. You are picking up exactly where **Session <Name> 1.1** left off: it reached its context limit and handed its work to you before compaction. Continue its goal; do not start over. Goal: … Handoff: `<path or doc name>` (read it fully). Code: branch `continuity/<name-slug>-1-2` (the previous session's uncommitted work is committed there; the original branch was `<branch>` at `<HEAD>`). Invoke `/continuity` (it will pick cloud mode), verify the handoff against live state, then tell the user in one line that Session <Name> 1.2 is continuing session 1.1's work, and report readiness before changing anything.
+   > You are **Session <Name> 1.2**. You are picking up exactly where **Session <Name> 1.1** left off: it reached its context limit and handed its work to you before compaction. Continue its goal; do not start over. Goal: … Handoff: `<path or doc name>` (read it fully). Code: branch `continuity/<name-slug>-session-1.2` (the previous session's uncommitted work is committed there; the original branch was `<branch>` at `<HEAD>`). Invoke `/continuity` (it will pick cloud mode), verify the handoff against live state, then tell the user in one line that Session <Name> 1.2 is continuing session 1.1's work, and report readiness before changing anything.
 5. **Close out here.** Tell the user in one or two lines: the new session's label (and link/ID if created), the branch holding the work, the handoff's name, and that further work should happen in the new session. Don't keep editing in the predecessor after the hand-over.
 
 ### Handoff format
