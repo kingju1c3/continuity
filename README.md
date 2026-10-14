@@ -97,12 +97,21 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## Compaction alert and versioned worktree branches — v0.6
+
+Found in a real cloud session (KJN FE). It compacted without a hand-over because the cloud rule said only "when the conversation has grown long".
+
+- **Mandatory pre-compaction hand-over in cloud mode.** There are concrete triggers: any host context notice, about 120 tool calls, about 40 user turns, or about 25 large outputs since the last hand-over. These are conservative defaults, not measurements. Work in progress is also pushed at invocation and at every milestone, so a surprise compaction loses nothing.
+- **Alert first.** The alert reads: "⚠️ Compaction is imminent. I'm creating a new git worktree as the handoff: branch `continuity/<name>-session-<next>` …". The local PreCompact alert now opens with `COMPACTION IMMINENT` and says the worktree was created as the handoff.
+- **Branches carry the version.** The successor's branch and worktree are `continuity/<label>-session-1.1` and `.claude/worktrees/continuity-<label>-session-1.1`, then 1.2, 1.3 … They were `…-1-1`. The same number appears in the session title, the branch and the folder.
+- **Compaction already happened?** The next turn says so in its first line, then hands over before taking on new work.
+
 ## Worktree successor and session chain — v0.4
 
 Before compaction, Continuity now starts the successor in a **new git worktree** and tells it plainly that it is picking up where the last session left off.
 
 - **Lossless handoff.** Besides goal, constraints, Git state, index, memories and transcript tail, the boundary handoff stores a full binary patch of every uncommitted change, the untracked-file list and recent commits. Nothing in your tree is staged, stashed or committed.
-- **New worktree.** `<main checkout>/.claude/worktrees/continuity-<label>-1-1` (since v0.4.1) on branch `continuity/<label>-1-1`, from your HEAD, with the patch applied and untracked files copied. Your own tree is untouched; merge the branch back when done.
+- **New worktree.** `<main checkout>/.claude/worktrees/continuity-<label>-session-1.1` (since v0.4.1; versioned name since v0.6) on branch `continuity/<label>-session-1.1`, from your HEAD, with the patch applied and untracked files copied. Your own tree is untouched; merge the branch back when done.
 - **Session chain labels.** `continuity arm --label "SiteBooked"` makes this session `Session SiteBooked 1.0`; successors are `Session SiteBooked 1.1`, `1.2`, `1.3` … (default label: the project folder name). Identifiers are unique per project: a number issued under a label is never reused, so a second `FE` chain (or `FE` armed again later) continues at the next free number instead of a second `1.0`.
 - **Explicit hand-over.** The successor's first prompt: "You are Session SiteBooked 1.1. You are picking up exactly where Session SiteBooked 1.0 left off…", followed by the goal, the worktree, the handoff path and the verification steps.
 

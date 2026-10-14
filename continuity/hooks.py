@@ -202,8 +202,8 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         )
         if transfer.get("ok"):
             reason = (
-                "Continuity handoff boundary reached: compaction is about to occur. "
-                "A detailed handoff was captured and a fresh Claude successor session was started in the background"
+                "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
+                "A detailed handoff was captured, a new git worktree was created as the handoff, and a fresh Claude successor session was started in the background"
                 + (f", in its own git worktree at {transfer.get('worktree')} (branch {transfer.get('worktree_branch')}; {transfer.get('worktree_note')})" if transfer.get("worktree") else f" in the project root ({transfer.get('worktree_note')})")
                 + ". It has been told it is picking up where this session left off. "
                 f"Successor: {transfer.get('successor_name')}. "
@@ -213,7 +213,7 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         else:
             set_arm_status(store, ident.key, sid, "armed", launch_error=transfer.get("reason"))
             reason = (
-                "Continuity handoff boundary reached: compaction is about to occur. "
+                "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
                 f"The detailed handoff was captured at {handoff_path}, but automatic Claude successor launch failed: "
                 f"{transfer.get('reason')}. Start a fresh Claude session in this project and invoke /continuity."
             )
@@ -244,7 +244,7 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         )
         if not transfer.get("ok"):
             reason = (
-                "Continuity handoff boundary reached: compaction is about to occur. "
+                "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
                 f"The detailed handoff was captured at {handoff_path}, but automatic Codex successor launch failed: "
                 f"{transfer.get('reason')}. Predecessor ownership was restored."
             )
@@ -252,7 +252,7 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
             tid = transfer.get("thread_id")
             thread_text = f" Successor thread: {tid}." if tid else ""
             reason = (
-                "Continuity handoff boundary reached: compaction is about to occur. "
+                "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
                 "A detailed handoff was captured and a fresh read-only Codex successor bootstrap thread was launched "
                 "in the background." + thread_text + " "
                 f"Resume it interactively with: {transfer.get('resume_command')}. "
@@ -260,7 +260,7 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
             )
         else:
             reason = (
-                "Continuity handoff boundary reached: compaction is about to occur. "
+                "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
                 "A detailed handoff was captured. The Codex executable was not available for automatic bootstrap. "
                 f"Start the fresh session with: {transfer.get('command')}. "
                 "The next fresh Codex session will inherit the staged handoff automatically."
@@ -284,7 +284,7 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
         command=command,
     )
     reason = (
-        "Continuity handoff boundary reached: compaction is about to occur. "
+        "COMPACTION IMMINENT — Continuity handoff boundary reached: compaction is about to occur. "
         f"A detailed handoff was captured at {handoff_path}. "
         f"Start a fresh successor session from the project: {transfer.get('command')}."
     )

@@ -317,7 +317,9 @@ def prepare_successor_worktree(ident, *, label: str, generation: str, wip: dict)
     head = (_git_bytes(root, "rev-parse", "HEAD") or b"").decode().strip()
     if not head:
         return {"ok": False, "reason": "not a git repository with commits; successor starts in the project root"}
-    slug = f"{_slug(label)}-{generation.replace('.', '-')}"
+    # The branch and folder carry the successor's version as written ("session-1.1"), so the chain reads
+    # 1.1, 1.2, 1.3 in `git branch` exactly as it does in session names. Dots are legal in git refs.
+    slug = f"{_slug(label)}-session-{generation}"
     # Inside the project, where Claude Code and the desktop app keep worktrees: the new directory inherits
     # the project's workspace trust, without which `claude --bg` refuses to start the successor.
     # Sibling of other worktrees under the MAIN checkout, so a chain of successors never nests.

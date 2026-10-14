@@ -73,10 +73,12 @@ class WorktreeSuccessorTests(unittest.TestCase):
             argv, cwd = popen.call_args.args
             name = argv[argv.index("--name") + 1]
             self.assertEqual(name, "Session SiteBooked 1.1")
-            wt = root / ".claude" / "worktrees" / "continuity-sitebooked-1-1"
+            wt = root / ".claude" / "worktrees" / "continuity-sitebooked-session-1.1"
             self.assertEqual(Path(cwd).resolve(), wt.resolve())
             self.assertIn(str(wt), payload["reason"])
             self.assertIn("Session SiteBooked 1.1", payload["reason"])
+            self.assertTrue(payload["reason"].startswith("COMPACTION IMMINENT"))
+            self.assertIn("a new git worktree was created as the handoff", payload["reason"])
             prompt = argv[-1]
             self.assertIn("You are Session SiteBooked 1.1. You are picking up exactly where Session SiteBooked 1.0 (session id s1) left off", prompt)
             self.assertIn("Goal: ship the booking chat", prompt)
@@ -87,7 +89,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
             self.assertEqual((wt / "notes.md").read_text(), "half-written plan\n")
             self.assertEqual((root / "app.py").read_text(), "print('v2 in progress')\n")
             branch = subprocess.run(["git", "-C", str(wt), "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
-            self.assertEqual(branch, "continuity/sitebooked-1-1")
+            self.assertEqual(branch, "continuity/sitebooked-session-1.1")
             latest = (wt / ".continuity" / "LATEST.md").read_text()
             self.assertIn("Session label: Session SiteBooked 1.0", latest)
             self.assertIn("Work In Progress (lossless)", latest)
