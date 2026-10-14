@@ -97,6 +97,15 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## Hand over before compaction, on measured usage — v0.7
+
+v0.6 transferred at the PreCompact hook, which is the last possible moment and comes too late for the agent to write its own handoff. v0.7 hands over earlier:
+
+- **Measured trigger.** On each user prompt and each edit/shell tool call, the hook reads the session transcript and measures the context size (the prompt tokens of the last main-thread turn). At 75% of the window (`continuity arm --context-window N --handoff-at 0.75`, or `CONTINUITY_CONTEXT_WINDOW`) it shows the user **"⚠️ Compaction is imminent — … creating a new git worktree … in this same checkout"** and tells the agent to hand over now.
+- **`continuity handover --handoff-file .continuity/HANDOFF.md`.** The agent writes the lossless narrative (decisions and reasons, open threads, verified vs. assumed state, next action), and the command embeds it at the top of the handoff, captures every uncommitted and untracked change, creates the successor worktree at `<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>`, and starts the successor there with `claude --bg`. All of that happens before compaction.
+- **PreCompact stays as the backstop.** If the early trigger never fired (unreadable transcript, a window set too large), the hook still transfers mechanically before compaction.
+- **Hard rules** at the top of `SKILL.md`: hand over before compaction; alert the user first; same environment and same folders; lossless; report only what happened; one owner.
+
 ## Compaction alert and versioned worktree branches — v0.6
 
 Found in a real cloud session (KJN FE). It compacted without a hand-over because the cloud rule said only "when the conversation has grown long".

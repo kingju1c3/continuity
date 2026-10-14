@@ -1,6 +1,6 @@
 ---
 name: continuity
-description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until the real pre-compaction hook, then captures a lossless handoff and starts a fresh successor in a new git worktree labelled with a unique sequential identifier ('Session FE 1.1', '1.2'…) Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and, on concrete triggers, alerts 'Compaction is imminent' and hands over to the next sequential session (1.1, 1.2…) on a new worktree branch named for that version (e.g. continuity/fe-session-1.1). Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
+description: "Session continuity for coding agents, local or cloud, in one skill. Invoke once. Local mode (Claude Code terminal/desktop or Codex with the continuity runtime) stays quiet until measured context nears the limit, then alerts 'Compaction is imminent', has the agent write a lossless handoff, and starts a fresh successor BEFORE compaction in a new git worktree inside the same checkout, labelled with a unique sequential identifier ('Session FE 1.1', '1.2'…); the PreCompact hook is the backstop. Cloud mode (Claude Code on the web, cloud workspaces, Claude app) writes verified handoffs at milestones and, on concrete triggers, alerts 'Compaction is imminent' and hands over to the next sequential session (1.1, 1.2…) on a new worktree branch named for that version (e.g. continuity/fe-session-1.1). Use whenever the user wants continuity, a handoff, a fresh session that picks up where this one left off, or protection against losing work to compaction."
 hooks:
   UserPromptSubmit:
     - hooks:
@@ -41,13 +41,15 @@ ARM EXACT CURRENT SESSION
     ↓
 STAY PASSIVE DURING NORMAL WORK
     ↓
-HOST SIGNALS PRECOMPACT
+MEASURED CONTEXT REACHES THE HAND-OVER THRESHOLD (default 75%)
+(backstop: the host's PreCompact hook, if the early trigger never fired)
     ↓
-ALERT USER BEFORE COMPACTION
+ALERT USER: "⚠️ Compaction is imminent — creating the successor worktree"
     ↓
-CAPTURE DETAILED, LOSSLESS HANDOFF (incl. uncommitted work)
+AGENT WRITES THE LOSSLESS HANDOFF (it still holds the whole conversation)
     ↓
-START FRESH SUCCESSOR IN A NEW GIT WORKTREE
+`continuity handover`: CAPTURE UNCOMMITTED WORK + CREATE THE WORKTREE
+IN THIS SAME CHECKOUT + START THE SUCCESSOR THERE — ALL BEFORE COMPACTION
 labelled "Session <name> 1.1" (then 1.2, 1.3 …)
     ↓
 SUCCESSOR IS TOLD IT CONTINUES "Session <name> 1.0"
@@ -56,6 +58,15 @@ SUCCESSOR VERIFIES SOURCE + RESUMES
 ```
 
 The skill must not continuously interrupt the session, repeatedly inject memory, or create a checkpoint after every turn.
+
+## Hard rules (both modes; these override anything below)
+
+1. **Hand over BEFORE compaction, never after.** The successor worktree is created and the successor started while this session still holds its full context. A hand-over after compaction works from a lossy summary; it is a recovery, not continuity.
+2. **Alert the user first, in plain words.** The first line the user sees is: `⚠️ Compaction is imminent. I'm creating a new git worktree (continuity/<slug>-session-<next>) in this same checkout and handing the work to Session <Name> <next>.` Then do it, in the same turn, without waiting for a reply.
+3. **Same environment, same folders.** The successor's worktree is `<main checkout>/.claude/worktrees/continuity-<slug>-session-<next>`, created by this session, in the environment it is running in (same machine or container, same main checkout). The successor is started in that folder. Never a fresh clone, a temp dir, another machine or another container, except as an announced fallback when no same-environment launch exists.
+4. **Lossless.** The handoff lets a session with no access to this conversation continue without asking anything. It contains the goal and done condition; the user's instructions and standing preferences, quoted; every decision with its reason; every open thread; failed attempts and why they failed; verified vs. assumed state with exact SHAs, paths, commands, IDs, URLs and test counts; and the single next action. Every uncommitted and untracked change goes into the worktree. Nothing is summarised away to save space.
+5. **Report only what happened.** Name the worktree path, branch, successor label and launch id exactly as the runtime or tool returned them. Never announce a worktree, an applied patch or a started session that was not confirmed.
+6. **One owner.** After the hand-over, this session stops working and points the user at the successor.
 
 ## Pick the mode first (one skill, two modes)
 
@@ -88,8 +99,11 @@ continuity arm \
   --host auto \
   --goal "<current user objective in one concise sentence>" \
   --instructions "<critical constraints that must survive the handoff>" \
-  --label "<short name for this line of work, e.g. SiteBooked>"
+  --label "<short name for this line of work, e.g. SiteBooked>" \
+  [--context-window <tokens>] [--handoff-at 0.75]
 ```
+
+Pass `--context-window` when the host's real context window is known (for example `1000000` for a 1M-context model). Without it the runtime uses `CONTINUITY_CONTEXT_WINDOW` if set, otherwise 1M when the model id says `[1m]` or measured usage has already passed 200k, otherwise 200k. A window that is too small hands over early, which is the safe direction. `--handoff-at` is the fraction of the window at which the hand-over starts (default 0.75).
 
 Do this before substantive new work. `--label` names the session chain: this session is **`Session <label> 1.0`**, its successors **`Session <label> 1.1`**, **`1.2`**, **`1.3`** and so on. Without `--label` the project folder name is used. A successor inherits the label and the next number automatically; never re-label it by hand. Every instance gets a unique identifier in sequential order: a number issued under a label is never reused in this project, so a second chain armed as `FE`, or `FE` armed again later, continues at the next free number (`Session FE 1.3`, `1.4` …), never a second `1.0`.
 
@@ -130,15 +144,26 @@ Once armed:
 - durable memory is available on demand, not injected every turn;
 - source and Git remain canonical.
 
-The runtime waits for a **documented host boundary**, not a guessed token percentage.
+### Two triggers: measured early hand-over, PreCompact backstop
 
-### Why PreCompact is the trigger
+**1. Early hand-over (primary, Claude Code).** On every user prompt and every edit/shell tool call, the hook reads the session's own transcript and takes the **measured** context size: the prompt tokens (`input + cache_creation + cache_read`) of the last main-thread assistant turn. When that reaches the threshold (default 75% of the window), the hook:
 
-The supported hosts do not expose one portable, stable live field saying “the session is exactly N% from compaction” on every turn.
+- shows the user `⚠️ Compaction is imminent — context is at <used> of ~<window> tokens (<pct>). Continuity is creating a new git worktree (<branch>) in this same checkout and handing the work to Session <Name> <next> before compaction.`
+- tells the agent to hand over now. On the first crossing it fires at once; after that it repeats on every user turn until the hand-over happens.
 
-Therefore Continuity uses the host's **PreCompact** lifecycle event: the reliable point immediately before compaction.
+When you (the agent) receive `CONTINUITY: COMPACTION IS IMMINENT`, do exactly this, in this turn, before any other work:
 
-Do not claim an earlier warning was measured if the host did not expose such telemetry.
+1. Put the alert to the user as the first line of your reply (Hard rule 2).
+2. Finish or safely pause the step in flight. Never leave a half-written file or a half-pushed branch.
+3. Write the lossless handoff to `.continuity/HANDOFF.md` (format: **Handoff format** under Cloud mode, which applies in both modes; Hard rule 4).
+4. Run `continuity handover --handoff-file .continuity/HANDOFF.md`. It embeds your narrative at the top of the handoff, captures the work in progress, creates the successor worktree in this checkout, applies the uncommitted changes, copies the untracked files, and starts the successor there with `claude --bg`.
+5. Report its real output (worktree, branch, successor name), then stop working in this session.
+
+If `continuity handover` reports a launch failure, the handoff and worktree stay on disk and the session stays armed. Tell the user the exact reason and the folder to start `Session <Name> <next>` in.
+
+The usage number is measured; the window is configured or inferred. Say which one it is when you report it. If the transcript can't be read, the early trigger stays silent and the backstop applies.
+
+**2. PreCompact (backstop).** If compaction arrives before the early hand-over happened, the host's PreCompact hook does the same transfer mechanically. That happens before compaction, but without your narrative, so it is less complete. Treat a backstop transfer as a sign that `--context-window` or `--handoff-at` should be lower.
 
 ## Boundary alert
 
@@ -158,7 +183,7 @@ Read `continuity/protocol/compaction.md`.
 
 ## Automatic boundary handoff
 
-At PreCompact, Continuity creates an **automatic-boundary handoff**.
+At the hand-over (`continuity handover`, kind `agent-handover`, with the agent's narrative first) or at PreCompact (kind `automatic-boundary`), Continuity creates a handoff.
 
 It captures, mechanically:
 
@@ -192,7 +217,7 @@ Read `continuity/protocol/checkpoint-handoff.md`.
 
 ## Session chain and worktree successor
 
-Before compaction (at the PreCompact boundary), Continuity always:
+Before compaction (at `continuity handover`, or at the PreCompact boundary as backstop), Continuity always:
 
 1. **Captures a detailed, lossless handoff.** On top of goal, instructions, Git branch/HEAD, working tree, diffstat, changed files, index, durable memories and transcript tail, it stores the **work in progress**: a full binary patch of every uncommitted tracked change against HEAD (`.continuity/handoffs/<stamp>-<session>.patch`), the list of untracked files, and the recent commits. Nothing in the predecessor's tree is staged, stashed or committed.
 2. **Creates a new git worktree for the successor** at `<main checkout>/.claude/worktrees/continuity-<label-slug>-session-<N>.<M+1>` (where Claude Code and the desktop app keep worktrees; a chain of successors stays side by side, never nested; the folder is added to `.git/info/exclude` if not already ignored), in the same environment as the predecessor (same machine, same main checkout; never a fresh clone or another machine), on branch `continuity/<label-slug>-session-<N>.<M+1>` (the successor's own version, written with its dot: `continuity/sitebooked-session-1.1`, then `-session-1.2`, `-session-1.3`), from the predecessor's HEAD. It applies the patch there, copies the untracked files (up to 10 MB each, 100 MB total; anything skipped is named), and copies `.continuity/enabled.json` and the handoff (`LATEST.md`/`LATEST.json`) into it. The predecessor's own tree is untouched; merge the successor branch back when the work is done.
@@ -458,6 +483,7 @@ continuity uninstall --agents claude,codex
 ## CLI map
 
 - `arm` — activate passive boundary continuity for exact current session (`--label` names the session chain).
+- `handover [--handoff-file F]` — hand over now, before compaction: embed the agent's handoff, create the successor worktree in this checkout, start the successor there.
 - `disarm` — disable it.
 - `status` — inspect lease, arm state, pending successor, handoff, index.
 - `start` — manual session registration.
@@ -500,7 +526,7 @@ It cannot capture at the exact compaction instant: there is no hook. It transfer
 
 ### On invocation
 
-1. Check for the runtime in this session's own shell (`command -v continuity`). If it is present AND the host exposes an exact session id (Claude Code, terminal or desktop app, exports `CLAUDE_CODE_SESSION_ID`), tell the user to use `/continuity` instead and stop: it arms without any prior install and hands over at the real PreCompact hook. A CLI installed on a linked remote computer does not count: hooks and session identity belong to the host running this conversation. Never invent a session ID.
+1. Check for the runtime in this session's own shell (`command -v continuity`). If it is present AND the host exposes an exact session id (Claude Code, terminal or desktop app, exports `CLAUDE_CODE_SESSION_ID`), tell the user to use `/continuity` instead and stop: it arms without any prior install, hands over early on measured context usage, and keeps the PreCompact hook as backstop. A CLI installed on a linked remote computer does not count: hooks and session identity belong to the host running this conversation. Never invent a session ID.
 2. Tell the user in one line that cloud mode is active: there is no compaction hook here, so handoffs are written at milestones and the hand-over to a new session happens before compaction, not at it.
 3. **Work out this session's label.** Sessions in one line of work form a chain: **`Session <Name> 1.0`**, then **`1.1`**, **`1.2`**, **`1.3`** … If the session was started by a predecessor, its first message names it ("You are Session SiteBooked 1.2 …"): keep that label. Otherwise it is a new instance: `<Name>` is the project or topic (ask only if it's genuinely unclear), and its number is the next one never used before under that name. Check the existing handoffs and session or chat titles for `Session <Name> …`, and take the number after the highest one found (`Session <Name> 1.0` only if none exists). Identifiers are never reused, so two sessions never share one. State the label in that same line.
 4. Find the latest existing handoff. If a Project is attached, search its docs for `Handoff`; otherwise check the working directory. Read it and note its version.
@@ -523,6 +549,22 @@ A cloud host compacts without warning, so waiting for "it feels long" fails: the
 
 **Triggers.** Hand over as soon as ANY of these is true. Count from invocation, or from the last hand-over:
 
+0. **Measured usage ≥ 75%**, where it can be measured. Claude Code (including on the web) writes this session's transcript under `~/.claude/projects/`; check it at every milestone and roughly every 20 tool calls:
+   ```bash
+   python3 - <<'PY'
+   import glob, json, os
+   sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+   f = (glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")) if sid else []) or sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")), key=os.path.getmtime)[-1:]
+   used = 0
+   for line in open(f[0]) if f else []:
+       try: v = json.loads(line)
+       except ValueError: continue
+       u = (v.get("message") or {}).get("usage") if v.get("type") == "assistant" and not v.get("isSidechain") else None
+       if u: used = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+   print(f"context used: {used} tokens", f[0] if f else "(no transcript)")
+   PY
+   ```
+   Compare against the model's window (the user or the host tells you; otherwise assume 200k, which errs early). Report the number as measured and the window as assumed or known.
 1. The host shows any notice about context, conversation length or compaction.
 2. About **120 tool calls**, or about **40 user turns**.
 3. About **25 large tool outputs** (full logs, whole files, test-suite dumps over ~200 lines each).

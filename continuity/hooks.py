@@ -8,10 +8,15 @@ import time
 from pathlib import Path
 
 from .boundary import (
+    _slug,
     automatic_boundary_handoff,
+    default_label,
     get_arm,
+    handoff_due,
     inherit_pending_successor,
     launch_claude_successor,
+    next_generation,
+    session_label,
     set_arm_status,
     stage_codex_successor,
     stage_manual_successor,
@@ -162,6 +167,45 @@ def _session_start(store: Store, ident, host: str, sid: str | None, event: dict)
             system_message="Continuity restored the armed session handoff.",
         )
     return 0
+
+
+def _early_warning(store: Store, ident, host: str, sid: str | None, arm: dict | None, event: dict, event_name: str) -> bool:
+    """Measured context crossed the hand-over threshold: alert the user and make the agent hand over now,
+    while it still holds the whole conversation. The PreCompact hook stays armed as the backstop."""
+    if host != "claude" or not sid or not arm or arm.get("status") != "armed":
+        return False
+    due = handoff_due(event.get("transcript_path"), arm)
+    if not due:
+        return False
+    first = not arm.get("early_warning")
+    if not first and event_name != "UserPromptSubmit":
+        return False  # first crossing alerts at once; after that, remind once per user turn, not per tool call
+    set_arm_status(store, ident.key, sid, "armed", early_warning={**due, "at": int(time.time())})
+    label = str(arm.get("label") or default_label(ident.root))
+    nxt = next_generation(str(arm.get("generation") or "1.0"))
+    name = session_label(label, nxt)
+    branch = f"continuity/{_slug(label)}-session-{nxt}"
+    pct = f"{due['used']:,} of ~{due['window']:,} tokens ({due['ratio']:.0%})"
+    user_msg = (
+        f"⚠️ Compaction is imminent — context is at {pct}. Continuity is creating a new git worktree "
+        f"({branch}) in this same checkout and handing the work to {name} before compaction."
+    )
+    agent_msg = (
+        f"CONTINUITY: COMPACTION IS IMMINENT. Measured context: {pct}; hand-over threshold {due['threshold']:.0%}. "
+        "Hand over NOW, before compaction, while you still hold the full conversation. Do this before any other work, in this turn:\n"
+        f"1. Tell the user, as the first line of your reply: \"⚠️ Compaction is imminent. I'm creating a new git worktree "
+        f"({branch}) in this same checkout and handing the work to {name}.\"\n"
+        "2. Finish or safely pause the step in flight (never leave a half-written file or a half-pushed branch).\n"
+        "3. Write the lossless handoff to .continuity/HANDOFF.md, per the skill's handoff format: goal and done condition, "
+        "the user's exact instructions and standing preferences (quoted), every decision with its reason, every open thread, "
+        "failed attempts, verified vs. assumed state with exact SHAs/paths/commands/IDs/URLs/test counts, and the single next action.\n"
+        "4. Run: continuity handover --handoff-file .continuity/HANDOFF.md\n"
+        "   It creates the successor worktree in THIS environment (<main checkout>/.claude/worktrees/), carries over every "
+        "uncommitted and untracked change, and starts the successor there with claude --bg.\n"
+        "5. Report the command's real output (worktree path, branch, successor name), then stop working in this session."
+    )
+    _emit_context(event_name, agent_msg, system_message=user_msg)
+    return True
 
 
 def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) -> int:
@@ -330,6 +374,8 @@ def run_hook(host: str) -> int:
                     host,
                     "Continuity already transferred this predecessor session. Continue in the fresh successor session.",
                 )
+                return 0
+            _early_warning(store, ident, host, sid, arm, event, event_name)
             return 0
 
         if event_name == "PostToolUse":
@@ -339,6 +385,7 @@ def run_hook(host: str) -> int:
                 shell_tools = {"Bash", "PowerShell", "Shell", "shell"}
                 if tool_name in edit_tools | shell_tools:
                     store.mark_index_dirty(ident.key, _edit_path(event, ident.root))
+                _early_warning(store, ident, host, sid, arm, event, event_name)
             return 0
 
         if event_name == "PreCompact":

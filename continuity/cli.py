@@ -6,9 +6,10 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 
 from .adapters import detect, structural_query
-from .boundary import arm_session, claim_generation, default_label, disarm_session, get_arm, pending_successor, session_label
+from .boundary import arm_session, automatic_boundary_handoff, claim_generation, default_label, disarm_session, get_arm, launch_claude_successor, pending_successor, session_label, set_arm_status
 from .context import query_terms
 from .handoff import checkpoint_payload, ensure_state_dir, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
@@ -198,6 +199,9 @@ def cmd_arm(a) -> int:
         label=label,
         generation=generation,
     )
+    tuning = {k: v for k, v in (("context_window", getattr(a, "context_window", None)), ("handoff_at", getattr(a, "handoff_at", None))) if v}
+    if tuning:
+        state = set_arm_status(st, ident.key, sid, "armed", **tuning)
     if pending and pending.get("host") == host:
         pending.update(
             {
@@ -214,6 +218,38 @@ def cmd_arm(a) -> int:
     )
     st.close()
     return 0
+
+
+def cmd_handover(a) -> int:
+    """Agent-initiated hand-over before compaction: same capture and same-environment successor as PreCompact,
+    plus the agent's own lossless narrative."""
+    ident, st = _ctx(a.path)
+    sid = a.session or os.getenv("CLAUDE_CODE_SESSION_ID") or _active_session(st, ident.key)[0]
+    arm = get_arm(st, ident.key, sid)
+    if not sid or not arm or arm.get("status") != "armed":
+        print(f"Continuity: session {sid or '(unknown)'} is not armed here ({ident.root}); run `continuity arm` first.", file=sys.stderr)
+        st.close()
+        return 2
+    narrative = ""
+    if a.handoff_file:
+        try:
+            narrative = Path(a.handoff_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"Continuity: cannot read handoff file: {exc}", file=sys.stderr)
+            st.close()
+            return 2
+    transcripts = sorted(Path.home().glob(f".claude/projects/*/{sid}.jsonl"))
+    event = {"transcript_path": str(transcripts[0])} if transcripts else {}
+    hid, path, _ = automatic_boundary_handoff(st, ident, host=str(arm.get("host") or "claude"), session_id=sid, arm=arm,
+                                              event=event, boundary="EarlyHandover", agent_handoff=narrative)
+    set_arm_status(st, ident.key, sid, "handoff_pending", handoff_id=hid, handoff_path=str(path))
+    transfer = launch_claude_successor(st, ident, predecessor_session=sid, arm=arm, handoff_id=hid, handoff_path=path)
+    if not transfer.get("ok"):
+        # Keep the PreCompact backstop armed; the handoff and its patch are already on disk.
+        set_arm_status(st, ident.key, sid, "armed", launch_error=transfer.get("reason"))
+    print(json.dumps({"handoff": str(path), **transfer}, indent=2, default=str))
+    st.close()
+    return 0 if transfer.get("ok") else 1
 
 
 def cmd_disarm(a) -> int:
@@ -532,8 +568,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--goal")
     s.add_argument("--instructions")
     s.add_argument("--no-auto-successor", action="store_true")
+    s.add_argument("--context-window", type=int, help="Host context window in tokens (default: env CONTINUITY_CONTEXT_WINDOW, else a model-based guess)")
+    s.add_argument("--handoff-at", type=float, help="Hand over when measured context reaches this fraction of the window (default 0.75)")
     s.add_argument("--label", help='Name for the session chain, e.g. "SiteBooked". Sessions are labelled "Session <label> 1.0", then 1.1, 1.2 ...')
     s.set_defaults(fn=cmd_arm)
+
+    s = sub.add_parser("handover", help="Hand over to the next session now, before compaction")
+    s.add_argument("--session")
+    s.add_argument("--handoff-file", help="The agent-written lossless handoff (markdown) to embed")
+    s.set_defaults(fn=cmd_handover)
 
     s = sub.add_parser("disarm")
     s.add_argument("--session")

@@ -207,6 +207,72 @@ def transcript_tail(path_value: object) -> dict:
     }
 
 
+DEFAULT_HANDOFF_AT = 0.75
+
+
+def context_usage(path_value: object) -> dict | None:
+    """Measured context size: the prompt tokens of the session's last main-thread assistant turn.
+
+    Read from the host transcript (Claude Code JSONL `message.usage`). None when unmeasurable;
+    the caller then stays silent and the PreCompact hook remains the backstop.
+    """
+    if not isinstance(path_value, str) or not path_value.strip():
+        return None
+    try:
+        with Path(path_value).expanduser().open("rb") as f:
+            try:
+                f.seek(-MAX_TRANSCRIPT_BYTES, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            raw = f.read(MAX_TRANSCRIPT_BYTES)
+    except OSError:
+        return None
+    for line in reversed(raw.decode("utf-8", errors="replace").splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = value.get("message") if isinstance(value, dict) else None
+        if value.get("type") != "assistant" or value.get("isSidechain") or not isinstance(msg, dict):
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        used = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        if used > 0:
+            return {"used": used, "model": str(msg.get("model") or "")}
+    return None
+
+
+def context_window(model: str, used: int, arm: dict | None = None) -> int:
+    """Window to measure against: arm setting, then CONTINUITY_CONTEXT_WINDOW, then a model-based guess."""
+    for value in ((arm or {}).get("context_window"), os.getenv("CONTINUITY_CONTEXT_WINDOW")):
+        try:
+            if value and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    # ponytail: 200k unless the model says 1M or usage already proved the window is bigger;
+    # pass --context-window when the host's real window is known.
+    return 1_000_000 if "[1m]" in model or used > 200_000 else 200_000
+
+
+def handoff_due(path_value: object, arm: dict | None) -> dict | None:
+    """{'used', 'window', 'ratio', 'threshold'} when measured usage has reached the hand-over threshold."""
+    usage = context_usage(path_value)
+    if not usage:
+        return None
+    window = context_window(usage["model"], usage["used"], arm)
+    try:
+        threshold = float((arm or {}).get("handoff_at") or os.getenv("CONTINUITY_HANDOFF_AT") or DEFAULT_HANDOFF_AT)
+    except ValueError:
+        threshold = DEFAULT_HANDOFF_AT
+    ratio = usage["used"] / window
+    if ratio < threshold:
+        return None
+    return {"used": usage["used"], "window": window, "ratio": round(ratio, 3), "threshold": threshold}
+
+
 def _changed_files(root: Path, index_state: dict) -> list[str]:
     snap = git_snapshot(root)
     found: list[str] = []
@@ -222,7 +288,7 @@ def _changed_files(root: Path, index_state: dict) -> list[str]:
     return found[:100]
 
 
-def automatic_boundary_handoff(store: Store, ident, *, host: str, session_id: str, arm: dict, event: dict, boundary: str = "PreCompact") -> tuple[int, Path, dict]:
+def automatic_boundary_handoff(store: Store, ident, *, host: str, session_id: str, arm: dict, event: dict, boundary: str = "PreCompact", agent_handoff: str = "") -> tuple[int, Path, dict]:
     files, symbols, edges = build_index(ident.root)
     store.replace_index(ident.key, files, symbols, edges)
     idx = store.index_state(ident.key)
@@ -242,8 +308,12 @@ def automatic_boundary_handoff(store: Store, ident, *, host: str, session_id: st
         relevant_files=" ".join(changed),
         verification="Automatic boundary capture only; semantic verification must be performed by the successor.",
     )
-    payload["kind"] = "automatic-boundary"
+    payload["kind"] = "agent-handover" if agent_handoff.strip() else "automatic-boundary"
     payload["boundary"] = boundary
+    if agent_handoff.strip():
+        # The agent's own narrative (decisions, reasons, open threads, next action) is the lossless part;
+        # the machine capture below is the evidence it is checked against.
+        payload["agent_handoff"] = agent_handoff
     payload["automatic_boundary_context"] = {
         "arm": {"goal": arm.get("goal"), "instructions": arm.get("instructions"), "armed_at": arm.get("armed_at")},
         "index": idx,
