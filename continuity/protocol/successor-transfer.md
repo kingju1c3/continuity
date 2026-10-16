@@ -4,7 +4,7 @@ The objective is a **fresh context** that resumes from durable evidence rather t
 
 ## Claude Code
 
-By default (v0.8) the successor is a **visible sidebar clone**. Continuity prepares the worktree, carries the work over, writes the handoff, releases the predecessor's lease, and returns a `start` block:
+By default (v0.8) the successor is a **visible sidebar clone**. Continuity prepares the worktree, carries the work over, writes the handoff, and returns a `start` block. The predecessor KEEPS its lease (status `successor_starting`) until the start is confirmed by `continuity confirm-successor` or by the successor arming:
 
 ```json
 {"tool": "mcp__ccd_session__start_session",
@@ -63,11 +63,11 @@ If the Codex executable is unavailable or automatic bootstrap cannot be started,
 
 ## Ownership
 
-The predecessor lease is released only after the handoff is durably written.
+The predecessor lease is released only after the handoff is durably written AND the successor is confirmed started (`confirm-successor`, or the successor arming from the pending hand-over). A refused or never-made start leaves the predecessor the owner; `continuity handover --cancel` undoes the preparation.
 
 If successor launch fails before a new session is established, predecessor ownership is restored.
 
-A transferred predecessor is blocked from continuing ordinary prompts so two sessions do not unknowingly work the same continuity chain.
+A transferred (confirmed) predecessor is blocked from continuing ordinary prompts so two sessions do not unknowingly work the same continuity chain. A predecessor in `successor_starting` is never blocked; it is reminded, with the start call, on each user turn.
 
 ## Resume semantics
 

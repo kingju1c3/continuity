@@ -122,7 +122,10 @@ def pending_successor(store: Store, project_key: str) -> dict | None:
     if not isinstance(p, dict):
         return None
     created = int(p.get("created_at") or 0)
-    if not created or int(time.time()) - created > PENDING_TTL_SECONDS:
+    # A prepared hand-over whose predecessor is still waiting (successor_starting) must not expire: the user may
+    # open the successor by hand long after the start was refused, and its arming is what retires the predecessor.
+    waiting = p.get("status") == "pending" and p.get("awaiting_start")
+    if not created or (not waiting and int(time.time()) - created > PENDING_TTL_SECONDS):
         return None
     if p.get("status") not in {"pending", "launched"}:
         return None
@@ -500,7 +503,7 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
     )
     pending = {
         "schema": 1, "status": "pending", "host": "claude",
-        "predecessor_session": predecessor_session, "successor_name": name,
+        "predecessor_session": predecessor_session, "predecessor_project_key": ident.key, "successor_name": name,
         "label": label, "generation": generation, "predecessor_label": previous,
         "worktree": tree.get("path", ""), "worktree_branch": tree.get("branch", ""), "worktree_note": tree.get("reason", tree.get("wip", "")),
         "handoff_id": handoff_id, "handoff_path": str(handoff_path),
@@ -518,7 +521,6 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
         if latest:
             store.ensure_project(succ_key, str(cwd))
             store.add_handoff(succ_key, predecessor_session, {k: v for k, v in latest.items() if not k.startswith("_")})
-    store.release_lease(ident.key, predecessor_session)
 
     result = {"ok": True, "successor_name": name, "worktree": tree.get("path", ""), "worktree_branch": tree.get("branch", ""),
               "worktree_note": tree.get("reason", "") if not tree.get("ok") else f"uncommitted changes {tree['wip']}"}
@@ -528,13 +530,20 @@ def launch_claude_successor(store: Store, ident, *, predecessor_session: str, ar
         # show in the app sidebar or on the phone, which once left the user unable to reach their lead.
         start = visible_start(name, previous, cwd, prompt)
         # Stays "pending" so the successor inherits it when it arms; `visible` marks who starts it.
-        pending.update({"visible": True, "start": start})
+        pending.update({"visible": True, "start": start, "awaiting_start": True})
         store.set_state(ident.key, "successor_pending", pending)
         if succ_key != ident.key:
             store.set_state(succ_key, "successor_pending", pending)
-        set_arm_status(store, ident.key, predecessor_session, "transferred", successor_name=name)
+        # NOT "transferred" yet: nothing has started. The agent's start call can be refused (a turn started by
+        # another session's message, a missing tool, the user declining). Marking the predecessor transferred
+        # here made its own hook block every later prompt while no successor existed: a session that said it
+        # handed over and then went dark (2026-10-16). It stays the owner, keeps its lease, and is reminded on
+        # every user turn until `continuity confirm-successor` (or the successor arming) completes the transfer.
+        set_arm_status(store, ident.key, predecessor_session, "successor_starting",
+                       successor_name=name, start=start, starting_at=int(time.time()))
         return {**result, "visible": True, "start": start}
 
+    store.release_lease(ident.key, predecessor_session)
     try:
         proc = _spawn_background([exe, "--bg", "--name", name, prompt], cwd)
     except OSError as exc:
@@ -585,24 +594,91 @@ def visible_start_instructions(transfer: dict) -> str:
         f"START {transfer.get('successor_name')} NOW as a visible session, in this turn. In the Claude desktop app, call "
         f"{start.get('tool')} with exactly these arguments (do not add permission_mode, model or effort: omitting them "
         f"makes it a clone with this session's permissions and settings): {json.dumps(start.get('args'))}. "
-        "Arming /continuity is the user's standing request for this successor. If that tool isn't available "
-        f"(terminal), tell the user to open {start.get('folder')} in the desktop app's Code tab (or run `claude` there) "
-        "and give them the prompt above as a copy-paste block. Never use `claude --bg`. Report the session id the tool "
-        "returns, then stop working in this session."
+        "Arming /continuity is the user's standing request for this successor. "
+        "When the tool returns a session id, run `continuity confirm-successor --successor-session <that id>`: only then "
+        "is this session transferred. Report the id, then stop working in this session. "
+        "If the start is REFUSED (the app refuses starts on a turn that another session's message or an automated event "
+        "began) or the tool isn't available (terminal): you are STILL the owner, do not say you handed over and do not go "
+        f"quiet. Tell the user plainly that the successor is prepared but not started, give them the folder {start.get('folder')} "
+        "and the prompt above as a copy-paste block, and ask them to reply (any message) so you can start it on their turn. "
+        "Keep working normally until then; the transfer completes when the successor arms. Never use `claude --bg`."
     )
+
+
+def confirm_successor(store: Store, project_key: str, predecessor_session: str, *, successor_session: str = "") -> dict | None:
+    """Complete a visible hand-over: the successor really exists now. Only here does the predecessor give up its
+    lease and become "transferred" (so its hook starts redirecting the user). Idempotent; None if nothing was
+    starting for this session."""
+    arm = get_arm(store, project_key, predecessor_session)
+    if not arm or arm.get("status") not in {"successor_starting", "transferred"}:
+        return None
+    if arm.get("status") == "transferred":
+        return arm
+    store.release_lease(project_key, predecessor_session)
+    pending = store.get_state(project_key, "successor_pending")
+    if isinstance(pending, dict) and pending.get("predecessor_session") == predecessor_session and pending.get("status") == "pending":
+        store.set_state(project_key, "successor_pending", {**pending, "status": "launched", "awaiting_start": False, "successor_session": successor_session or pending.get("successor_session", ""), "confirmed_at": int(time.time())})
+    return set_arm_status(store, project_key, predecessor_session, "transferred",
+                          successor_session=successor_session or arm.get("successor_session", ""), confirmed_at=int(time.time()))
+
+
+def cancel_handover(store: Store, project_key: str, predecessor_session: str) -> dict | None:
+    """The user chose to keep working here: back to armed, and the prepared successor can no longer retire us."""
+    arm = get_arm(store, project_key, predecessor_session)
+    if not arm or arm.get("status") != "successor_starting":
+        return None
+    pending = store.get_state(project_key, "successor_pending")
+    if isinstance(pending, dict) and pending.get("predecessor_session") == predecessor_session:
+        store.set_state(project_key, "successor_pending", {**pending, "status": "cancelled", "awaiting_start": False})
+        wt = str(pending.get("worktree") or "")
+        if wt:
+            succ = store.get_state(identity(Path(wt)).key, "successor_pending")
+            if isinstance(succ, dict) and succ.get("predecessor_session") == predecessor_session:
+                store.set_state(identity(Path(wt)).key, "successor_pending", {**succ, "status": "cancelled", "awaiting_start": False})
+    # No more early-warning nags this session (the user declined); PreCompact stays armed as the backstop.
+    return set_arm_status(store, project_key, predecessor_session, "armed", handover_declined=int(time.time()))
+
+
+def take_over_from_waiting_predecessor(store: Store, project_key: str, root: Path, new_session: str) -> bool:
+    """A new session in the SAME folder as a predecessor that prepared a hand-over with no separate worktree (the
+    manual path, or a worktree that couldn't be made): it is the successor, so retire the predecessor first.
+    Never for a hand-over that made a worktree: there the successor arms in that folder, and a second session
+    here is someone else."""
+    pending = pending_successor(store, project_key)
+    lease = store.active_lease(project_key)
+    if not pending or not lease or lease["session_id"] == new_session:
+        return False
+    if pending.get("predecessor_session") != lease["session_id"]:
+        return False
+    wt = str(pending.get("worktree") or "")
+    if wt and Path(wt).resolve() != Path(root).resolve():
+        return False
+    return confirm_successor(store, project_key, lease["session_id"], successor_session=new_session) is not None
+
+
+def _confirm_from_pending(store: Store, pending: dict, successor_session: str) -> None:
+    """The successor armed from a pending hand-over: that is proof it started, whoever started it (the agent's
+    tool call or the user opening the folder by hand), so retire the predecessor."""
+    prev = str(pending.get("predecessor_session") or "")
+    key = str(pending.get("predecessor_project_key") or "")
+    if prev and key:
+        confirm_successor(store, key, prev, successor_session=successor_session)
 
 
 def stage_manual_successor(store: Store, ident, *, host: str, predecessor_session: str, arm: dict, handoff_id: int, handoff_path: Path, command: str) -> dict:
     pending = {
         "schema": 1, "status": "pending", "host": host,
-        "predecessor_session": predecessor_session, "handoff_id": handoff_id,
+        "predecessor_session": predecessor_session, "predecessor_project_key": ident.key, "handoff_id": handoff_id,
         "handoff_path": str(handoff_path), "goal": arm.get("goal", ""),
         "instructions": arm.get("instructions", ""),
         "auto_successor": bool(arm.get("auto_successor", True)), "created_at": int(time.time()),
+        "awaiting_start": True, "label": arm.get("label", ""),
     }
     store.set_state(ident.key, "successor_pending", pending)
-    store.release_lease(ident.key, predecessor_session)
-    set_arm_status(store, ident.key, predecessor_session, "transferred")
+    # Same rule as the visible path: nothing has started, so the predecessor stays the owner (lease kept, not
+    # blocked) until a successor arms here and retires it.
+    set_arm_status(store, ident.key, predecessor_session, "successor_starting", manual_command=command,
+                   starting_at=int(time.time()))
     return {"ok": True, "manual_start": True, "command": command}
 
 
@@ -744,4 +820,5 @@ def inherit_pending_successor(store: Store, ident, *, host: str, session_id: str
     )
     pending.update({"status": "consumed", "successor_session": session_id, "consumed_at": int(time.time())})
     store.set_state(ident.key, "successor_pending", pending)
+    _confirm_from_pending(store, pending, session_id)
     return inherited

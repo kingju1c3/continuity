@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from .adapters import detect, structural_query
-from .boundary import visible_start_instructions, arm_session, automatic_boundary_handoff, claim_generation, default_label, disarm_session, get_arm, launch_claude_successor, pending_successor, session_label, set_arm_status
+from .boundary import _confirm_from_pending, cancel_handover, confirm_successor, take_over_from_waiting_predecessor, visible_start_instructions, arm_session, automatic_boundary_handoff, claim_generation, default_label, disarm_session, get_arm, launch_claude_successor, pending_successor, session_label, set_arm_status
 from .context import query_terms
 from .handoff import checkpoint_payload, ensure_state_dir, render_markdown, validate_handoff, write_checkpoint
 from .hooks import run_hook
@@ -119,6 +119,11 @@ def cmd_recover(a) -> int:
 def cmd_arm(a) -> int:
     ident, st = _ctx(a.path)
     active_sid, active_host = _active_session(st, ident.key)
+    env_sid = os.getenv("CLAUDE_CODE_SESSION_ID") if a.host in {"auto", "claude"} else None
+    if not a.session and env_sid and active_sid and env_sid != active_sid and take_over_from_waiting_predecessor(st, ident.key, ident.root, env_sid):
+        # The successor landed in the predecessor's own folder (no worktree): the predecessor kept its lease
+        # until now, so complete the hand-over before this session claims it.
+        active_sid, active_host = _active_session(st, ident.key)
     sid = a.session or active_sid
     if not sid and a.host in {"auto", "claude"} and os.getenv("CLAUDE_CODE_SESSION_ID"):
         # Claude Code (CLI and desktop app) exports the exact session id hooks receive; use it when
@@ -169,6 +174,8 @@ def cmd_arm(a) -> int:
     inherited_from = None
     label = getattr(a, "label", None) or (str(existing_arm.get("label") or "") if existing_arm else "") or default_label(ident.root)
     generation = str(existing_arm.get("generation") or "1.0") if existing_arm else "1.0"
+    if pending and pending.get("predecessor_session") == sid:
+        pending = None  # a predecessor re-arming must never inherit (or consume) its own hand-over
     if pending and pending.get("host") == host:
         label = str(pending.get("label") or label)
         generation = str(pending.get("generation") or generation)
@@ -207,7 +214,7 @@ def cmd_arm(a) -> int:
     tuning = {k: v for k, v in (("context_window", getattr(a, "context_window", None)), ("handoff_at", getattr(a, "handoff_at", None))) if v}
     if tuning:
         state = set_arm_status(st, ident.key, sid, "armed", **tuning)
-    if pending and pending.get("host") == host:
+    if pending and pending.get("host") == host and pending.get("predecessor_session") != sid:
         pending.update(
             {
                 "status": "consumed",
@@ -216,6 +223,8 @@ def cmd_arm(a) -> int:
             }
         )
         st.set_state(ident.key, "successor_pending", pending)
+        # Arming from the pending hand-over proves the successor started (by the agent's call or by hand).
+        _confirm_from_pending(st, pending, sid)
     print(
         f"Continuity armed as {session_label(label, generation)}. It will remain passive during ordinary turns and trigger at the "
         "hand-over threshold (measured context), with the host PreCompact hook as backstop.\n"
@@ -231,6 +240,24 @@ def cmd_handover(a) -> int:
     ident, st = _ctx(a.path)
     sid = a.session or os.getenv("CLAUDE_CODE_SESSION_ID") or _active_session(st, ident.key)[0]
     arm = get_arm(st, ident.key, sid)
+    if getattr(a, "cancel", False):
+        state = cancel_handover(st, ident.key, sid) if sid else None
+        st.close()
+        if state is None:
+            print(f"Continuity: no prepared hand-over to cancel for {sid or '(unknown)'}.", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": state.get("status"), "cancelled": True,
+                          "note": "This session keeps the work. The prepared worktree stays on disk; PreCompact remains the backstop."}, indent=2))
+        return 0
+    if arm and arm.get("status") == "successor_starting":
+        # Already prepared; the start just hasn't happened (e.g. it was refused). Re-issue the same start call,
+        # never a second worktree or a second generation number.
+        transfer = {"ok": True, "visible": True, "successor_name": arm.get("successor_name"), "start": arm.get("start") or {},
+                    "handoff": arm.get("handoff_path", "")}
+        transfer["next"] = visible_start_instructions(transfer)
+        print(json.dumps(transfer, indent=2, default=str))
+        st.close()
+        return 0
     if not sid or not arm or arm.get("status") != "armed":
         print(f"Continuity: session {sid or '(unknown)'} is not armed here ({ident.root}); run `continuity arm` first.", file=sys.stderr)
         st.close()
@@ -257,6 +284,20 @@ def cmd_handover(a) -> int:
     print(json.dumps({"handoff": str(path), **transfer}, indent=2, default=str))
     st.close()
     return 0 if transfer.get("ok") else 1
+
+
+def cmd_confirm_successor(a) -> int:
+    """The successor session really started: only now give up the lease and become "transferred"."""
+    ident, st = _ctx(a.path)
+    sid = a.session or os.getenv("CLAUDE_CODE_SESSION_ID") or _active_session(st, ident.key)[0]
+    state = confirm_successor(st, ident.key, sid, successor_session=a.successor_session) if sid else None
+    st.close()
+    if state is None:
+        print(f"Continuity: session {sid or '(unknown)'} has no hand-over in progress here ({ident.root}).", file=sys.stderr)
+        return 2
+    print(json.dumps({"status": state.get("status"), "successor_name": state.get("successor_name"),
+                      "successor_session": state.get("successor_session")}, indent=2))
+    return 0
 
 
 def cmd_disarm(a) -> int:
@@ -586,7 +627,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("handover", help="Hand over to the next session now, before compaction")
     s.add_argument("--session")
     s.add_argument("--handoff-file", help="The agent-written lossless handoff (markdown) to embed")
+    s.add_argument("--cancel", action="store_true", help="The user chose to keep working here: undo a prepared hand-over")
     s.set_defaults(fn=cmd_handover)
+
+    s = sub.add_parser("confirm-successor", help="Complete a hand-over once the successor session has really started")
+    s.add_argument("--session", help="The predecessor (default: this session)")
+    s.add_argument("--successor-session", default="", help="The session id the start tool returned")
+    s.set_defaults(fn=cmd_confirm_successor)
 
     s = sub.add_parser("disarm")
     s.add_argument("--session")
