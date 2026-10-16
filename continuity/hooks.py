@@ -15,6 +15,7 @@ from .boundary import (
     handoff_due,
     inherit_pending_successor,
     launch_claude_successor,
+    take_over_from_waiting_predecessor,
     visible_start_instructions,
     next_generation,
     session_label,
@@ -75,6 +76,41 @@ def _alert_and_block(host: str, reason: str) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
+# Turns the user did not type: the Claude desktop app refuses mcp__ccd_session__start_session on them, so a
+# hand-over that tries to start the successor there fails (BE 1.4→1.5 and 1.5→1.6, 2026-10-16).
+_NOT_USER_TURN_MARKERS = ("<cross-session-message", "Another Claude session sent a message", "<side-sessions-event",
+                          "<task-notification", "[SYSTEM NOTIFICATION", "<ci-monitor-event")
+
+
+def _turn_from_another_session(event: dict) -> bool:
+    prompt = event.get("prompt")
+    # Anchored to the start of the prompt: the host wraps these turns at the top, while a user who pastes such
+    # text usually writes something first.
+    return isinstance(prompt, str) and any(m in prompt.lstrip()[:400] for m in _NOT_USER_TURN_MARKERS)
+
+
+def _successor_starting_reminder(event: dict, arm: dict) -> None:
+    """The predecessor prepared a successor that hasn't been confirmed started: it is STILL the owner."""
+    name = arm.get("successor_name") or "the successor"
+    start = arm.get("start") or {}
+    if arm.get("manual_command"):
+        how = (f"This hand-over is manual: the user starts the successor with `{arm.get('manual_command')}` and runs "
+               "/continuity there; its arming completes the transfer. Remind them once, then keep working.")
+    elif _turn_from_another_session(event):
+        how = ("This turn was started by another session or an automated event, so the app will refuse a start now. "
+               "Do not try it here. Make sure the user knows the successor is prepared but not started, with the folder "
+               f"{start.get('folder')} and the start prompt as a copy-paste block; it starts on their next message.")
+    else:
+        how = (f"This is a user turn, so start it now: call {start.get('tool')} with exactly {json.dumps(start.get('args'))}, "
+               "then run `continuity confirm-successor --successor-session <returned id>`.")
+    _emit_context(
+        "UserPromptSubmit",
+        f"CONTINUITY: {name} is prepared but NOT confirmed started. You are still the owner of this work: keep working "
+        f"and never tell the user you handed over until the start is confirmed. {how}",
+        system_message=f"Continuity: {name} is prepared but not started yet.",
+    )
+
+
 def _block_transferred(host: str, reason: str) -> None:
     if host == "codex":
         sys.stdout.write(json.dumps({"continue": False, "stopReason": reason, "systemMessage": reason}))
@@ -128,6 +164,8 @@ def _session_start(store: Store, ident, host: str, sid: str | None, event: dict)
     )
 
     conflict = None
+    # A same-folder successor of a predecessor still waiting on its hand-over takes over instead of conflicting.
+    take_over_from_waiting_predecessor(store, ident.key, ident.root, sid)
     try:
         store.acquire_lease(ident.key, sid, host)
     except LeaseConflict as exc:
@@ -173,7 +211,7 @@ def _session_start(store: Store, ident, host: str, sid: str | None, event: dict)
 def _early_warning(store: Store, ident, host: str, sid: str | None, arm: dict | None, event: dict, event_name: str) -> bool:
     """Measured context crossed the hand-over threshold: alert the user and make the agent hand over now,
     while it still holds the whole conversation. The PreCompact hook stays armed as the backstop."""
-    if host != "claude" or not sid or not arm or arm.get("status") != "armed":
+    if host != "claude" or not sid or not arm or arm.get("status") != "armed" or arm.get("handover_declined"):
         return False
     due = handoff_due(event.get("transcript_path"), arm)
     if not due:
@@ -204,9 +242,14 @@ def _early_warning(store: Store, ident, host: str, sid: str | None, arm: dict | 
         "   It creates the successor worktree in THIS environment (<main checkout>/.claude/worktrees/), carries over every "
         "uncommitted and untracked change, and prints a `start` block and a `next` instruction.\n"
         "5. Start the successor VISIBLY, as its `next` says: in the Claude desktop app call mcp__ccd_session__start_session "
-        "with the printed `start.args` (a sidebar session in the new worktree, with this session's permissions and settings). "
-        "Never `claude --bg`. In a terminal, give the user the folder and the prompt instead.\n"
-        "6. Report the real result (worktree path, branch, successor name, session id), then stop working in this session."
+        "with the printed `start.args` (a sidebar session in the new worktree, with this session's permissions and settings), "
+        "then run `continuity confirm-successor --successor-session <returned id>`. Never `claude --bg`. "
+        "In a terminal, give the user the folder and the prompt instead.\n"
+        + ("   THIS TURN WAS STARTED BY ANOTHER SESSION'S MESSAGE OR AN AUTOMATED EVENT: the app will refuse the start here. "
+           "Do steps 1-4 now, then tell the user the successor is prepared and ask them to reply so you can start it on "
+           "their turn. You remain the owner until then.\n" if _turn_from_another_session(event) else "")
+        + "6. Report the real result (worktree path, branch, successor name, session id). Stop working in this session "
+        "ONLY after the start is confirmed; if it was refused, you are still the owner, so say so and keep working."
     )
     _emit_context(event_name, agent_msg, system_message=user_msg)
     return True
@@ -216,6 +259,14 @@ def _precompact(store: Store, ident, host: str, sid: str | None, event: dict) ->
     if not sid:
         return 0
     arm = get_arm(store, ident.key, sid)
+    if arm and arm.get("status") == "successor_starting" and not arm.get("precompact_reminded"):
+        # The successor was prepared but never confirmed started: hold compaction ONCE so the agent can still start
+        # it with the full conversation; after that, compaction proceeds and this session stays the owner.
+        set_arm_status(store, ident.key, sid, "successor_starting", precompact_reminded=int(time.time()))
+        how = (f"Start it with `{arm.get('manual_command')}` and run /continuity there." if arm.get("manual_command")
+               else visible_start_instructions({"successor_name": arm.get("successor_name"), "start": arm.get("start") or {}}))
+        _alert_and_block(host, "COMPACTION IMMINENT — the Continuity successor is prepared but NOT started. " + how)
+        return 0
     if not arm or arm.get("status") != "armed":
         return 0
 
@@ -385,6 +436,10 @@ def run_hook(host: str) -> int:
                     host,
                     "Continuity already transferred this predecessor session. Continue in the fresh successor session.",
                 )
+                return 0
+            if arm and arm.get("status") == "successor_starting":
+                if host == "claude":  # codex: never block; the predecessor simply stays the owner
+                    _successor_starting_reminder(event, arm)
                 return 0
             _early_warning(store, ident, host, sid, arm, event, event_name)
             return 0

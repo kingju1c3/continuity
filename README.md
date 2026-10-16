@@ -97,6 +97,17 @@ Continuity addresses those failures by giving each kind of state a different lif
 
 ---
 
+## Ownership moves only when the successor really starts — v0.9
+
+v0.8 marked the predecessor "transferred" and released its lease the moment it *prepared* the successor, before anything had started. The start can fail: the Claude desktop app refuses to start sessions on a turn begun by another session's message, and the user may decline. On 2026-10-16, two sessions said "handed over" this way, and their own hook then blocked every later prompt while no successor existed. Juice had to start the successors by hand. v0.9:
+
+- **The predecessor stays the owner** (status `successor_starting`, lease kept, never blocked) until the start is confirmed: `continuity confirm-successor --successor-session <id>`, or the successor arming in its worktree. The successor arming confirms automatically however it was started, even by hand hours later; a prepared hand-over no longer expires.
+- **Turns started by another session are recognized.** The early warning and the reminder say the app will refuse a start there; the agent prepares, tells the user, and starts it on the user's next message.
+- **A reminder replaces the block.** Every user turn while a start is pending carries the exact start call. A second PreCompact holds compaction once more, then lets it proceed with the predecessor still the owner.
+- `continuity handover` is idempotent while a start is pending: it re-prints the same start, with no second worktree or number. `continuity handover --cancel` keeps the work here.
+- The manual and no-worktree paths follow the same rule. A same-folder successor takes over without a lease conflict, but never steals a hand-over that made its own worktree.
+- SKILL.md is down from 665 to ~530 lines. Cloud mode moved to `continuity/protocol/cloud-mode.md`.
+
 ## The successor is a visible sidebar clone — v0.8
 
 v0.7 started the successor with `claude --bg`. A background session doesn't appear in the Claude desktop app's sidebar or on the phone, so on 2026-10-14 a team lead ran for hours that its user couldn't reach. v0.8:

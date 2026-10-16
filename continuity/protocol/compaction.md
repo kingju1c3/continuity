@@ -17,7 +17,7 @@ For an **armed** session, PreCompact triggers this sequence:
 5. create an automatic-boundary handoff;
 6. persist the handoff to SQLite and .continuity/LATEST.*;
 7. prepare or launch a fresh successor;
-8. release predecessor ownership only after durable handoff capture;
+8. release predecessor ownership only after durable handoff capture AND a confirmed successor start;
 9. block the current compaction attempt so the original context is not destroyed first.
 
 Unarmed sessions do not perform this sequence.
@@ -39,7 +39,7 @@ Transcript data is explicitly marked as best-effort evidence and must not outran
 
 ## No infinite block
 
-After a successful transfer the predecessor is marked transferred. It is not allowed to repeatedly recreate/block the same transfer boundary. Work should continue in the fresh successor.
+After a confirmed transfer the predecessor is marked transferred; while the successor is only prepared it stays `successor_starting` and keeps working. It is not allowed to repeatedly recreate/block the same transfer boundary. Work should continue in the fresh successor.
 
 If automatic successor launch fails, predecessor ownership is restored and the durable handoff remains available.
 

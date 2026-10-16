@@ -119,6 +119,63 @@ class EarlyHandoverTests(unittest.TestCase):
                 st.close()
 
 
+    def test_message_triggered_early_warning_says_start_will_be_refused(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project, TemporaryDirectory() as td:
+            root = Path(project)
+            self.setup_project(root, home)
+            t = transcript(Path(td) / "t.jsonl", 170_000)
+            with patch.dict(os.environ, {"HOME": home}):
+                out = self.hook(root, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "transcript_path": t,
+                                       "prompt": "Another Claude session sent a message:\n<cross-session-message>x</cross-session-message>"})
+                ctx = out["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("the app will refuse the start here", ctx)
+                self.assertIn("You remain the owner", ctx)
+                plain = self.hook(root, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "transcript_path": t, "prompt": "go on"})
+                self.assertNotIn("refuse the start here", plain["hookSpecificOutput"]["additionalContext"])
+
+    def test_visible_handover_retires_predecessor_only_when_successor_arms(self):
+        """The full visible flow: handover prepares (predecessor still owner), a re-run re-issues the same start,
+        and the successor arming in its worktree, by tool call or by hand, completes the transfer."""
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project).resolve()
+            self.setup_project(root, home, background_successor=False)
+            hf = root / ".continuity" / "HANDOFF.md"
+            hf.write_text("Decision: x.\n")
+            env = {"HOME": home, "CLAUDE_CODE_SESSION_ID": "s1"}
+            with patch.dict(os.environ, env):
+                a = build_parser().parse_args(["--path", str(root), "handover", "--handoff-file", str(hf)])
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(a.fn(a), 0)
+                first = json.loads(out.getvalue())
+                self.assertTrue(first["visible"])
+                self.assertIn("confirm-successor", first["next"])
+                self.assertIn("you are STILL the owner", first["next"])
+                st = Store.default()
+                key = identity(root).key
+                self.assertEqual(get_arm(st, key, "s1")["status"], "successor_starting")
+                self.assertEqual(st.active_lease(key)["session_id"], "s1")
+                st.close()
+                # A re-run (e.g. after a refused start) re-issues the SAME start, no second worktree or number.
+                out2 = io.StringIO()
+                with redirect_stdout(out2):
+                    self.assertEqual(a.fn(a), 0)
+                again = json.loads(out2.getvalue())
+                self.assertEqual(again["start"], first["start"])
+                self.assertEqual(again["successor_name"], first["successor_name"])
+            wt = Path(first["worktree"])
+            with patch.dict(os.environ, {"HOME": home, "CLAUDE_CODE_SESSION_ID": "s2"}):
+                arm2 = build_parser().parse_args(["--path", str(wt), "arm", "--host", "auto", "--goal", "g"])
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(arm2.fn(arm2), 0)
+                st = Store.default()
+                prev = get_arm(st, identity(root).key, "s1")
+                self.assertEqual(prev["status"], "transferred")
+                self.assertEqual(prev["successor_session"], "s2")
+                self.assertIsNone(st.active_lease(identity(root).key))
+                self.assertEqual(get_arm(st, identity(wt).key, "s2")["generation"], "1.2")
+                st.close()
+
     def test_arm_generation_continues_a_chain_started_elsewhere(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
             root = Path(project).resolve()

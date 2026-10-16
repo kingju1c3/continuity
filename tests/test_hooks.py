@@ -185,13 +185,134 @@ class HookTests(unittest.TestCase):
                 self.assertIn("Never use `claude --bg`", reason)
                 st = Store.default()
                 ident = identity(root)
-                self.assertEqual(get_arm(st, ident.key, "s1")["status"], "transferred")
+                # Nothing has started yet: the predecessor must NOT be transferred and must keep its lease
+                # (2026-10-16: a refused start left "transferred" sessions blocked with no successor).
+                self.assertEqual(get_arm(st, ident.key, "s1")["status"], "successor_starting")
                 pending = st.get_state(ident.key, "successor_pending")
                 self.assertEqual(pending["status"], "pending")  # the successor inherits it when it arms
                 self.assertTrue(pending["visible"])
                 self.assertEqual(pending["start"]["args"]["initiation"], "user_asked")
-                self.assertIsNone(st.active_lease(ident.key))
+                self.assertEqual(st.active_lease(ident.key)["session_id"], "s1")
                 st.close()
+
+    def _prepare_visible(self, root: Path, home: str):
+        self.enabled_project(root)
+        self.run_event(root, {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"})
+        self.arm(root, home, background=False)
+        with patch("continuity.boundary.shutil.which", return_value=None):
+            self.run_event(root, {"hook_event_name": "PreCompact", "session_id": "s1", "trigger": "auto"})
+
+    def test_unstarted_successor_never_blocks_the_predecessor(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            with patch.dict(os.environ, {"HOME": home}):
+                self._prepare_visible(root, home)
+                _, out, _ = self.run_event(root, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "next?"})
+                payload = json.loads(out)
+                self.assertNotEqual(payload.get("decision"), "block")
+                ctx = payload["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("NOT confirmed started", ctx)
+                self.assertIn("start it now", ctx)
+                self.assertIn("confirm-successor", ctx)
+
+    def test_message_triggered_turn_is_told_not_to_start(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            with patch.dict(os.environ, {"HOME": home}):
+                self._prepare_visible(root, home)
+                prompt = '<cross-session-message from="x">hi</cross-session-message>'
+                _, out, _ = self.run_event(root, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": prompt})
+                ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("will refuse a start now", ctx)
+                self.assertNotIn("start it now", ctx)
+
+    def test_confirm_successor_completes_the_transfer(self):
+        from continuity.boundary import confirm_successor
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            with patch.dict(os.environ, {"HOME": home}):
+                self._prepare_visible(root, home)
+                st = Store.default()
+                ident = identity(root)
+                state = confirm_successor(st, ident.key, "s1", successor_session="local_abc")
+                self.assertEqual(state["status"], "transferred")
+                self.assertEqual(state["successor_session"], "local_abc")
+                self.assertIsNone(st.active_lease(ident.key))
+                self.assertEqual(st.get_state(ident.key, "successor_pending")["status"], "launched")
+                self.assertIsNone(confirm_successor(st, ident.key, "nope"))
+                st.close()
+                _, out, _ = self.run_event(root, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "x"})
+                self.assertEqual(json.loads(out)["decision"], "block")
+
+    def test_waiting_handover_does_not_expire_and_can_be_cancelled(self):
+        from continuity.boundary import cancel_handover, pending_successor
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            with patch.dict(os.environ, {"HOME": home}):
+                self._prepare_visible(root, home)
+                st = Store.default()
+                ident = identity(root)
+                p = st.get_state(ident.key, "successor_pending")
+                st.set_state(ident.key, "successor_pending", {**p, "created_at": 1})  # long ago
+                self.assertIsNotNone(pending_successor(st, ident.key))  # a waiting hand-over never expires
+                state = cancel_handover(st, ident.key, "s1")
+                self.assertEqual(state["status"], "armed")
+                self.assertTrue(state["handover_declined"])
+                self.assertIsNone(pending_successor(st, ident.key))  # cancelled: can no longer retire s1
+                self.assertEqual(st.active_lease(ident.key)["session_id"], "s1")
+                st.close()
+
+    def test_manual_staging_keeps_predecessor_owner_until_successor_starts_here(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            self.enabled_project(root)
+            with patch.dict(os.environ, {"HOME": home}):
+                self.run_event(root, {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"})
+                self.arm(root, home, auto=False)
+                self.run_event(root, {"hook_event_name": "PreCompact", "session_id": "s1", "trigger": "auto"})
+                st = Store.default()
+                ident = identity(root)
+                self.assertEqual(get_arm(st, ident.key, "s1")["status"], "successor_starting")
+                self.assertEqual(st.active_lease(ident.key)["session_id"], "s1")
+                st.close()
+                _, out, _ = self.run_event(root, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "hi"})
+                self.assertIn("This hand-over is manual", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+                # The successor opens in the same folder: no lease conflict; it retires the predecessor.
+                _, out2, _ = self.run_event(root, {"hook_event_name": "SessionStart", "session_id": "s2", "source": "startup"})
+                self.assertNotIn("LEASE CONFLICT", out2)
+                st = Store.default()
+                self.assertEqual(get_arm(st, ident.key, "s1")["status"], "transferred")
+                self.assertEqual(st.active_lease(ident.key)["session_id"], "s2")
+                st.close()
+
+    def test_second_session_in_predecessor_folder_does_not_steal_worktree_handover(self):
+        from continuity.boundary import take_over_from_waiting_predecessor
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            with patch.dict(os.environ, {"HOME": home}):
+                self._prepare_visible(root, home)
+                st = Store.default()
+                ident = identity(root)
+                p = st.get_state(ident.key, "successor_pending")
+                st.set_state(ident.key, "successor_pending", {**p, "worktree": str(root / ".claude" / "worktrees" / "x")})
+                self.assertFalse(take_over_from_waiting_predecessor(st, ident.key, root, "intruder"))
+                self.assertEqual(get_arm(st, ident.key, "s1")["status"], "successor_starting")
+                st.close()
+
+    def test_pasted_marker_mid_prompt_is_still_a_user_turn(self):
+        from continuity.hooks import _turn_from_another_session
+        self.assertTrue(_turn_from_another_session({"prompt": "<cross-session-message from=x>hi</cross-session-message>"}))
+        self.assertFalse(_turn_from_another_session({"prompt": "start it. " + "log line\n" * 60 + "<task-notification> pasted"}))
+
+    def test_precompact_holds_once_while_successor_starting(self):
+        with TemporaryDirectory() as home, TemporaryDirectory() as project:
+            root = Path(project)
+            with patch.dict(os.environ, {"HOME": home}):
+                self._prepare_visible(root, home)
+                _, out, _ = self.run_event(root, {"hook_event_name": "PreCompact", "session_id": "s1", "trigger": "auto"})
+                self.assertIn("prepared but NOT started", json.loads(out)["reason"])
+                _, out2, _ = self.run_event(root, {"hook_event_name": "PreCompact", "session_id": "s1", "trigger": "auto"})
+                self.assertEqual(out2, "")  # only once: compaction then proceeds, the session stays the owner
 
     def test_claude_launch_failure_restores_predecessor_ownership(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
@@ -330,7 +451,7 @@ class HookTests(unittest.TestCase):
                 self.assertIsNone(st.active_lease(ident.key))
                 st.close()
 
-    def test_transferred_predecessor_blocks_further_prompt(self):
+    def test_unstarted_codex_successor_never_stops_the_predecessor(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
             root = Path(project)
             self.enabled_project(root)
@@ -356,9 +477,12 @@ class HookTests(unittest.TestCase):
                     },
                     host="codex",
                 )
-                payload = json.loads(out)
-                self.assertFalse(payload["continue"])
-                self.assertIn("transferred", payload["stopReason"])
+                # No Codex successor was started (no executable), so the predecessor must NOT be stopped: it stays
+                # the owner until a successor arms (it used to be blocked with nothing to continue in).
+                self.assertEqual(out, "")
+                st = Store.default()
+                self.assertEqual(get_arm(st, identity(root).key, "c1")["status"], "successor_starting")
+                st.close()
 
     def test_ordinary_stop_is_silent_when_armed(self):
         with TemporaryDirectory() as home, TemporaryDirectory() as project:
